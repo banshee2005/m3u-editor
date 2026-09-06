@@ -144,11 +144,29 @@ class DvrRecordingRule extends Model
      */
     public function alreadyHaveEpisode(string $seriesKey, ?int $season, ?int $episode): bool
     {
+        return $this->getEpisodeRecordingStatus($seriesKey, $season, $episode) !== null;
+    }
+
+    /**
+     * Get the status of an existing recording for the given series_key + season + episode.
+     * Returns the status string ('scheduled', 'completed', etc.) or null if no recording exists.
+     */
+    public function getEpisodeRecordingStatus(string $seriesKey, ?int $season, ?int $episode): ?string
+    {
         if ($season === null || $episode === null) {
-            return false;
+            $recording = DvrRecording::where('series_key', $seriesKey)
+                ->whereIn('status', [
+                    DvrRecordingStatus::Scheduled,
+                    DvrRecordingStatus::Recording,
+                    DvrRecordingStatus::PostProcessing,
+                    DvrRecordingStatus::Completed,
+                ])
+                ->first();
+
+            return $recording?->status?->value;
         }
 
-        return DvrRecording::where('series_key', $seriesKey)
+        $recording = DvrRecording::where('series_key', $seriesKey)
             ->where('season', $season)
             ->where('episode', $episode)
             ->whereIn('status', [
@@ -156,9 +174,10 @@ class DvrRecordingRule extends Model
                 DvrRecordingStatus::Recording,
                 DvrRecordingStatus::PostProcessing,
                 DvrRecordingStatus::Completed,
-                DvrRecordingStatus::Purged,
             ])
-            ->exists();
+            ->first();
+
+        return $recording?->status?->value;
     }
 
     /**

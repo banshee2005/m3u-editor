@@ -2,8 +2,10 @@
 
 namespace App\Filament\Resources\DvrRecordingRules;
 
+use App\Enums\DvrMatchMode;
 use App\Enums\DvrRuleType;
 use App\Enums\DvrSeriesMode;
+use Illuminate\Support\Facades\Log;
 use App\Models\Channel;
 use App\Models\DvrRecordingRule;
 use App\Models\DvrSetting;
@@ -124,8 +126,12 @@ class DvrRecordingRuleResource extends Resource
                             return [];
                         }
 
+                        // Deduplicate by title — the IPTV provider may have
+                        // multiple streams/quality variants for the same channel.
                         return Channel::whereIn('id', $dvrSetting->ownerChannelsSubquery())
                             ->orderBy('title')
+                            ->get()
+                            ->unique('title')
                             ->pluck('title', 'id')
                             ->prepend(__('From Original Source'), 0)
                             ->all();
@@ -133,6 +139,7 @@ class DvrRecordingRuleResource extends Resource
                     ->disabled(fn (Get $get): bool => ! $get('dvr_setting_id'))
                     ->searchable()
                     ->nullable()
+                    ->live(onBlur: true)
                     ->helperText(fn (Get $get): ?string => self::isRuleType($get('type'), DvrRuleType::Series)
                         ? __('Series rules only match against channels with EPG data mapped. If a rule never records, confirm this channel has an EPG source assigned.')
                         : null),
@@ -141,6 +148,7 @@ class DvrRecordingRuleResource extends Resource
                     ->label(__('Series Title'))
                     ->placeholder(__('e.g. Breaking Bad'))
                     ->visible(fn (Get $get): bool => self::isRuleType($get('type'), DvrRuleType::Series))
+                    ->live(onBlur: true)
                     ->requiredIf('type', DvrRuleType::Series->value),
 
                 Select::make('series_mode')
@@ -148,7 +156,8 @@ class DvrRecordingRuleResource extends Resource
                     ->options(DvrSeriesMode::class)
                     ->default(DvrSeriesMode::UniqueSe->value)
                     ->helperText(__('Set per-playlist defaults under Playlists → Edit → DVR Settings.'))
-                    ->visible(fn (Get $get): bool => self::isRuleType($get('type'), DvrRuleType::Series)),
+                    ->visible(fn (Get $get): bool => self::isRuleType($get('type'), DvrRuleType::Series))
+                    ->live(onBlur: true),
 
                 Select::make('enable_comskip')
                     ->label(__('Commercial Detection (Comskip)'))
@@ -186,12 +195,53 @@ class DvrRecordingRuleResource extends Resource
                     ->required(),
 
                 View::make('filament.forms.dvr-matched-airings')
-                    ->viewData(fn (?DvrRecordingRule $record): array => [
-                        'airings' => $record ? static::resolveMatchedAirings($record) : [],
+                    ->viewData(fn (?DvrRecordingRule $record, Get $get): array => [
+                        'airings' => static::resolveMatchedAiringsFromForm($record, $get),
                     ])
-                    ->visible(fn (?DvrRecordingRule $record, Get $get): bool => $record !== null && self::isRuleType($get('type'), DvrRuleType::Series))
+                    ->visible(fn (Get $get): bool => self::isRuleType($get('type'), DvrRuleType::Series))
                     ->columnSpanFull(),
             ]);
+    }
+
+    /**
+     * Build a temporary DvrRecordingRule from form values to preview
+     * matched airings. Works for both new rules (no record yet) and
+     * existing rules being edited.
+     */
+    protected static function resolveMatchedAiringsFromForm(?DvrRecordingRule $record, Get $get): array
+    {
+        $type = DvrRuleType::tryFrom($get('type')?->value ?? $get('type'));
+        if ($type !== DvrRuleType::Series) {
+            return [];
+        }
+
+        $seriesTitle = trim((string) ($get('series_title') ?? ''));
+        if ($seriesTitle === '') {
+            return [];
+        }
+
+        // For existing records, use the record directly
+        if ($record) {
+            return static::resolveMatchedAirings($record);
+        }
+
+        // For new records, build a temporary rule from form values
+        $dvrSettingId = $get('dvr_setting_id');
+        if (! $dvrSettingId) {
+            return [];
+        }
+
+        $tempRule = new DvrRecordingRule([
+            'series_title' => $seriesTitle,
+            'match_mode' => is_string($get('match_mode')) ? DvrMatchMode::tryFrom($get('match_mode')) : ($get('match_mode') ?? DvrMatchMode::Contains),
+            'series_mode' => is_string($get('series_mode')) ? DvrSeriesMode::tryFrom($get('series_mode')) : ($get('series_mode') ?? DvrSeriesMode::All),
+            'dvr_setting_id' => $dvrSettingId,
+            'epg_channel_id' => $get('epg_channel_id'),
+            'channel_id' => $get('channel_id'),
+            'source_channel_id' => $get('source_channel_id'),
+        ]);
+
+        return static::resolveMatchedAirings($tempRule);
     }
 
     public static function table(Table $table): Table
