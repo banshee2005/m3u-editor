@@ -73,8 +73,22 @@ class AIOStreamsProxyController extends Controller
             return response()->json(['error' => 'Unauthorized'], 401);
         }
 
+        // Debrid addons only resolve IMDb IDs to streams, not TMDB IDs.
+        // When the catalog returns a TMDB ID (e.g. "tmdb:603"), fetch the
+        // meta to obtain the IMDb ID before requesting streams.
+        $resolvedId = $id;
+        if (str_starts_with($id, 'tmdb:')) {
+            $metaResponse = Http::timeout(30)->get("{$integration->manifest_base_url}/meta/{$type}/{$id}.json");
+            if ($metaResponse->successful()) {
+                $imdbId = $metaResponse->json('meta.imdb_id');
+                if (! empty($imdbId)) {
+                    $resolvedId = $imdbId;
+                }
+            }
+        }
+
         // Streams are not cached — always fetch fresh to get current availability
-        $response = Http::timeout(30)->get("{$integration->manifest_base_url}/stream/{$type}/{$id}.json");
+        $response = Http::timeout(30)->get("{$integration->manifest_base_url}/stream/{$type}/{$resolvedId}.json");
 
         if (! $response->successful()) {
             return response()->json(['error' => 'Failed to fetch streams from AIOStreams'], 502);

@@ -1030,7 +1030,21 @@ class MediaServerProxyController extends Controller
             'has_range' => $request->hasHeader('Range'),
         ]);
 
-        return new StreamedResponse(function () use ($resolvedUrl, $requestHeaders) {
+        // Set sensible default headers BEFORE the curl stream starts.
+        // ExoPlayer/Media3 probes with a HEAD request before playing; if no
+        // headers are set yet (they're lazily applied on first body chunk in
+        // the WRITEFUNCTION), the response defaults to text/html and the
+        // player rejects the source.  These defaults are overridden by the
+        // real upstream headers once the first body byte arrives.
+        //
+        // ExoPlayer/Media3 refuses to probe a huge response served as generic
+        // application/octet-stream, so we set a concrete video MIME type based
+        // on the resolved URL's file extension (e.g. .mkv -> video/x-matroska).
+        // This mirrors what the upstream debrid host serves for the same file,
+        // which is what lets other players (Nuvio/Stremio) play it directly.
+        $contentType = self::mimeForUrl($resolvedUrl);
+
+        $response = new StreamedResponse(function () use ($resolvedUrl, $requestHeaders, $contentType) {
             $ch = curl_init($resolvedUrl);
             curl_setopt($ch, CURLOPT_HTTPHEADER, array_map(
                 fn ($k, $v) => "{$k}: {$v}",
@@ -1069,7 +1083,7 @@ class MediaServerProxyController extends Controller
 
             $responseStarted = false;
 
-            curl_setopt($ch, CURLOPT_WRITEFUNCTION, function ($ch, $data) use (&$responseStarted, &$finalHeaders) {
+            curl_setopt($ch, CURLOPT_WRITEFUNCTION, function ($ch, $data) use (&$responseStarted, &$finalHeaders, $contentType) {
                 // See other proxy methods in this class: a seek abandons this
                 // connection without closing it, and ignore_user_abort(true) means
                 // PHP won't notice unless we check here.
@@ -1083,7 +1097,14 @@ class MediaServerProxyController extends Controller
                     $status = $finalHeaders['status'] ?? 200;
                     http_response_code(in_array($status, [200, 206], true) ? $status : 200);
 
-                    header('Content-Type: '.($finalHeaders['content-type'] ?? 'application/octet-stream'));
+                    // Prefer the concrete MIME type derived from the URL extension
+                    // over a generic upstream application/octet-stream, which
+                    // ExoPlayer/Media3 refuses to probe for large files.
+                    $upstreamContentType = $finalHeaders['content-type'] ?? 'application/octet-stream';
+                    $resolvedContentType = str_contains($upstreamContentType, 'application/octet-stream')
+                        ? $contentType
+                        : $upstreamContentType;
+                    header('Content-Type: '.$resolvedContentType);
                     header('Accept-Ranges: bytes');
                     header('X-Proxied-From: AIOStreams');
 
@@ -1121,5 +1142,44 @@ class MediaServerProxyController extends Controller
                 echo json_encode(['error' => 'Failed to reach the resolved upstream URL']);
             }
         });
+
+        // Set headers on the StreamedResponse object (Symfony sends these,
+        // not raw header() calls which are overridden).
+        $response->headers->set('Content-Type', $contentType);
+        $response->headers->set('Accept-Ranges', 'bytes');
+        $response->headers->set('X-Proxied-From', 'AIOStreams');
+
+        // When the client sends a Range request, the upstream returns 206.
+        // We must set the status on the Response object before Symfony sends
+        // headers — http_response_code() inside the WRITEFUNCTION callback
+        // comes too late.
+        if ($request->hasHeader('Range')) {
+            $response->setStatusCode(206);
+        }
+
+        return $response;
+    }
+
+    /**
+     * Resolve a concrete video MIME type from a media URL's file extension.
+     * Returns application/octet-stream when the extension is unknown.
+     */
+    private static function mimeForUrl(string $url): string
+    {
+        $extension = strtolower(pathinfo(parse_url($url, PHP_URL_PATH) ?? '', PATHINFO_EXTENSION));
+
+        return match ($extension) {
+            'mkv' => 'video/x-matroska',
+            'webm' => 'video/webm',
+            'mp4', 'm4v' => 'video/mp4',
+            'mov' => 'video/quicktime',
+            'avi' => 'video/x-msvideo',
+            'mpg', 'mpeg' => 'video/mpeg',
+            'ts', 'm2ts', 'mts' => 'video/mp2t',
+            'flv' => 'video/x-flv',
+            'wmv' => 'video/x-ms-wmv',
+            '3gp' => 'video/3gpp',
+            default => 'application/octet-stream',
+        };
     }
 }

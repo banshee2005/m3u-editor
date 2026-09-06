@@ -450,7 +450,7 @@ Route::get('/aiostreams-media/{integration}/episode/{episode}/stream', [
 Route::get('/aiostreams-media/{integration}/live/{item}/stream', [
     MediaServerProxyController::class,
     'streamAioStreamsLive',
-])->middleware(ValidateSignature::relative())->name('aiostreams-media.live.stream');
+])->middleware([\App\Http\Middleware\StripProxyQueryParam::class, ValidateSignature::relative()])->name('aiostreams-media.live.stream');
 
 /*
  * DVR routes — file streaming and proxy callbacks
