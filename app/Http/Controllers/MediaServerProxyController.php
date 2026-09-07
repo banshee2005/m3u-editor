@@ -1098,13 +1098,11 @@ class MediaServerProxyController extends Controller
                     http_response_code(in_array($status, [200, 206], true) ? $status : 200);
 
                     // Prefer the concrete MIME type derived from the URL extension
-                    // over a generic upstream application/octet-stream, which
+                    // over a generic upstream type (application/octet-stream,
+                    // binary/octet-stream, an empty header, ...), which
                     // ExoPlayer/Media3 refuses to probe for large files.
-                    $upstreamContentType = $finalHeaders['content-type'] ?? 'application/octet-stream';
-                    $resolvedContentType = str_contains($upstreamContentType, 'application/octet-stream')
-                        ? $contentType
-                        : $upstreamContentType;
-                    header('Content-Type: '.$resolvedContentType);
+                    $upstreamContentType = $finalHeaders['content-type'] ?? '';
+                    header('Content-Type: '.self::resolveStreamContentType($upstreamContentType, $contentType));
                     header('Accept-Ranges: bytes');
                     header('X-Proxied-From: AIOStreams');
 
@@ -1149,15 +1147,44 @@ class MediaServerProxyController extends Controller
         $response->headers->set('Accept-Ranges', 'bytes');
         $response->headers->set('X-Proxied-From', 'AIOStreams');
 
-        // When the client sends a Range request, the upstream returns 206.
-        // We must set the status on the Response object before Symfony sends
-        // headers — http_response_code() inside the WRITEFUNCTION callback
-        // comes too late.
-        if ($request->hasHeader('Range')) {
+        // When the client sends a Range request on a GET, mark the envelope 206
+        // up front; the WRITEFUNCTION callback still corrects it to the real
+        // upstream status (200 if the host ignored the Range) before the first
+        // body byte, and adds Content-Range / Content-Length there.
+        //
+        // A HEAD request never runs that callback (Symfony nulls the body for
+        // HEAD, so sendContent() returns early), which means Content-Range and
+        // Content-Length would be absent - a 206 without them is malformed and
+        // strict players reject it. Leave HEAD as a 200 probe response.
+        if ($request->hasHeader('Range') && ! $request->isMethod('HEAD')) {
             $response->setStatusCode(206);
         }
 
         return $response;
+    }
+
+    /**
+     * Pick the Content-Type to serve for a proxied stream.
+     *
+     * A concrete video/* type from the upstream host is the most accurate and
+     * always wins. Otherwise the upstream type is generic
+     * (application/octet-stream, binary/octet-stream, an empty header, or an
+     * error page's text/html) and ExoPlayer/Media3 refuses to probe it, so fall
+     * back to the type derived from the URL's file extension when one resolved.
+     */
+    private static function resolveStreamContentType(string $upstreamContentType, string $urlContentType): string
+    {
+        $normalized = strtolower(trim(Str::before($upstreamContentType, ';')));
+
+        if (str_starts_with($normalized, 'video/')) {
+            return $upstreamContentType;
+        }
+
+        if ($urlContentType !== 'application/octet-stream') {
+            return $urlContentType;
+        }
+
+        return $upstreamContentType !== '' ? $upstreamContentType : 'application/octet-stream';
     }
 
     /**
