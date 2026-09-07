@@ -438,14 +438,23 @@ class StreamProfileResource extends Resource implements CopilotResource
                 Actions\DeleteAction::make()
                     ->before(function (StreamProfile $record, Actions\DeleteAction $action): void {
                         $referencing = $record->getReferencingAdaptiveProfiles();
-                        if ($referencing->isEmpty()) {
+                        $dvrUsages = \App\Models\DvrSetting::where('stream_profile_id', $record->id)->count();
+                        if ($referencing->isEmpty() && $dvrUsages === 0) {
                             return;
+                        }
+
+                        $reasons = [];
+                        if ($referencing->isNotEmpty()) {
+                            $reasons[] = __('adaptive profiles: ').$referencing->pluck('name')->join(', ');
+                        }
+                        if ($dvrUsages > 0) {
+                            $reasons[] = __('DVR settings')." ({$dvrUsages})";
                         }
 
                         Notification::make()
                             ->danger()
                             ->title(__('Profile in use'))
-                            ->body(__('This profile is referenced by the following adaptive profiles: ').$referencing->pluck('name')->join(', ').'. '.__('Remove the references before deleting.'))
+                            ->body(__('This profile is referenced by the following: ').implode('; ', $reasons).'. '.__('Remove the references before deleting.'))
                             ->persistent()
                             ->send();
 

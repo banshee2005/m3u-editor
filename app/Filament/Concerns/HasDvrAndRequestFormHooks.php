@@ -41,6 +41,7 @@ trait HasDvrAndRequestFormHooks
             $data['dvr_include_disabled_channels'] = $dvr->include_disabled_channels;
             $data['dvr_default_series_mode'] = $dvr->default_series_mode?->value ?? DvrSeriesMode::UniqueSe->value;
             $data['dvr_default_series_keep_last'] = $dvr->default_series_keep_last;
+            $data['dvr_stream_profile_id'] = $dvr->stream_profile_id;
         } else {
             $data['dvr_enabled'] = false;
             $data['dvr_output_format'] = 'ts';
@@ -101,6 +102,7 @@ trait HasDvrAndRequestFormHooks
                     'include_disabled_channels' => $data['dvr_include_disabled_channels'] ?? false,
                     'default_series_mode' => $data['dvr_default_series_mode'] ?? DvrSeriesMode::UniqueSe->value,
                     'default_series_keep_last' => ($data['dvr_default_series_keep_last'] > 0) ? $data['dvr_default_series_keep_last'] : null,
+                    'stream_profile_id' => ! empty($data['dvr_stream_profile_id']) ? $data['dvr_stream_profile_id'] : null,
                 ]
             );
         }

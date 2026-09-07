@@ -4,6 +4,7 @@ namespace App\Filament\Support;
 
 use App\Enums\DvrSeriesMode;
 use App\Models\MediaServerIntegration;
+use App\Models\StreamProfile;
 use App\Settings\GeneralSettings;
 use Filament\Forms\Components\Select;
 use Filament\Forms\Components\TextInput;
@@ -45,7 +46,7 @@ class DvrRequestsAiostreamsTabs
                             ->live(),
                         Select::make('dvr_output_format')
                             ->label(__('Output Format'))
-                            ->helperText(__('Container format for the final recording file. All options use stream copy (no re-encoding) - only the container changes.'))
+                            ->helperText(__('Container format for the final recording file. Only set "Transcoding Profile" below for HDHomeRun and similar OTA streams.'))
                             ->options([
                                 'ts' => 'MPEG-TS (.ts) — fastest, direct segment join, no remuxing',
                                 'mp4' => 'MP4 (.mp4) — best compatibility with media players',
@@ -53,6 +54,14 @@ class DvrRequestsAiostreamsTabs
                             ])
                             ->default('ts')
                             ->required()
+                            ->hidden(fn (Get $get): bool => ! $get('dvr_enabled')),
+                        Select::make('dvr_stream_profile_id')
+                            ->label(__('Transcoding Profile'))
+                            ->helperText(__('Stream profile used for DVR recording post-processing (concat + transcode). Leave empty for default (stream copy). Transcoding may be desired for HDHomeRun/OTA to save disk space (MPEG-2 to H.264) and enable browser playback.'))
+                            ->options(fn () => StreamProfile::orderBy('name')->pluck('name', 'id'))
+                            ->default(null)
+                            ->searchable()
+                            ->nullable()
                             ->hidden(fn (Get $get): bool => ! $get('dvr_enabled')),
                         Grid::make()
                             ->columns(2)

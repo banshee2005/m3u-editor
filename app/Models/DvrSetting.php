@@ -38,12 +38,18 @@ class DvrSetting extends Model
             'default_series_mode' => DvrSeriesMode::class,
             'default_series_keep_last' => 'integer',
             'include_disabled_channels' => 'boolean',
+            'stream_profile_id' => 'integer',
         ];
     }
 
     public function user(): BelongsTo
     {
         return $this->belongsTo(User::class);
+    }
+
+    public function streamProfile(): BelongsTo
+    {
+        return $this->belongsTo(StreamProfile::class);
     }
 
     public function recordingRules(): HasMany
