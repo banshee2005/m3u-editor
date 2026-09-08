@@ -63,14 +63,6 @@ class ListStreamProfiles extends ListRecords
                         ],
                         [
                             'user_id' => $userId,
-                            'name' => 'HDHomeRun / OTA DVR',
-                            'description' => 'DVR recording post-processing for OTA broadcasts. Deinterlaces MPEG-2 and transcodes to H.264+AAC MP4.',
-                            'backend' => 'ffmpeg',
-                            'format' => 'mp4',
-                            'args' => '-vf yadif=1:-1:0 -c:v libx264 -preset {preset|veryfast} -crf {crf|23} -pix_fmt yuv420p -c:a aac -b:a {audio_bitrate|128k}',
-                        ],
-                        [
-                            'user_id' => $userId,
                             'name' => 'Default Streamlink Profile',
                             'description' => 'For platforms like Twitch and YouTube — extracts the stream directly without re-encoding.',
                             'backend' => 'streamlink',

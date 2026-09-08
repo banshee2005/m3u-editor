@@ -170,7 +170,11 @@ Route::get('/series/{username}/{password}/{streamId}.{format?}', [XtreamStreamCo
 Route::get('/timeshift/{username}/{password}/{duration}/{date}/{streamId}.{format?}', [XtreamStreamController::class, 'handleTimeshift'])
     ->name('xtream.stream.timeshift.root');
 
-// DVR routes - also before HDHR catch-all
+// DVR file streaming routes - also declared before the HDHR /{uuid}/... catch-all.
+// Stream auth mirrors the Xtream stream pattern: username + password (playlist UUID)
+// or PlaylistAuth credentials embedded in the URL. Keep the more specific
+// live.m3u8 and edl routes ahead of the generic {uuid}.{format?} stream route so
+// Laravel does not consume "live.m3u8" as {uuid}.{format?}.
 Route::get('/dvr/{username}/{password}/{uuid}/live.m3u8', [DvrStreamController::class, 'hlsPlaylist'])
     ->name('dvr.recording.hls.playlist');
 Route::get('/dvr/{username}/{password}/{uuid}/edl', [DvrStreamController::class, 'edl'])

@@ -4,7 +4,6 @@ namespace App\Filament\Resources\StreamProfiles;
 
 use App\Filament\Actions\CopyToUserAction;
 use App\Filament\Concerns\HasCopilotSupport;
-use App\Models\DvrSetting;
 use App\Models\StreamProfile;
 use App\Services\M3uProxyService;
 use EslamRedaDiv\FilamentCopilot\Contracts\CopilotResource;
@@ -439,23 +438,14 @@ class StreamProfileResource extends Resource implements CopilotResource
                 Actions\DeleteAction::make()
                     ->before(function (StreamProfile $record, Actions\DeleteAction $action): void {
                         $referencing = $record->getReferencingAdaptiveProfiles();
-                        $dvrUsages = DvrSetting::where('stream_profile_id', $record->id)->count();
-                        if ($referencing->isEmpty() && $dvrUsages === 0) {
+                        if ($referencing->isEmpty()) {
                             return;
-                        }
-
-                        $reasons = [];
-                        if ($referencing->isNotEmpty()) {
-                            $reasons[] = __('adaptive profiles: ').$referencing->pluck('name')->join(', ');
-                        }
-                        if ($dvrUsages > 0) {
-                            $reasons[] = __('DVR Settings')." ({$dvrUsages})";
                         }
 
                         Notification::make()
                             ->danger()
                             ->title(__('Profile in use'))
-                            ->body(__('This profile is referenced by the following: ').implode('; ', $reasons).'. '.__('Remove the references before deleting.'))
+                            ->body(__('This profile is referenced by the following adaptive profiles: ').$referencing->pluck('name')->join(', ').'. '.__('Remove the references before deleting.'))
                             ->persistent()
                             ->send();
 
@@ -474,7 +464,6 @@ class StreamProfileResource extends Resource implements CopilotResource
                         ->before(function ($records, Actions\DeleteBulkAction $action): void {
                             $blocked = $records->filter(
                                 fn (StreamProfile $record) => $record->getReferencingAdaptiveProfiles()->isNotEmpty()
-                                    || DvrSetting::where('stream_profile_id', $record->id)->exists()
                             );
 
                             if ($blocked->isEmpty()) {
@@ -484,7 +473,7 @@ class StreamProfileResource extends Resource implements CopilotResource
                             Notification::make()
                                 ->danger()
                                 ->title(__('Some profiles could not be deleted'))
-                                ->body(__('The following profiles are referenced by adaptive profiles or DVR settings and cannot be deleted: ').$blocked->pluck('name')->join(', ').'. '.__('Remove the references before deleting.'))
+                                ->body(__('The following profiles are referenced by adaptive profiles and cannot be deleted: ').$blocked->pluck('name')->join(', ').'. '.__('Remove the references before deleting.'))
                                 ->persistent()
                                 ->send();
 
