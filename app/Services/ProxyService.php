@@ -22,15 +22,7 @@ class ProxyService
      */
     public function __construct()
     {
-        // 1) Explicit public URL from environment (most reliable in Docker)
-        $publicUrl = config('proxy.m3u_proxy_public_url');
-        if (! empty($publicUrl) && filter_var($publicUrl, FILTER_VALIDATE_URL)) {
-            $this->baseUrl = rtrim($publicUrl, '/');
-
-            return;
-        }
-
-        // 2) See if proxy override is enabled
+        // See if proxy override is enabled
         $proxyUrlOverride = config('proxy.url_override');
 
         // See if override settings apply

@@ -306,12 +306,18 @@ class DvrPostProcessorService
     /**
      * Concatenate HLS segments into a single output file.
      *
-     * For MPEG-TS output: binary-concatenates the raw .ts segment files directly —
-     * no FFmpeg needed, fastest possible path, zero re-encoding overhead.
+     * When no transcoding profile is assigned to the DVR setting, this is a pure
+     * stream copy (no re-encoding):
+     *  - MPEG-TS output: binary-concatenates the raw .ts segment files directly,
+     *    no FFmpeg needed, fastest possible path.
+     *  - MP4/MKV output: FFmpeg concat demuxer with -c copy. We build an explicit
+     *    file list from the .m3u8 manifest rather than feeding the manifest
+     *    directly, which avoids stalls caused by corrupt #EXTINF durations.
      *
-     * For MP4/MKV output: uses FFmpeg's concat demuxer with -c copy (stream copy only,
-     * no re-encoding). We build an explicit file list from the .m3u8 manifest rather than
-     * feeding the manifest directly, which avoids stalls caused by corrupt #EXTINF durations.
+     * When a transcoding profile IS assigned (see resolveEncodingArgs()), every
+     * output format goes through the FFmpeg concat demuxer and is re-encoded with
+     * the profile's args - e.g. deinterlacing + MPEG-2 to H.264/AAC for HDHomeRun
+     * and other OTA sources.
      *
      * Output format is determined by the $format parameter: 'ts', 'mp4', or 'mkv'.
      */
@@ -334,8 +340,13 @@ class DvrPostProcessorService
             throw new Exception('No segments found in HLS manifest');
         }
 
-        // Fast path: MPEG-TS is just a binary concat of the segment files
-        if ($format === 'ts') {
+        // Build encoding args from the DVR stream profile, or fall back to stream copy.
+        $encodingArgs = $this->resolveEncodingArgs($setting);
+        $isStreamCopy = $encodingArgs === ['-c', 'copy'];
+
+        // Fast path: raw MPEG-TS with no transcoding is just a binary concat of the
+        // segment files. A transcoding profile forces the FFmpeg path below.
+        if ($format === 'ts' && $isStreamCopy) {
             $out = fopen($outputPath, 'wb');
             if (! $out) {
                 throw new Exception("Could not open output file for writing: {$outputPath}");
@@ -359,9 +370,8 @@ class DvrPostProcessorService
             return;
         }
 
-        // MP4 / MKV: use FFmpeg concat demuxer with transcoding
-        // The broadcast copies raw MPEG-2/AC3 segments (no deinterlacing).
-        // This step transcodes to browser-compatible H.264+AAC with deinterlacing.
+        // FFmpeg concat demuxer path. Either a stream copy (no profile) or a
+        // re-encode using the assigned transcoding profile's args.
         $concatListPath = $segmentDir.'/concat-list.txt';
         $logFile = $segmentDir.'/ffmpeg-concat.log';
 
@@ -371,9 +381,6 @@ class DvrPostProcessorService
         ));
         file_put_contents($concatListPath, $listContent);
 
-        // Build encoding args from the DVR stream profile, or fall back to defaults.
-        $encodingArgs = $this->resolveEncodingArgs($setting);
-
         $args = array_merge([
             $ffmpegPath, '-y',
             '-f', 'concat', '-safe', '0', '-i', $concatListPath,
@@ -381,13 +388,14 @@ class DvrPostProcessorService
 
         match ($format) {
             'mkv' => array_push($args, '-f', 'matroska'),
+            'ts' => array_push($args, '-f', 'mpegts'),
             default => array_push($args, '-movflags', '+faststart'), // mp4
         };
 
         $args[] = $outputPath;
 
         $cmd = implode(' ', array_map('escapeshellarg', $args)).' 2>&1';
-        Log::info('DVR concat: ffmpeg command', ['cmd' => $cmd]);
+        Log::debug('DVR concat: ffmpeg command', ['cmd' => $cmd]);
 
         $descriptor = [
             0 => ['file', '/dev/null', 'r'],
@@ -420,17 +428,32 @@ class DvrPostProcessorService
      * that are specific to the proxy streaming context and not applicable to
      * the local concat step.
      *
-     * Falls back to hardcoded defaults if no profile is assigned or the profile
-     * has no args.
+     * Falls back to stream copy (['-c', 'copy']) when no usable profile is
+     * assigned, the profile is not an FFmpeg profile, or no encoding args could
+     * be extracted - i.e. the concat step keeps its original stream-copy
+     * behavior unless a profile explicitly opts into transcoding.
      */
     private function resolveEncodingArgs(?DvrSetting $setting): array
     {
+        $streamCopy = ['-c', 'copy'];
+
         $profile = $setting?->streamProfile;
         $args = $profile?->args;
 
         if (empty($args)) {
-            // No profile assigned — use stream copy (original upstream behavior).
-            return ['-c', 'copy'];
+            // No profile assigned - use stream copy (original upstream behavior).
+            return $streamCopy;
+        }
+
+        if ($profile->backend !== 'ffmpeg') {
+            // Streamlink / yt-dlp / adaptive profiles carry no FFmpeg encoding
+            // args we can apply to a local concat. Fall back to stream copy.
+            Log::warning('DVR concat: assigned stream profile is not an FFmpeg profile, using stream copy', [
+                'stream_profile_id' => $profile->id,
+                'backend' => $profile->backend,
+            ]);
+
+            return $streamCopy;
         }
 
         // Resolve {placeholder|default} template variables to their defaults.
@@ -439,14 +462,20 @@ class DvrPostProcessorService
         }, $args);
 
         // Tokenize the resolved args string respecting quoted values.
-        $tokens = str_getcsv($resolved, ' ', "'");
+        $tokens = str_getcsv($resolved, ' ', "'", '');
 
-        // Flags that are input/output/format specific — not applicable to concat.
+        // Flags that are input/output/format specific - not applicable to concat.
+        // Each of these consumes its following value token as well.
         $skipFlags = [
             '-i', '-fflags', '-max_muxing_queue_size',
             '-f', '-hls_time', '-hls_list_size', '-hls_flags', '-hls_segment_type',
-            '-vsync',
+            '-vsync', '-fps_mode',
         ];
+
+        // Bare (non-flag) tokens that are proxy input/output sentinels, never
+        // encoding options. After placeholder resolution {input_url} becomes
+        // "input_url", {output_args|pipe:1} becomes "pipe:1", etc.
+        $sentinelTokens = ['input_url', 'output_args', 'pipe:0', 'pipe:1', 'index.m3u8', '-'];
 
         $encoding = [];
         $skipNext = false;
@@ -458,7 +487,11 @@ class DvrPostProcessorService
                 continue;
             }
             $trimmed = trim($token);
-            if ($trimmed === '' || $trimmed === '{input_url}' || $trimmed === '{output_args}' || $trimmed === '{output_args|pipe:1}') {
+            if ($trimmed === '' || in_array($trimmed, $sentinelTokens, true)) {
+                continue;
+            }
+            // Any unresolved placeholder is not a real FFmpeg token.
+            if (str_contains($trimmed, '{') || str_contains($trimmed, '}')) {
                 continue;
             }
             if (in_array($trimmed, $skipFlags, true)) {
@@ -476,11 +509,11 @@ class DvrPostProcessorService
         }
 
         if (empty($encoding)) {
-            return [
-                '-vf', 'yadif=1:-1:0',
-                '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
-                '-c:a', 'aac', '-b:a', '128k',
-            ];
+            Log::warning('DVR concat: no encoding args could be extracted from stream profile, using stream copy', [
+                'stream_profile_id' => $profile->id,
+            ]);
+
+            return $streamCopy;
         }
 
         return $encoding;

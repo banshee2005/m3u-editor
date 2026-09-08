@@ -449,7 +449,7 @@ class StreamProfileResource extends Resource implements CopilotResource
                             $reasons[] = __('adaptive profiles: ').$referencing->pluck('name')->join(', ');
                         }
                         if ($dvrUsages > 0) {
-                            $reasons[] = __('DVR settings')." ({$dvrUsages})";
+                            $reasons[] = __('DVR Settings')." ({$dvrUsages})";
                         }
 
                         Notification::make()
@@ -474,6 +474,7 @@ class StreamProfileResource extends Resource implements CopilotResource
                         ->before(function ($records, Actions\DeleteBulkAction $action): void {
                             $blocked = $records->filter(
                                 fn (StreamProfile $record) => $record->getReferencingAdaptiveProfiles()->isNotEmpty()
+                                    || DvrSetting::where('stream_profile_id', $record->id)->exists()
                             );
 
                             if ($blocked->isEmpty()) {
@@ -483,7 +484,7 @@ class StreamProfileResource extends Resource implements CopilotResource
                             Notification::make()
                                 ->danger()
                                 ->title(__('Some profiles could not be deleted'))
-                                ->body(__('The following profiles are referenced by adaptive profiles and cannot be deleted: ').$blocked->pluck('name')->join(', ').'. '.__('Remove the references before deleting.'))
+                                ->body(__('The following profiles are referenced by adaptive profiles or DVR settings and cannot be deleted: ').$blocked->pluck('name')->join(', ').'. '.__('Remove the references before deleting.'))
                                 ->persistent()
                                 ->send();
 

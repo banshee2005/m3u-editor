@@ -59,7 +59,7 @@ class ListStreamProfiles extends ListRecords
                             'description' => 'For ATSC OTA broadcasts (HDHomeRun). Deinterlaces MPEG-2, encodes to H.264 High Profile Level 4.1 with superfast preset, and converts audio to AAC stereo.',
                             'backend' => 'ffmpeg',
                             'format' => 'ts',
-                            'args' => '-i {input_url} -max_muxing_queue_size 1024 -fflags +genpts -vf yadif=1:-1:0 -c:v libx264 -preset superfast -crf {crf|23} -b:v {bitrate|2000k} -maxrate {maxrate|2500k} -bufsize {bufsize|5000k} -vsync vfr -profile:v high -level 41 -c:a aac -b:a {audio_bitrate|128k} -ac 2 -f mpegts {output_args|pipe:1}',
+                            'args' => '-fflags +genpts -i {input_url} -max_muxing_queue_size 1024 -vf yadif=1:-1:0 -c:v libx264 -preset superfast -b:v {bitrate|2000k} -maxrate {maxrate|2500k} -bufsize {bufsize|5000k} -fps_mode vfr -profile:v high -level 41 -c:a aac -b:a {audio_bitrate|128k} -ac 2 -f mpegts {output_args|pipe:1}',
                         ],
                         [
                             'user_id' => $userId,
@@ -67,7 +67,7 @@ class ListStreamProfiles extends ListRecords
                             'description' => 'DVR recording post-processing for OTA broadcasts. Deinterlaces MPEG-2 and transcodes to H.264+AAC MP4.',
                             'backend' => 'ffmpeg',
                             'format' => 'mp4',
-                            'args' => '-vf yadif=1:-1:0 -c:v libx264 -preset {preset|ultrafast} -crf {crf|23} -c:a aac -b:a {audio_bitrate|128k}',
+                            'args' => '-vf yadif=1:-1:0 -c:v libx264 -preset {preset|veryfast} -crf {crf|23} -pix_fmt yuv420p -c:a aac -b:a {audio_bitrate|128k}',
                         ],
                         [
                             'user_id' => $userId,

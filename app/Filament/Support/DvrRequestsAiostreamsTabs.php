@@ -46,7 +46,7 @@ class DvrRequestsAiostreamsTabs
                             ->live(),
                         Select::make('dvr_output_format')
                             ->label(__('Output Format'))
-                            ->helperText(__('Container format for the final recording file. Only set "Transcoding Profile" below for HDHomeRun and similar OTA streams.'))
+                            ->helperText(__('Container format for the final recording file. With no Transcoding Profile set, segments are stream-copied (no re-encoding) and only the container changes.'))
                             ->options([
                                 'ts' => 'MPEG-TS (.ts) — fastest, direct segment join, no remuxing',
                                 'mp4' => 'MP4 (.mp4) — best compatibility with media players',
@@ -58,7 +58,11 @@ class DvrRequestsAiostreamsTabs
                         Select::make('dvr_stream_profile_id')
                             ->label(__('Transcoding Profile'))
                             ->helperText(__('Stream profile used for DVR recording post-processing (concat + transcode). Leave empty for default (stream copy). Transcoding may be desired for HDHomeRun/OTA to save disk space (MPEG-2 to H.264) and enable browser playback.'))
-                            ->options(fn () => StreamProfile::orderBy('name')->pluck('name', 'id'))
+                            ->options(fn () => StreamProfile::query()
+                                ->where('user_id', auth()->id())
+                                ->where('backend', 'ffmpeg')
+                                ->orderBy('name')
+                                ->pluck('name', 'id'))
                             ->default(null)
                             ->searchable()
                             ->nullable()
