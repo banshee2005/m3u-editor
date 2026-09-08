@@ -1,6 +1,6 @@
 <?php
 
-use App\Filament\Resources\TvDevices\TvDeviceResource;
+use App\Filament\Clusters\Devices\Pages\PairDevice;
 use App\Http\Controllers\AIOStreamsProxyController;
 use App\Http\Controllers\Api\DispatcharrController;
 use App\Http\Controllers\AssetPreviewController;
@@ -41,8 +41,7 @@ use Illuminate\Support\Facades\Route;
 // Vanity URL for Device Pairing — short and easy to type from a phone/computer
 // while looking at a TV. Forwards ?code= through if present (e.g. from a QR link).
 Route::get('/pdt', function () {
-    return redirect(TvDeviceResource::getUrl('index', array_filter([
-        'tab' => 'pairing',
+    return redirect(PairDevice::getUrl(array_filter([
         'code' => request()->query('code'),
     ])));
 })->name('device-pairing.vanity');
@@ -452,14 +451,18 @@ Route::get('/webdav-media/{integration}/stream/{item}', [
 Route::get('/aiostreams-media/{integration}/channel/{channel}/stream', [
     MediaServerProxyController::class,
     'streamAioStreamsChannel',
-])->middleware(ValidateSignature::relative())->name('aiostreams-media.channel.stream');
+])->middleware(ValidateSignature::relative('proxy'))->name('aiostreams-media.channel.stream');
 
 Route::get('/aiostreams-media/{integration}/episode/{episode}/stream', [
     MediaServerProxyController::class,
     'streamAioStreamsEpisode',
-])->middleware(ValidateSignature::relative())->name('aiostreams-media.episode.stream');
+])->middleware(ValidateSignature::relative('proxy'))->name('aiostreams-media.episode.stream');
 
 Route::get('/aiostreams-media/{integration}/live/{item}/stream', [
     MediaServerProxyController::class,
     'streamAioStreamsLive',
-])->middleware(ValidateSignature::relative())->name('aiostreams-media.live.stream');
+])->middleware(ValidateSignature::relative('proxy'))->name('aiostreams-media.live.stream');
+
+// NOTE: The DVR file streaming routes (dvr.recording.*) were relocated earlier in
+// this file, ahead of the /{uuid}/hdhr/... catch-all, so the HDHR pattern no
+// longer swallows /dvr/... URLs. See the "DVR file streaming routes" block above.
