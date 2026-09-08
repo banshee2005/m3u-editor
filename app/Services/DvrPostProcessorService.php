@@ -454,6 +454,7 @@ class DvrPostProcessorService
         foreach ($tokens as $token) {
             if ($skipNext) {
                 $skipNext = false;
+
                 continue;
             }
             $trimmed = trim($token);
@@ -463,6 +464,7 @@ class DvrPostProcessorService
             if (in_array($trimmed, $skipFlags, true)) {
                 // Skip this flag AND its next argument (the value).
                 $skipNext = true;
+
                 continue;
             }
             // Skip bare tokens that look like output files (not flags, not flag values).

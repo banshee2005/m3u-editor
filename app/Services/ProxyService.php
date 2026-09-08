@@ -26,6 +26,7 @@ class ProxyService
         $publicUrl = config('proxy.m3u_proxy_public_url');
         if (! empty($publicUrl) && filter_var($publicUrl, FILTER_VALIDATE_URL)) {
             $this->baseUrl = rtrim($publicUrl, '/');
+
             return;
         }
 

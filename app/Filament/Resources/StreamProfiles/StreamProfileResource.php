@@ -4,6 +4,7 @@ namespace App\Filament\Resources\StreamProfiles;
 
 use App\Filament\Actions\CopyToUserAction;
 use App\Filament\Concerns\HasCopilotSupport;
+use App\Models\DvrSetting;
 use App\Models\StreamProfile;
 use App\Services\M3uProxyService;
 use EslamRedaDiv\FilamentCopilot\Contracts\CopilotResource;
@@ -438,7 +439,7 @@ class StreamProfileResource extends Resource implements CopilotResource
                 Actions\DeleteAction::make()
                     ->before(function (StreamProfile $record, Actions\DeleteAction $action): void {
                         $referencing = $record->getReferencingAdaptiveProfiles();
-                        $dvrUsages = \App\Models\DvrSetting::where('stream_profile_id', $record->id)->count();
+                        $dvrUsages = DvrSetting::where('stream_profile_id', $record->id)->count();
                         if ($referencing->isEmpty() && $dvrUsages === 0) {
                             return;
                         }
