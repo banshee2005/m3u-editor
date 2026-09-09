@@ -957,6 +957,23 @@ class M3uProxyService
             $profileSourcePlaylist = $channel->playlist;
         }
 
+        // When the channel comes through a MergedPlaylist/CustomPlaylist/PlaylistAlias,
+        // the $playlist parameter is the wrapper, not the source. Pool search keys
+        // (original_playlist_uuid) and Redis channel→stream mappings must use the
+        // SOURCE playlist UUID so that streams created via the source playlist are
+        // found when the same channel is requested through the merged playlist.
+        // For channels without pooled providers (e.g. antenna), $profileSourcePlaylist
+        // is null and $originalPlaylistUuid stays as the wrapper UUID — no pooling
+        // involvement, so this is safe.
+        if ($profileSourcePlaylist && $profileSourcePlaylist->uuid !== $originalPlaylistUuid) {
+            Log::debug('Resolving pool UUID to source playlist for merged/custom context', [
+                'original_playlist_uuid' => $originalPlaylistUuid,
+                'resolved_source_playlist_uuid' => $profileSourcePlaylist->uuid,
+                'channel_id' => $originalChannelId,
+            ]);
+            $originalPlaylistUuid = $profileSourcePlaylist->uuid;
+        }
+
         // IMPORTANT: Check for existing pooled stream BEFORE capacity check AND provider profile selection
         // If a pooled stream exists, we can reuse it without consuming additional capacity
         // We search WITHOUT filtering by provider profile to maximize pooling opportunities:
@@ -1216,6 +1233,7 @@ class M3uProxyService
         // Note: If we already selected a profile during pooled stream check, skip this
         // Use profileSourcePlaylist which may be the channel's source playlist when streaming via CustomPlaylist
         // Use selectAndReserveProfile() for atomic select+increment to prevent TOCTOU races
+
         if (! $selectedProfile && $profileSourcePlaylist) {
             $forceSelect = $profileSourcePlaylist->bypass_provider_limits ?? false;
             [$selectedProfile, $reservationId] = ProfileService::selectAndReserveProfile($profileSourcePlaylist, null, $originalChannelId, $originalPlaylistUuid, $forceSelect, $clientIdentifier);
@@ -1515,6 +1533,18 @@ class M3uProxyService
         } elseif ($episode->playlist instanceof Playlist && $episode->playlist->profiles_enabled) {
             // Streaming through CustomPlaylist/MergedPlaylist/PlaylistAlias - use episode's source Playlist
             $profileSourcePlaylist = $episode->playlist;
+        }
+
+        // When the episode comes through a MergedPlaylist/CustomPlaylist/PlaylistAlias,
+        // resolve originalPlaylistUuid to the source playlist UUID so pool search keys
+        // and Redis channel→stream mappings are consistent across playlist types.
+        if ($profileSourcePlaylist && $profileSourcePlaylist->uuid !== $originalPlaylistUuid) {
+            Log::debug('Resolving pool UUID to source playlist for merged/custom context (episode)', [
+                'original_playlist_uuid' => $originalPlaylistUuid,
+                'resolved_source_playlist_uuid' => $profileSourcePlaylist->uuid,
+                'episode_id' => $originalEpisodeId,
+            ]);
+            $originalPlaylistUuid = $profileSourcePlaylist->uuid;
         }
 
         // Cached failover episodes so the relationship is only queried once per request

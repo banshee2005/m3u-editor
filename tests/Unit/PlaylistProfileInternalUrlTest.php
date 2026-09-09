@@ -1,6 +1,7 @@
 <?php
 
 use App\Models\Channel;
+use App\Models\ChannelProfileMap;
 use App\Models\Episode;
 use App\Models\Playlist;
 use App\Models\PlaylistProfile;
@@ -117,4 +118,50 @@ test('it falls back to the plain credential swap when an internal profile has no
     // untouched), just not the direct-resolution shortcut.
     expect($profile->transformChannelUrl($sourceChannel))
         ->toBe(rtrim(url('/'), '/').'/live/fallbackuser/'.$targetPlaylist->uuid.'/123.ts');
+});
+
+test('it resolves via channel_profile_map when source_id lookup fails', function () {
+    $poolPlaylist = Playlist::factory()->create([
+        'xtream_config' => [
+            'url' => 'http://primary-provider.test',
+            'username' => 'pooluser',
+            'password' => 'poolpass',
+        ],
+    ]);
+
+    $targetPlaylist = Playlist::factory()->create();
+
+    // Source channel has a numeric source_id that doesn't match any channel on target
+    $sourceChannel = Channel::factory()->create([
+        'playlist_id' => $poolPlaylist->id,
+        'source_id' => '1918533',
+        'name' => 'TSN',
+    ]);
+
+    // Target channel has a different ID but same name
+    $targetChannel = Channel::factory()->create([
+        'playlist_id' => $targetPlaylist->id,
+        'source_id' => 'some-hash-id',
+        'name' => 'TSN',
+        'enabled' => true,
+        'url' => 'http://real-upstream.test/live/user/pass/999.ts',
+    ]);
+
+    // Create the mapping
+    ChannelProfileMap::create([
+        'source_channel_id' => $sourceChannel->id,
+        'target_playlist_id' => $targetPlaylist->id,
+        'target_channel_id' => $targetChannel->id,
+    ]);
+
+    $profile = PlaylistProfile::factory()->create([
+        'playlist_id' => $poolPlaylist->id,
+        'url' => url('/'),
+        'password' => $targetPlaylist->uuid,
+    ]);
+
+    // resolveInternalUrl() finds no matching channel via source_id (hash mismatch),
+    // but the mapping table resolves it to the correct target channel.
+    expect($profile->transformChannelUrl($sourceChannel))
+        ->toBe($targetChannel->url);
 });

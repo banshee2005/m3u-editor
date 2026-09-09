@@ -116,7 +116,26 @@ class DvrRecorderService
         // circuit-breaker drops (provider kills one connection when a second opens).
         $channel = $recording->channel;
         if ($channel) {
-            $streamUrl = $channel->url_custom ?? $channel->url ?? $recording->stream_url;
+            // When the channel comes from a playlist with pooled providers (2-step setup),
+            // resolve the URL through getChannelUrl() so profile selection and URL transform
+            // are applied. Otherwise use the raw channel URL.
+            $sourcePlaylist = $channel->playlist;
+            if ($sourcePlaylist instanceof Playlist && $sourcePlaylist->profiles_enabled) {
+                $streamUrl = app(M3uProxyService::class)->getChannelUrl(
+                    $sourcePlaylist,
+                    $channel,
+                    null,  // no request
+                    null,  // no stream profile
+                    $recording->user?->name,
+                    null   // no playlist auth
+                );
+                Log::info('DVR: Resolved URL via profile selection', [
+                    'recording_id' => $recording->id,
+                    'stream_url' => substr($streamUrl, 0, 100),
+                ]);
+            } else {
+                $streamUrl = $channel->url_custom ?? $channel->url ?? $recording->stream_url;
+            }
         } else {
             $streamUrl = $recording->stream_url;
         }

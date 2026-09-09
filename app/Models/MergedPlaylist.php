@@ -21,6 +21,44 @@ class MergedPlaylist extends Model
     use ShortUrlTrait;
 
     /**
+     * When a merged playlist is saved, auto-populate channel profile mappings
+     * for any source playlists that have pooled providers. This ensures
+     * resolveInternalUrl() can find the correct target channel by ID.
+     */
+    protected static function booted(): void
+    {
+        static::saved(function (MergedPlaylist $mergedPlaylist) {
+            $mergedPlaylist->populateChannelProfileMaps();
+        });
+    }
+
+    /**
+     * For each pooled-provider playlist in this merged playlist, populate
+     * channel mappings against the profile target playlists.
+     */
+    public function populateChannelProfileMaps(): void
+    {
+        foreach ($this->playlists as $playlist) {
+            if (! $playlist->profiles_enabled) {
+                continue;
+            }
+
+            foreach ($playlist->profiles as $profile) {
+                if (! $profile->url || ! str_starts_with(rtrim($profile->url, '/'), rtrim(url('/'), '/'))) {
+                    continue;
+                }
+
+                $targetPlaylist = Playlist::where('uuid', $profile->password)->first();
+                if (! $targetPlaylist || $targetPlaylist->id === $playlist->id) {
+                    continue;
+                }
+
+                ChannelProfileMap::populateForPlaylist($playlist, $targetPlaylist);
+            }
+        }
+    }
+
+    /**
      * The attributes that should be cast to native types.
      *
      * @var array

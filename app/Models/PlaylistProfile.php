@@ -292,8 +292,6 @@ class PlaylistProfile extends Model
 
         $isEpisode = $model instanceof Episode;
 
-        // Channel's provider-native ID column is `source_id`; Episode's is
-        // `source_episode_id` - they are not interchangeable columns.
         $sourceId = $isEpisode ? $model->source_episode_id : $model->source_id;
         if (! $sourceId) {
             return null;
@@ -313,6 +311,17 @@ class PlaylistProfile extends Model
                 ->where('source_id', $sourceId)
                 ->where('enabled', true)
                 ->first();
+
+        if (! $targetModel) {
+            // Fallback: use the channel_profile_map table for exact ID matching.
+            // The mapping is auto-populated when a merged playlist with pooled providers is saved.
+            if (! $isEpisode) {
+                $mapping = ChannelProfileMap::resolve($model->id, $targetPlaylist->id);
+                if ($mapping) {
+                    $targetModel = $mapping->targetChannel;
+                }
+            }
+        }
 
         if (! $targetModel) {
             Log::warning('Could not resolve internal profile URL to target playlist', [
