@@ -4462,12 +4462,18 @@ class XtreamApiController extends Controller
         // outlive its row's Recording status during stop drain) PLUS imminent
         // scheduled recordings (starting within 10 minutes) so rapid-fire
         // taps can't slip past before the previous ones start.
-        $sourceLimit = $channel->playlist instanceof Playlist ? $channel->playlist->available_streams : 0;
+        // Profile-enabled playlists (pooled providers) are EXCLUDED here:
+        // a full pool is handled at start time by the DVR-wins eviction
+        // (the recording evicts an older live stream instead of failing).
+        $sourcePlaylist = $channel->playlist instanceof Playlist ? $channel->playlist : null;
+        $sourceLimit = $sourcePlaylist && ! $sourcePlaylist->profiles_enabled
+            ? $sourcePlaylist->available_streams
+            : 0;
         $effectiveLimit = 0;
         if ($sourceLimit > 0) {
             $effectiveLimit = $sourceLimit;
         }
-        if ($playlist->available_streams > 0) {
+        if (! $sourcePlaylist?->profiles_enabled && $playlist->available_streams > 0) {
             $effectiveLimit = $effectiveLimit === 0
                 ? $playlist->available_streams
                 : min($effectiveLimit, $playlist->available_streams);

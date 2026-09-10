@@ -3751,7 +3751,7 @@ class M3uProxyService
      * UUID), including their metadata. Used to detect which streams a
      * DVR-wins eviction stopped so the affected viewer can be notified.
      *
-     * @return array<int, array{stream_id: string, metadata: array}>
+     * @return array<int, array{stream_id: string, created_at: ?string, metadata: array}>
      */
     public function getActiveLiveStreams(?string $playlistUuid = null): array
     {
@@ -3778,6 +3778,7 @@ class M3uProxyService
                 }
                 $result[] = [
                     'stream_id' => (string) ($stream['stream_id'] ?? ''),
+                    'created_at' => $stream['created_at'] ?? null,
                     'metadata' => $metadata,
                 ];
             }
@@ -3789,6 +3790,39 @@ class M3uProxyService
             ]);
 
             return [];
+        }
+    }
+
+    /**
+     * Delete a stream on the proxy (used to evict a specific live stream to
+     * make room for a DVR recording — never a recording-backed stream).
+     */
+    public function deleteStream(string $streamId): bool
+    {
+        if (empty($this->apiBaseUrl)) {
+            return false;
+        }
+
+        try {
+            $endpoint = $this->apiBaseUrl.'/streams/'.rawurlencode($streamId);
+            $response = Http::timeout(10)
+                ->acceptJson()
+                ->withHeaders($this->apiToken ? ['X-API-Token' => $this->apiToken] : [])
+                ->delete($endpoint);
+
+            if ($response->successful()) {
+                Log::debug("Stream {$streamId} deleted on proxy");
+
+                return true;
+            }
+
+            Log::warning("Failed to delete stream {$streamId} on proxy: HTTP {$response->status()}");
+
+            return false;
+        } catch (Exception $e) {
+            Log::warning("Could not delete stream {$streamId} on proxy: {$e->getMessage()}");
+
+            return false;
         }
     }
 

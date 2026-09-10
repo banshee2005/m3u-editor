@@ -126,12 +126,52 @@ class DvrRecorderService
             // recording is never lost to a transient proxy/provider error.
             $sourcePlaylist = $channel->playlist;
             if ($sourcePlaylist instanceof Playlist && $sourcePlaylist->profiles_enabled) {
-                // Snapshot the active live streams so we can detect which ones a
-                // "DVR wins" eviction stopped (getChannelUrl stops the oldest
-                // stream when the pool is full) and notify the affected viewers.
-                $streamsBefore = $this->proxy->getActiveLiveStreams($sourcePlaylist->uuid);
+// Snapshot the active live streams so we can detect which ones a
+            // "DVR wins" eviction stopped and notify the affected viewers.
+            $streamsBefore = $this->proxy->getActiveLiveStreams($sourcePlaylist->uuid);
 
-                try {
+            // Pre-evict the oldest LIVE-VIEWER stream (never a recording's
+            // stream) when the pool is full, so getChannelUrl's age-based
+            // stopOldestOnLimit cannot kill an active recording's stream.
+            $totalProfileSlots = 0;
+            foreach ($sourcePlaylist->profiles()->where('enabled', true)->get() as $profile) {
+                $totalProfileSlots += (int) $profile->effective_max_streams;
+            }
+
+            if ($totalProfileSlots > 0 && count($streamsBefore) >= $totalProfileSlots) {
+                $recordingChannelIds = $setting->recordings()
+                    ->where('status', DvrRecordingStatus::Recording)
+                    ->pluck('channel_id')
+                    ->map(fn ($c) => (int) $c)
+                    ->all();
+
+                // Oldest first — a viewer whose stream is evicted should be
+                // the one who has been watching the longest.
+                usort($streamsBefore, fn ($a, $b) => strcmp((string) ($a['created_at'] ?? ''), (string) ($b['created_at'] ?? '')));
+
+                $preEvictedStreamId = null;
+                foreach ($streamsBefore as $candidate) {
+                    $streamChannelId = (int) ($candidate['metadata']['channel_id'] ?? 0);
+                    if (in_array($streamChannelId, $recordingChannelIds, true)) {
+                        continue;
+                    }
+
+                    if ($this->proxy->deleteStream($candidate['stream_id'])) {
+                        $preEvictedStreamId = $candidate['stream_id'];
+                        Log::info('DVR: evicted oldest live stream for recording', [
+                            'recording_id' => $recording->id,
+                            'title' => $recording->title,
+                            'evicted_stream_id' => $candidate['stream_id'],
+                            'evicted_channel_id' => $streamChannelId,
+                        ]);
+                        $this->notifyEvictedViewer($candidate, $recording);
+                        usleep(200000); // 200ms for the proxy to release the slot
+                    }
+                    break;
+                }
+            }
+
+            try {
                     $streamUrl = $this->proxy->getChannelUrl(
                         $sourcePlaylist,
                         $channel,
@@ -157,9 +197,13 @@ class DvrRecorderService
                 }
 
                 // Notify the viewers of any live stream the DVR-wins eviction
-                // stopped while resolving this recording's URL.
+                // stopped while resolving this recording's URL (the pre-evicted
+                // stream was already notified above — skip it here).
                 $streamsAfter = $this->proxy->getActiveLiveStreams($sourcePlaylist->uuid);
                 foreach ($streamsBefore as $before) {
+                    if (isset($preEvictedStreamId) && ($before['stream_id'] ?? null) === $preEvictedStreamId) {
+                        continue;
+                    }
                     $stillActive = collect($streamsAfter)->first(
                         fn ($after) => ($after['stream_id'] ?? null) === ($before['stream_id'] ?? null),
                     );
