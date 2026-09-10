@@ -258,7 +258,13 @@ class DvrSchedulerService
         foreach ($programmes as $programme) {
             // Dedup strategy depends on series_mode:
             // - All: record every matching airing (no dedup)
-            // - UniqueSe/NewFlag: dedup by programme title (same game = same identity)
+            // - UniqueSe/NewFlag with season/episode: dedup by rule series_key
+            //   + S/E (scripted episodes — Purged rows still block, see
+            //   alreadyHaveEpisode)
+            // - UniqueSe/NewFlag without S/E (sports): identity is the
+            //   programme title + airing DATE — a re-match on a different date
+            //   is a new event and records even if an earlier game was
+            //   recorded or purged; a same-day replay is the same game.
             $hasSeasonEpisode = $programme->season !== null && $programme->episode !== null;
 
             if ($rule->series_mode === DvrSeriesMode::All) {
@@ -272,8 +278,22 @@ class DvrSchedulerService
                 $seriesKey = SeriesKey::for($rule->dvrSetting->id, $programme->title);
             }
 
-            $alreadyRecorded = $seriesKey !== null && $rule->alreadyHaveEpisode($seriesKey, $programme->season, $programme->episode);
-            $alreadyScheduled = $dryRun && $seriesKey !== null && in_array($seriesKey.'|'.($programme->season ?? '').'|'.($programme->episode ?? ''), $scheduledProgrammeIds['scheduled_keys'] ?? []);
+            $dedupKey = $seriesKey.'|'.($hasSeasonEpisode
+                ? ($programme->season ?? '').'|'.($programme->episode ?? '')
+                : ($programme->start_time?->toDateString() ?? '').'|');
+
+            $windowDays = $rule->dvrSetting?->sportsDedupDays() ?? 2;
+
+            $alreadyRecorded = $seriesKey !== null && (
+                $hasSeasonEpisode
+                    ? $rule->alreadyHaveEpisode($seriesKey, $programme->season, $programme->episode)
+                    : $rule->alreadyHaveEpisodeOnDate($seriesKey, $programme->start_time, $windowDays)
+            );
+            $alreadyScheduled = $dryRun && $seriesKey !== null && (
+                $hasSeasonEpisode
+                    ? in_array($dedupKey, $scheduledProgrammeIds['scheduled_keys'] ?? [])
+                    : $rule->sportsAlreadyScheduled($seriesKey, $programme->start_time, $windowDays, $scheduledProgrammeIds['scheduled_keys'] ?? [])
+            );
 
             if ($alreadyRecorded || $alreadyScheduled) {
                 Log::debug('DVR: Skipping programme — already have episode', [
@@ -281,6 +301,7 @@ class DvrSchedulerService
                     'title' => $programme->title,
                     'season' => $programme->season,
                     'episode' => $programme->episode,
+                    'start_time' => $programme->start_time,
                 ]);
 
                 if ($dryRun) {
@@ -292,7 +313,7 @@ class DvrSchedulerService
 
             if ($dryRun) {
                 $scheduledProgrammeIds['scheduled'][] = $programme->id;
-                $scheduledProgrammeIds['scheduled_keys'][] = $seriesKey.'|'.($programme->season ?? '').'|'.($programme->episode ?? '');
+                $scheduledProgrammeIds['scheduled_keys'][] = $dedupKey;
             } else {
                 $this->createScheduledRecordingFromProgramme($rule, $programme);
             }

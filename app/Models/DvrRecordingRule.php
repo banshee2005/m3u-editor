@@ -9,6 +9,7 @@ use App\Enums\DvrRuleType;
 use App\Enums\DvrSeriesMode;
 use App\Services\DvrSchedulerService;
 use App\Support\SeriesKey;
+use Carbon\CarbonImmutable;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
@@ -185,6 +186,75 @@ class DvrRecordingRule extends Model
             ->first();
 
         return $recording?->status?->value;
+    }
+
+    /**
+     * Sports identity (no season/episode): same series_key within a dedup
+     * WINDOW (see DvrSetting::sportsDedupDays) of an existing recording = a
+     * replay of the same game (skipped — even after retention purged the file,
+     * the row is kept). Beyond the window it is a NEW event (a re-match later
+     * in the season) and must record. A same-day replay is always a duplicate.
+     */
+    public function getEpisodeRecordingStatusOnDate(string $seriesKey, \DateTimeInterface $date, int $windowDays): ?string
+    {
+        $from = (new CarbonImmutable($date))->subDays($windowDays);
+
+        $recording = DvrRecording::where('series_key', $seriesKey)
+            ->whereBetween('scheduled_start', [$from, $date])
+            ->whereIn('status', [
+                DvrRecordingStatus::Scheduled,
+                DvrRecordingStatus::Recording,
+                DvrRecordingStatus::PostProcessing,
+                DvrRecordingStatus::Completed,
+                DvrRecordingStatus::Purged,
+            ])
+            ->orderByDesc('scheduled_start')
+            ->first();
+
+        return $recording?->status?->value;
+    }
+
+    /**
+     * Sports identity duplicate check — see getEpisodeRecordingStatusOnDate().
+     */
+    public function alreadyHaveEpisodeOnDate(string $seriesKey, \DateTimeInterface $date, int $windowDays): bool
+    {
+        return $this->getEpisodeRecordingStatusOnDate($seriesKey, $date, $windowDays) !== null;
+    }
+
+    /**
+     * In-window duplicate check against dry-run scheduled keys (sports keys
+     * are seriesKey|DATE): true when a same-title airing within [windowStart,
+     * date] was already scheduled in this dry run.
+     *
+     * @param  list<string>  $scheduledKeys
+     */
+    public function sportsAlreadyScheduled(string $seriesKey, \DateTimeInterface $date, int $windowDays, array $scheduledKeys): bool
+    {
+        if ($windowDays === 0) {
+            return in_array($seriesKey.'|'.$date->format('Y-m-d'), $scheduledKeys, true);
+        }
+
+        $windowStart = $date->format('Y-m-d');
+        $prefix = $seriesKey.'|';
+        foreach ($scheduledKeys as $key) {
+            if (! str_starts_with($key, $prefix)) {
+                continue;
+            }
+
+            $scheduledDate = substr($key, strlen($prefix));
+            $scheduledTimestamp = strtotime($scheduledDate);
+            $dateTimestamp = strtotime($date->format('Y-m-d'));
+
+            if ($scheduledTimestamp !== false
+                && $dateTimestamp !== false
+                && $scheduledTimestamp >= $dateTimestamp - $windowDays * 86400
+                && $scheduledTimestamp <= $dateTimestamp) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**
