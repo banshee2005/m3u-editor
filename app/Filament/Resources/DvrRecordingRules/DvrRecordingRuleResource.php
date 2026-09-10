@@ -127,11 +127,15 @@ class DvrRecordingRuleResource extends Resource
 
                         // Deduplicate by title — the IPTV provider may have
                         // multiple streams/quality variants for the same channel.
+                        // Channels without a title fall back to their name so
+                        // the option label is never null.
                         return Channel::whereIn('id', $dvrSetting->ownerChannelsSubquery())
                             ->orderBy('title')
                             ->get()
                             ->unique('title')
-                            ->pluck('title', 'id')
+                            ->mapWithKeys(fn (Channel $channel): array => [
+                                $channel->id => $channel->title ?: $channel->name,
+                            ])
                             ->prepend(__('From Original Source'), 0)
                             ->all();
                     })

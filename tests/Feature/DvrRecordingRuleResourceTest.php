@@ -36,7 +36,10 @@ it('re-renders the airings preview from the edited form values on an existing ru
     ]);
     $channel = Channel::factory()
         ->for($playlist)
-        ->create(['epg_channel_id' => $epgChannel->id]);
+        ->create([
+            'epg_channel_id' => $epgChannel->id,
+            'title' => 'Test Channel',
+        ]);
 
     $rule = DvrRecordingRule::factory()
         ->series()
