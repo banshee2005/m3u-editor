@@ -206,7 +206,9 @@ class DvrRecordingRuleResource extends Resource
     /**
      * Build a temporary DvrRecordingRule from form values to preview
      * matched airings. Works for both new rules (no record yet) and
-     * existing rules being edited.
+     * existing rules being edited — the preview always reflects the form's
+     * CURRENT (possibly unsaved) values, so onBlur changes to the title,
+     * channel or record-episodes mode re-render the airings immediately.
      */
     protected static function resolveMatchedAiringsFromForm(?DvrRecordingRule $record, Get $get): array
     {
@@ -220,25 +222,29 @@ class DvrRecordingRuleResource extends Resource
             return [];
         }
 
-        // For existing records, use the record directly
-        if ($record) {
-            return static::resolveMatchedAirings($record);
-        }
-
-        // For new records, build a temporary rule from form values
         $dvrSettingId = $get('dvr_setting_id');
         if (! $dvrSettingId) {
             return [];
         }
 
+        $formMatchMode = is_string($get('match_mode'))
+            ? DvrMatchMode::tryFrom($get('match_mode'))
+            : $get('match_mode');
+
         $tempRule = new DvrRecordingRule([
+            // Existing records supply the base (fields outside the form —
+            // tmdb_id, enable_comskip, keep_last, ...) so edited rules preview
+            // with their full context.
+            ...($record?->getAttributes() ?? []),
             'series_title' => $seriesTitle,
-            'match_mode' => is_string($get('match_mode')) ? DvrMatchMode::tryFrom($get('match_mode')) : ($get('match_mode') ?? DvrMatchMode::Contains),
-            'series_mode' => is_string($get('series_mode')) ? DvrSeriesMode::tryFrom($get('series_mode')) : ($get('series_mode') ?? DvrSeriesMode::All),
+            'match_mode' => $formMatchMode ?? $record?->match_mode ?? DvrMatchMode::Contains,
+            'series_mode' => is_string($get('series_mode'))
+                ? (DvrSeriesMode::tryFrom($get('series_mode')) ?? $record?->series_mode)
+                : ($get('series_mode') ?? $record?->series_mode ?? DvrSeriesMode::All),
             'dvr_setting_id' => $dvrSettingId,
-            'epg_channel_id' => $get('epg_channel_id'),
-            'channel_id' => $get('channel_id'),
-            'source_channel_id' => $get('source_channel_id'),
+            'epg_channel_id' => $get('epg_channel_id') ?? $record?->epg_channel_id,
+            'channel_id' => $get('channel_id') ?? $record?->channel_id,
+            'source_channel_id' => $get('source_channel_id') ?? $record?->source_channel_id,
         ]);
 
         return static::resolveMatchedAirings($tempRule);
