@@ -1,6 +1,6 @@
 <?php
 
-use App\Filament\Clusters\Devices\Pages\PairDevice;
+use App\Filament\Resources\TvDevices\TvDeviceResource;
 use App\Http\Controllers\AIOStreamsProxyController;
 use App\Http\Controllers\Api\DispatcharrController;
 use App\Http\Controllers\AssetPreviewController;
@@ -41,7 +41,8 @@ use Illuminate\Support\Facades\Route;
 // Vanity URL for Device Pairing — short and easy to type from a phone/computer
 // while looking at a TV. Forwards ?code= through if present (e.g. from a QR link).
 Route::get('/pdt', function () {
-    return redirect(PairDevice::getUrl(array_filter([
+    return redirect(TvDeviceResource::getUrl('index', array_filter([
+        'tab' => 'pairing',
         'code' => request()->query('code'),
     ])));
 })->name('device-pairing.vanity');
@@ -169,11 +170,7 @@ Route::get('/series/{username}/{password}/{streamId}.{format?}', [XtreamStreamCo
 Route::get('/timeshift/{username}/{password}/{duration}/{date}/{streamId}.{format?}', [XtreamStreamController::class, 'handleTimeshift'])
     ->name('xtream.stream.timeshift.root');
 
-// DVR file streaming routes - also declared before the HDHR /{uuid}/... catch-all.
-// Stream auth mirrors the Xtream stream pattern: username + password (playlist UUID)
-// or PlaylistAuth credentials embedded in the URL. Keep the more specific
-// live.m3u8 and edl routes ahead of the generic {uuid}.{format?} stream route so
-// Laravel does not consume "live.m3u8" as {uuid}.{format?}.
+// DVR routes - also before HDHR catch-all
 Route::get('/dvr/{username}/{password}/{uuid}/live.m3u8', [DvrStreamController::class, 'hlsPlaylist'])
     ->name('dvr.recording.hls.playlist');
 Route::get('/dvr/{username}/{password}/{uuid}/edl', [DvrStreamController::class, 'edl'])
@@ -451,18 +448,14 @@ Route::get('/webdav-media/{integration}/stream/{item}', [
 Route::get('/aiostreams-media/{integration}/channel/{channel}/stream', [
     MediaServerProxyController::class,
     'streamAioStreamsChannel',
-])->middleware(ValidateSignature::relative('proxy'))->name('aiostreams-media.channel.stream');
+])->middleware(ValidateSignature::relative())->name('aiostreams-media.channel.stream');
 
 Route::get('/aiostreams-media/{integration}/episode/{episode}/stream', [
     MediaServerProxyController::class,
     'streamAioStreamsEpisode',
-])->middleware(ValidateSignature::relative('proxy'))->name('aiostreams-media.episode.stream');
+])->middleware(ValidateSignature::relative())->name('aiostreams-media.episode.stream');
 
 Route::get('/aiostreams-media/{integration}/live/{item}/stream', [
     MediaServerProxyController::class,
     'streamAioStreamsLive',
-])->middleware(ValidateSignature::relative('proxy'))->name('aiostreams-media.live.stream');
-
-// NOTE: The DVR file streaming routes (dvr.recording.*) were relocated earlier in
-// this file, ahead of the /{uuid}/hdhr/... catch-all, so the HDHR pattern no
-// longer swallows /dvr/... URLs. See the "DVR file streaming routes" block above.
+])->middleware(ValidateSignature::relative())->name('aiostreams-media.live.stream');
