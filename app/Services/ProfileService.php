@@ -279,6 +279,14 @@ class ProfileService
                 return [null, null];
             }
 
+            // Prune stale reservations before counting capacity. A pending
+            // reservation (reservation:xxx) only lives as long as its reverse
+            // channel mapping (30s TTL). If the reverse key is gone, whoever
+            // held the slot never finalized or released it (deleted recording,
+            // missed webhook, crashed worker) — the slot is phantom and must
+            // not block new streams.
+            static::pruneStaleReservations($playlist);
+
             // Inside the lock: detect if this channel is already being served.
             // Prevents two simultaneous requests for the same channel from both
             // allocating a slot during the window before the first stream is visible
@@ -475,6 +483,52 @@ class ProfileService
         );
 
         return $proxyCount + static::countPendingReservations($profile);
+    }
+
+    /**
+     * Remove stale pending reservations for a playlist's profiles.
+     *
+     * Pending reservations (reservation:xxx) are written together with a
+     * reverse channel mapping that carries a 30-second TTL. A reservation
+     * whose reverse key has already expired is a phantom slot (the creator
+     * never finalized it and no webhook released it) — drop it from the
+     * profile's streams set so it stops blocking capacity.
+     */
+    public static function pruneStaleReservations(Playlist $playlist): void
+    {
+        try {
+            $profiles = $playlist->profiles()->where('enabled', true)->get();
+            foreach ($profiles as $profile) {
+                $streamsKey = static::getProfileStreamsKey($profile);
+                $members = Redis::smembers($streamsKey);
+
+                $stale = [];
+                foreach ($members as $member) {
+                    if (! str_starts_with($member, 'reservation:')) {
+                        continue;
+                    }
+                    if (! Redis::exists(static::getStreamChannelKey($member))) {
+                        $stale[] = $member;
+                    }
+                }
+
+                if ($stale !== []) {
+                    Redis::pipeline(function ($pipe) use ($streamsKey, $stale): void {
+                        $pipe->srem($streamsKey, ...$stale);
+                    });
+
+                    Log::info('Pruned stale profile reservations', [
+                        'profile_id' => $profile->id,
+                        'removed' => $stale,
+                    ]);
+                }
+            }
+        } catch (\Exception $e) {
+            Log::warning('Failed to prune stale profile reservations', [
+                'playlist_id' => $playlist->id,
+                'exception' => $e->getMessage(),
+            ]);
+        }
     }
 
     /**

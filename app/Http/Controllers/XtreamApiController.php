@@ -18,6 +18,7 @@ use App\Models\Channel;
 use App\Models\CustomPlaylist;
 use App\Models\DvrRecording;
 use App\Models\DvrRecordingRule;
+use App\Models\DvrSetting;
 use App\Models\DynamicGroup;
 use App\Models\EmbyLibraryMapping;
 use App\Models\Epg;
@@ -45,6 +46,7 @@ use App\Services\EmbyPublicationCatalogService;
 use App\Services\EpgCacheService;
 use App\Services\LogoCacheService;
 use App\Services\M3uProxyService;
+use App\Services\ProfileService;
 use App\Services\VodFileNameService;
 use App\Services\XtreamCategoryService;
 use App\Settings\GeneralSettings;
@@ -59,6 +61,7 @@ use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Bus;
 use Illuminate\Support\Facades\Config;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\RateLimiter;
 use Illuminate\Support\Facades\Redirect;
 use Illuminate\Support\Facades\Validator;
@@ -1198,8 +1201,8 @@ class XtreamApiController extends Controller
                     $backdropPaths = array_filter($backdropPaths);
                     $clearLogo = $seriesItem->metadata['clearlogo'] ?? null;
                     if ($playlist->enable_logo_proxy) {
-                        $cover = $this->proxyImageUrl($cover, self::posterProxyWidth());
-                        $backdropPaths = array_map(fn ($path) => $this->proxyImageUrl($path, self::backdropProxyWidth()), $backdropPaths);
+                        $cover = $this->proxyImageUrl($cover);
+                        $backdropPaths = array_map(fn ($path) => $this->proxyImageUrl($path), $backdropPaths);
                         $clearLogo = $clearLogo ? $this->proxyImageUrl($clearLogo) : null;
                     }
 
@@ -1326,8 +1329,8 @@ class XtreamApiController extends Controller
             $backdropPaths = array_filter($backdropPaths);
             $clearLogo = $seriesItem->metadata['clearlogo'] ?? null;
             if ($playlist->enable_logo_proxy) {
-                $cover = $this->proxyImageUrl($cover, self::posterProxyWidth());
-                $backdropPaths = array_map(fn ($path) => $this->proxyImageUrl($path, self::backdropProxyWidth()), $backdropPaths);
+                $cover = $this->proxyImageUrl($cover);
+                $backdropPaths = array_map(fn ($path) => $this->proxyImageUrl($path), $backdropPaths);
                 $clearLogo = $clearLogo ? $this->proxyImageUrl($clearLogo) : null;
             }
 
@@ -1376,7 +1379,7 @@ class XtreamApiController extends Controller
                 $castList = $seriesItem->metadata['cast_list'];
                 if ($playlist->enable_logo_proxy) {
                     $castList = array_map(function ($member) {
-                        $member['photo'] = $this->proxyImageUrl($member['photo'] ?? null, self::photoProxyWidth());
+                        $member['photo'] = $this->proxyImageUrl($member['photo'] ?? null);
 
                         return $member;
                     }, $castList);
@@ -1397,13 +1400,13 @@ class XtreamApiController extends Controller
                 foreach ($seriesItem->seasons as $season) {
                     $seasonNumber = $season->season_number;
                     $seasonCover = $playlist->enable_logo_proxy && ($season->cover ?? false)
-                        ? $this->proxyImageUrl($season->cover, self::posterProxyWidth())
+                        ? $this->proxyImageUrl($season->cover)
                         : $season->cover;
                     $tmdbCover = $playlist->enable_logo_proxy && ($seriesItem->metadata['cover_tmdb'] ?? false)
-                        ? $this->proxyImageUrl($seriesItem->metadata['cover_tmdb'], self::posterProxyWidth())
+                        ? $this->proxyImageUrl($seriesItem->metadata['cover_tmdb'])
                         : ($seriesItem->metadata['cover_tmdb'] ?? null);
                     $coverBig = $playlist->enable_logo_proxy && ($season->cover_big ?? false)
-                        ? $this->proxyImageUrl($season->cover_big, self::posterProxyWidth())
+                        ? $this->proxyImageUrl($season->cover_big)
                         : ($season->cover_big ?? null);
                     $seasons[] = [
                         'name' => $season->metadata['name'] ?? "Season {$seasonNumber}",
@@ -1424,12 +1427,12 @@ class XtreamApiController extends Controller
                             $containerExtension = $episode->container_extension ?? 'mp4';
                             if ($episode->info['movie_image'] ?? false) {
                                 $movieImage = $playlist->enable_logo_proxy
-                                    ? $this->proxyImageUrl($episode->info['movie_image'], self::posterProxyWidth())
+                                    ? $this->proxyImageUrl($episode->info['movie_image'])
                                     : $episode->info['movie_image'];
                             }
                             if ($episode->info['cover_big'] ?? false) {
                                 $movieImage = $playlist->enable_logo_proxy
-                                    ? $this->proxyImageUrl($episode->info['cover_big'], self::posterProxyWidth())
+                                    ? $this->proxyImageUrl($episode->info['cover_big'])
                                     : $episode->info['cover_big'];
                             }
 
@@ -1830,9 +1833,9 @@ class XtreamApiController extends Controller
             $backdropPaths = array_filter($backdropPaths);
             $clearLogo = $info['clearlogo'] ?? null;
             if ($playlist->enable_logo_proxy) {
-                $cover = $this->proxyImageUrl($cover, self::posterProxyWidth());
-                $movieImage = $this->proxyImageUrl($movieImage, self::posterProxyWidth());
-                $backdropPaths = array_map(fn ($path) => $this->proxyImageUrl($path, self::backdropProxyWidth()), $backdropPaths);
+                $cover = $this->proxyImageUrl($cover);
+                $movieImage = $this->proxyImageUrl($movieImage);
+                $backdropPaths = array_map(fn ($path) => $this->proxyImageUrl($path), $backdropPaths);
                 $clearLogo = $clearLogo ? $this->proxyImageUrl($clearLogo) : null;
             }
 
@@ -1905,7 +1908,7 @@ class XtreamApiController extends Controller
                 $castList = $info['cast_list'];
                 if ($playlist->enable_logo_proxy) {
                     $castList = array_map(function ($member) {
-                        $member['photo'] = $this->proxyImageUrl($member['photo'] ?? null, self::photoProxyWidth());
+                        $member['photo'] = $this->proxyImageUrl($member['photo'] ?? null);
 
                         return $member;
                     }, $castList);
@@ -2992,7 +2995,7 @@ class XtreamApiController extends Controller
                     $backdrop = $this->extractFirstUrl($backdropPath);
                 }
                 if ($backdrop && ($playlist->enable_logo_proxy ?? false)) {
-                    $backdrop = $this->proxyImageUrl($backdrop, self::backdropProxyWidth());
+                    $backdrop = $this->proxyImageUrl($backdrop);
                 }
 
                 $data['title'] = $series?->name ?? $episode?->title ?? null;
@@ -3013,7 +3016,7 @@ class XtreamApiController extends Controller
                 }
                 $backdropPaths = array_filter($backdropPaths);
                 if ($playlist->enable_logo_proxy ?? false) {
-                    $backdropPaths = array_map(fn ($path) => $this->proxyImageUrl($path, self::backdropProxyWidth()), $backdropPaths);
+                    $backdropPaths = array_map(fn ($path) => $this->proxyImageUrl($path), $backdropPaths);
                 }
 
                 $data['title'] = $channel?->title ?? $channel?->name ?? null;
@@ -3139,7 +3142,7 @@ class XtreamApiController extends Controller
             $backdrop = $this->extractFirstUrl($series?->backdrop_path ?? null);
         }
         if ($backdrop && ($playlist->enable_logo_proxy ?? false)) {
-            $backdrop = $this->proxyImageUrl($backdrop, self::backdropProxyWidth());
+            $backdrop = $this->proxyImageUrl($backdrop);
         }
 
         return [
@@ -3398,38 +3401,13 @@ class XtreamApiController extends Controller
      * (e.g. a media server image proxied at sync time), in which case it's returned
      * untouched to avoid double-proxying it through the logo proxy's own fetch.
      */
-    /**
-     * Role-based downscale widths baked into proxied artwork URLs so clients
-     * pull a right-sized file. Null (resize disabled) leaves URLs unchanged.
-     */
-    private static function posterProxyWidth(): ?int
-    {
-        return config('proxy.image_resize_enabled', true)
-            ? (int) config('proxy.image_resize_poster_width', 600)
-            : null;
-    }
-
-    private static function backdropProxyWidth(): ?int
-    {
-        return config('proxy.image_resize_enabled', true)
-            ? (int) config('proxy.image_resize_backdrop_width', 1280)
-            : null;
-    }
-
-    private static function photoProxyWidth(): ?int
-    {
-        return config('proxy.image_resize_enabled', true)
-            ? (int) config('proxy.image_resize_photo_width', 300)
-            : null;
-    }
-
-    private function proxyImageUrl(?string $url, ?int $width = null): ?string
+    private function proxyImageUrl(?string $url): ?string
     {
         if (! $url || ! filter_var($url, FILTER_VALIDATE_URL) || str_starts_with($url, url('/'))) {
             return $url;
         }
 
-        return LogoProxyController::generateProxyUrl($url, width: $width);
+        return LogoProxyController::generateProxyUrl($url);
     }
 
     /**
@@ -3894,6 +3872,20 @@ class XtreamApiController extends Controller
         return $this->resolveEffectivePlaylist($playlist);
     }
 
+    private function resolveDvrSetting($playlist, ?int $channelId = null): ?\App\Models\DvrSetting
+    {
+        if ($playlist instanceof Playlist && $playlist->dvrSetting?->enabled) {
+            return $playlist->dvrSetting;
+        }
+        if ($channelId && ! $playlist instanceof Playlist) {
+            $channel = $playlist->channels()->where('channels.id', $channelId)->first();
+            if ($channel?->playlist instanceof Playlist && $channel->playlist->dvrSetting?->enabled) {
+                return $channel->playlist->dvrSetting;
+            }
+        }
+        return null;
+    }
+
     /**
      * Get short EPG for an attached network on custom/merged playlists.
      * Stream ID format: network-{id}
@@ -3980,17 +3972,32 @@ class XtreamApiController extends Controller
      */
     private function getDvrRecordings(Request $request, $playlist, string $username, string $password, ?PlaylistAuth $playlistAuth): \Illuminate\Http\JsonResponse
     {
-        $dvrSetting = $playlist->dvrSetting;
-
-        if (! $dvrSetting) {
+        if (! $playlist) {
             return response()->json([]);
+        }
+
+        if ($playlist instanceof Playlist) {
+            $dvrSetting = $playlist->dvrSetting;
+            if (! $dvrSetting) {
+                return response()->json([]);
+            }
+            $dvrSettingIds = [$dvrSetting->id];
+        } else {
+            $sourcePlaylistIds = DB::table('merged_playlist_playlist')
+                ->where('merged_playlist_id', $playlist->id)
+                ->pluck('playlist_id')
+                ->toArray();
+            $dvrSettingIds = DvrSetting::whereIn('playlist_id', $sourcePlaylistIds)->pluck('id')->toArray();
+            if (empty($dvrSettingIds)) {
+                return response()->json([]);
+            }
         }
 
         $status = $request->input('status');
         $limit = min((int) $request->input('limit', 50), 200);
         $offset = (int) $request->input('offset', 0);
 
-        $query = DvrRecording::where('dvr_setting_id', $dvrSetting->id)
+        $query = DvrRecording::whereIn('dvr_setting_id', $dvrSettingIds)
             ->when($playlistAuth, fn ($q) => $q->where('playlist_auth_id', $playlistAuth->id))
             ->with(['channel', 'dvrSetting', 'recordingRule'])
             ->orderByDesc('scheduled_start');
@@ -4018,17 +4025,28 @@ class XtreamApiController extends Controller
             return response()->json(['error' => 'recording_id parameter is required'], 400);
         }
 
-        $dvrSetting = $playlist->dvrSetting;
-
-        if (! $dvrSetting) {
-            return response()->json(['error' => 'DVR not configured for this playlist'], 404);
+        if ($playlist instanceof Playlist) {
+            $dvrSetting = $playlist->dvrSetting;
+            if (! $dvrSetting) {
+                return response()->json(['error' => 'DVR not configured for this playlist'], 404);
+            }
+            $recording = DvrRecording::where('dvr_setting_id', $dvrSetting->id)
+                ->where('uuid', $uuid)
+                ->when($playlistAuth, fn ($q) => $q->where('playlist_auth_id', $playlistAuth->id))
+                ->with(['channel', 'dvrSetting', 'recordingRule'])
+                ->first();
+        } else {
+            $sourcePlaylistIds = DB::table('merged_playlist_playlist')
+                ->where('merged_playlist_id', $playlist->id)
+                ->pluck('playlist_id');
+            $recording = DvrRecording::whereIn('dvr_setting_id', function ($query) use ($sourcePlaylistIds) {
+                $query->select('id')->from('dvr_settings')->whereIn('playlist_id', $sourcePlaylistIds);
+            })
+                ->where('uuid', $uuid)
+                ->when($playlistAuth, fn ($q) => $q->where('playlist_auth_id', $playlistAuth->id))
+                ->with(['channel', 'dvrSetting', 'recordingRule'])
+                ->first();
         }
-
-        $recording = DvrRecording::where('dvr_setting_id', $dvrSetting->id)
-            ->where('uuid', $uuid)
-            ->when($playlistAuth, fn ($q) => $q->where('playlist_auth_id', $playlistAuth->id))
-            ->with(['channel', 'dvrSetting', 'recordingRule'])
-            ->first();
 
         if (! $recording) {
             return response()->json(['error' => 'Recording not found'], 404);
@@ -4388,7 +4406,13 @@ class XtreamApiController extends Controller
             return response()->json(['error' => 'channel_id, title, start_time, and end_time are required'], 400);
         }
 
-        $dvrSetting = $playlist->dvrSetting?->enabled ? $playlist->dvrSetting : null;
+        // Look up channel first for merged playlist resolution
+        $channel = $playlist->channels()->where('channels.id', $channelId)->first();
+        if (! $channel) {
+            return response()->json(['error' => 'Channel not found'], 404);
+        }
+
+        $dvrSetting = $this->resolveDvrSetting($playlist, $channelId);
 
         if (! $dvrSetting) {
             return response()->json(['error' => 'DVR is not enabled for this playlist'], 422);
@@ -4398,9 +4422,147 @@ class XtreamApiController extends Controller
             return response()->json(['error' => 'Concurrent recording limit reached'], 422);
         }
 
-        $channel = $playlist->channels()->where('channels.id', $channelId)->first();
-        if (! $channel) {
-            return response()->json(['error' => 'Channel not found'], 404);
+        if ($dvrSetting->isAtCapacity()) {
+            return response()->json(['error' => 'Concurrent recording limit reached'], 422);
+        }
+
+        // Global provider-capacity check: count ACTUAL active connections
+        // (live proxy streams + Recording-status DVR recordings) against the
+        // playlist's provider limit. Scheduled rules are NOT connections.
+        $sourceLimit = $channel->playlist instanceof Playlist ? $channel->playlist->available_streams : 0;
+        $effectiveLimit = 0;
+        if ($sourceLimit > 0) {
+            $effectiveLimit = $sourceLimit;
+        }
+        if ($playlist->available_streams > 0) {
+            $effectiveLimit = $effectiveLimit === 0
+                ? $playlist->available_streams
+                : min($effectiveLimit, $playlist->available_streams);
+        }
+        if ($effectiveLimit > 0) {
+            // Count DISTINCT active channels (a channel that is both watched
+            // live AND recorded consumes ONE provider connection via piggyback).
+            $activeDvrChannelIds = $dvrSetting->recordings()
+                ->where('status', DvrRecordingStatus::Recording)
+                ->pluck('channel_id')
+                ->map(fn ($c) => (int) $c)
+                ->unique()
+                ->values()
+                ->all();
+
+            // A broadcast may keep running after its row left Recording (stop
+            // drain) or its row was deleted — the running broadcast IS a live
+            // connection and must count. Dedupe against the rows above.
+            $runningBroadcastChannelIds = [];
+            $runningDvrIds = app(M3uProxyService::class)->getRunningDvrRecordingIds();
+            if ($runningDvrIds !== []) {
+                $runningBroadcastChannelIds = $dvrSetting->recordings()
+                    ->whereIn('id', $runningDvrIds)
+                    ->pluck('channel_id')
+                    ->map(fn ($c) => (int) $c)
+                    ->unique()
+                    ->values()
+                    ->all();
+            }
+
+            $liveIds = M3uProxyService::getActiveLiveChannelIds($playlist->uuid);
+            if ($channel->playlist instanceof Playlist && $channel->playlist->uuid !== $playlist->uuid) {
+                $liveIds = array_merge($liveIds, M3uProxyService::getActiveLiveChannelIds($channel->playlist->uuid));
+            }
+
+            $activeChannelIds = array_values(array_unique(array_merge(
+                $activeDvrChannelIds,
+                $runningBroadcastChannelIds,
+                array_map('intval', $liveIds),
+            )));
+            $distinctActive = count($activeChannelIds);
+
+            // Imminent scheduled recordings (starting within 10 minutes) will
+            // occupy a connection momentarily — rapid-fire scheduling must not
+            // slip a recording past this check before the previous ones start.
+            $imminentScheduled = $dvrSetting->recordings()
+                ->where('status', DvrRecordingStatus::Scheduled)
+                ->where('scheduled_start', '<=', now()->addMinutes(10))
+                ->pluck('channel_id')
+                ->map(fn ($c) => (int) $c)
+                ->unique()
+                ->values()
+                ->all();
+
+            $projectedActiveChannelIds = array_values(array_unique(array_merge($activeChannelIds, $imminentScheduled)));
+
+            // The new recording adds a connection UNLESS its channel is already
+            // active (it will piggyback on the existing live stream or recording).
+            $willPiggyback = in_array((int) $channelId, $projectedActiveChannelIds, true);
+            $projected = count($projectedActiveChannelIds) + ($willPiggyback ? 0 : 1);
+
+            if ($projected > $effectiveLimit) {
+                return response()->json(['error' => 'Playlist has reached maximum stream limit.'], 422);
+            }
+        }
+
+        // Provider-profile capacity check: profile-enabled playlists (e.g.
+        // "2 Step 2 Provider") distribute connections across provider accounts.
+        // Count slots held by ACTIVE recordings (DB rows with a profile
+        // reservation) PLUS any still-running broadcasts whose rows already
+        // left the recording state (stop drain) — otherwise a recording whose
+        // broadcast hasn't fully stopped yet under-counts and a new one slips
+        // through to fail moments later. If every profile is saturated, refuse
+        // NOW so no recording row is created at all.
+        $sourcePlaylist = $channel->playlist instanceof Playlist ? $channel->playlist : null;
+        if ($sourcePlaylist?->profiles_enabled) {
+            $enabledProfiles = $sourcePlaylist->profiles()->where('enabled', true)->get();
+            $totalProfileSlots = 0;
+            $liveProfileSlots = 0;
+            foreach ($enabledProfiles as $profile) {
+                $totalProfileSlots += (int) $profile->effective_max_streams;
+                $liveProfileSlots += M3uProxyService::getActiveStreamsCountByMetadata(
+                    'provider_profile_id',
+                    (string) $profile->id,
+                );
+            }
+
+            $activeDvrRecordings = $sourcePlaylist->dvrSetting
+                ? $sourcePlaylist->dvrSetting->recordings()
+                    ->where('status', DvrRecordingStatus::Recording)
+                    ->whereNotNull('metadata->provider_profile_id')
+                    ->get()
+                : collect();
+
+            $dvrProfileSlots = $activeDvrRecordings->count();
+
+            // Broadcasts still running after their row left Recording hold a
+            // slot too — count them as well (deduplicated against the rows
+            // above).
+            $runningIds = app(M3uProxyService::class)->getRunningDvrRecordingIds();
+            if ($runningIds !== []) {
+                $dvrProfileSlots += $sourcePlaylist->dvrSetting
+                    ? $sourcePlaylist->dvrSetting->recordings()
+                        ->whereIn('id', $runningIds)
+                        ->whereNotNull('metadata->provider_profile_id')
+                        ->whereNotIn('id', $activeDvrRecordings->pluck('id'))
+                        ->count()
+                    : 0;
+            }
+
+            $activeProfileSlots = $dvrProfileSlots + $liveProfileSlots;
+
+            // Imminent scheduled recordings (starting within 10 minutes) will
+            // grab a profile slot momentarily — count them as projected so a
+            // rapid 3rd tap is refused instead of creating a row that fails
+            // when the recorder starts it.
+            $imminentScheduledProfileSlots = $sourcePlaylist->dvrSetting
+                ? $sourcePlaylist->dvrSetting->recordings()
+                    ->where('status', DvrRecordingStatus::Scheduled)
+                    ->where('scheduled_start', '<=', now()->addMinutes(10))
+                    ->count()
+                : 0;
+
+            $projectedProfileSlots = $activeProfileSlots + $imminentScheduledProfileSlots;
+
+            if ($totalProfileSlots > 0 && $projectedProfileSlots >= $totalProfileSlots) {
+                return response()->json(['error' => 'No provider profiles available.'], 422);
+            }
         }
 
         // manual_start/manual_end are cast as `datetime`, which Eloquent re-hydrates by
@@ -4669,17 +4831,28 @@ class XtreamApiController extends Controller
             return response()->json(['error' => 'recording_id parameter is required'], 400);
         }
 
-        $dvrSetting = $playlist->dvrSetting;
-
-        if (! $dvrSetting) {
-            return response()->json(['error' => 'DVR not configured for this playlist'], 404);
+        if ($playlist instanceof Playlist) {
+            $dvrSetting = $playlist->dvrSetting;
+            if (! $dvrSetting) {
+                return response()->json(['error' => 'DVR not configured for this playlist']);
+            }
+            $recording = DvrRecording::where('dvr_setting_id', $dvrSetting->id)
+                ->where('uuid', $uuid)
+                ->when($playlistAuth, fn ($q) => $q->where('playlist_auth_id', $playlistAuth->id))
+                ->whereIn('status', [DvrRecordingStatus::Scheduled, DvrRecordingStatus::Recording])
+                ->first();
+        } else {
+            $sourcePlaylistIds = DB::table('merged_playlist_playlist')
+                ->where('merged_playlist_id', $playlist->id)
+                ->pluck('playlist_id');
+            $recording = DvrRecording::whereIn('dvr_setting_id', function ($query) use ($sourcePlaylistIds) {
+                $query->select('id')->from('dvr_settings')->whereIn('playlist_id', $sourcePlaylistIds);
+            })
+                ->where('uuid', $uuid)
+                ->when($playlistAuth, fn ($q) => $q->where('playlist_auth_id', $playlistAuth->id))
+                ->whereIn('status', [DvrRecordingStatus::Scheduled, DvrRecordingStatus::Recording])
+                ->first();
         }
-
-        $recording = DvrRecording::where('dvr_setting_id', $dvrSetting->id)
-            ->where('uuid', $uuid)
-            ->when($playlistAuth, fn ($q) => $q->where('playlist_auth_id', $playlistAuth->id))
-            ->whereIn('status', [DvrRecordingStatus::Scheduled, DvrRecordingStatus::Recording])
-            ->first();
 
         if (! $recording) {
             return response()->json(['error' => 'Recording not found or not cancellable'], 404);
@@ -4714,22 +4887,42 @@ class XtreamApiController extends Controller
             return response()->json(['error' => 'recording_id parameter is required'], 400);
         }
 
-        $dvrSetting = $playlist->dvrSetting;
-
-        if (! $dvrSetting) {
-            return response()->json(['error' => 'DVR not configured for this playlist'], 404);
+        if ($playlist instanceof Playlist) {
+            $dvrSetting = $playlist->dvrSetting;
+            if (! $dvrSetting) {
+                return response()->json(['error' => 'DVR not configured for this playlist']);
+            }
+            $recording = DvrRecording::where('dvr_setting_id', $dvrSetting->id)
+                ->where('uuid', $uuid)
+                ->when($playlistAuth, fn ($q) => $q->where('playlist_auth_id', $playlistAuth->id))
+                ->whereIn('status', [
+                    DvrRecordingStatus::Completed,
+                    DvrRecordingStatus::Failed,
+                    DvrRecordingStatus::Cancelled,
+                    DvrRecordingStatus::PostProcessing,
+                    DvrRecordingStatus::Recording,
+                    DvrRecordingStatus::Scheduled,
+                ])
+                ->first();
+        } else {
+            $sourcePlaylistIds = DB::table('merged_playlist_playlist')
+                ->where('merged_playlist_id', $playlist->id)
+                ->pluck('playlist_id');
+            $recording = DvrRecording::whereIn('dvr_setting_id', function ($query) use ($sourcePlaylistIds) {
+                $query->select('id')->from('dvr_settings')->whereIn('playlist_id', $sourcePlaylistIds);
+            })
+                ->where('uuid', $uuid)
+                ->when($playlistAuth, fn ($q) => $q->where('playlist_auth_id', $playlistAuth->id))
+                ->whereIn('status', [
+                    DvrRecordingStatus::Completed,
+                    DvrRecordingStatus::Failed,
+                    DvrRecordingStatus::Cancelled,
+                    DvrRecordingStatus::PostProcessing,
+                    DvrRecordingStatus::Recording,
+                    DvrRecordingStatus::Scheduled,
+                ])
+                ->first();
         }
-
-        $recording = DvrRecording::where('dvr_setting_id', $dvrSetting->id)
-            ->where('uuid', $uuid)
-            ->when($playlistAuth, fn ($q) => $q->where('playlist_auth_id', $playlistAuth->id))
-            ->whereIn('status', [
-                DvrRecordingStatus::Completed,
-                DvrRecordingStatus::Failed,
-                DvrRecordingStatus::Cancelled,
-                DvrRecordingStatus::PostProcessing,
-            ])
-            ->first();
 
         if (! $recording) {
             return response()->json(['error' => 'Recording not found or not deletable'], 404);

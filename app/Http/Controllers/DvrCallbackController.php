@@ -5,6 +5,7 @@ namespace App\Http\Controllers;
 use App\Enums\DvrRecordingStatus;
 use App\Jobs\PostProcessDvrRecording;
 use App\Models\DvrRecording;
+use App\Services\DvrRecorderService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -96,6 +97,11 @@ class DvrCallbackController extends Controller
             return response()->json(['status' => 'ignored', 'reason' => 'not in recording state']);
         }
 
+        // Free the provider-profile reservation (if any) — covers natural
+        // programme end (no explicit stop() call). Idempotent: stop()/cancel()
+        // already cleared the metadata, so this is a no-op for manual stops.
+        app(DvrRecorderService::class)->releaseProfileReservation($recording);
+
         // Only update actual_end if not already set (e.g., by cancel() or finalizeStop()).
         // Then atomically update status and dispatch job in a transaction.
         $updateData = [
@@ -130,6 +136,8 @@ class DvrCallbackController extends Controller
         }
 
         $errorMessage = $data['error'] ?? 'Proxy broadcast failed';
+
+        app(DvrRecorderService::class)->releaseProfileReservation($recording);
 
         $recording->update([
             'status' => DvrRecordingStatus::Failed->value,

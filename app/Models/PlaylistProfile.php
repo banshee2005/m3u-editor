@@ -8,6 +8,7 @@ use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 
 class PlaylistProfile extends Model
@@ -304,6 +305,29 @@ class PlaylistProfile extends Model
             return null;
         }
 
+        if (! $isEpisode) {
+            // Consult the channel profile mapping table FIRST: it translates the
+            // source playlist's channel to the target playlist's LOCAL channel
+            // id. Cross-provider profiles (e.g. the "2 Step 2 Provider" setup)
+            // use entirely different channel-id spaces, so source_id matching
+            // below can never succeed for them.
+            $mapped = DB::table('channel_profile_map')
+                ->where('source_channel_id', $model->id)
+                ->where('target_playlist_id', $targetPlaylist->id)
+                ->first();
+
+            if ($mapped && $mapped->target_channel_id) {
+                $targetModel = $targetPlaylist->channels()
+                    ->where('id', $mapped->target_channel_id)
+                    ->where('enabled', true)
+                    ->first();
+
+                if ($targetModel) {
+                    return PlaylistUrlService::getChannelUrl($targetModel, $targetPlaylist);
+                }
+            }
+        }
+
         $targetModel = $isEpisode
             ? Episode::where('playlist_id', $targetPlaylist->id)
                 ->where('source_episode_id', $sourceId)
@@ -313,24 +337,6 @@ class PlaylistProfile extends Model
                 ->where('source_id', $sourceId)
                 ->where('enabled', true)
                 ->first();
-
-        // Fallback for 2-step setups: when the source playlist was imported via
-        // Xtream (numeric source_id) but the target playlist was imported as a
-        // plain M3U (hash-based source_id), the ids never match. Resolve the
-        // channel by exact name instead, using the `group` string as a
-        // tie-breaker. Skip when still ambiguous rather than guess wrong.
-        if (! $targetModel && ! $isEpisode && $model->name) {
-            $candidates = $targetPlaylist->channels()
-                ->where('enabled', true)
-                ->where('name', $model->name)
-                ->get();
-
-            if ($candidates->count() === 1) {
-                $targetModel = $candidates->first();
-            } elseif ($candidates->count() > 1 && $model->group) {
-                $targetModel = $candidates->firstWhere('group', $model->group);
-            }
-        }
 
         if (! $targetModel) {
             Log::warning('Could not resolve internal profile URL to target playlist', [

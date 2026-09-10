@@ -10,6 +10,7 @@ use App\Models\CustomPlaylist;
 use App\Models\DvrRecording;
 use App\Models\MergedPlaylist;
 use App\Models\Playlist;
+use App\Models\PlaylistProfile;
 use App\Models\TvNotification;
 use App\Notifications\Notification as AppNotification;
 use Exception;
@@ -57,6 +58,18 @@ class DvrRecorderService
         $byPlaylist = [];
 
         foreach ($stale as $recording) {
+            $this->releaseProfileReservation($recording);
+
+            // Stop the proxy-side broadcast BEFORE clearing proxy_network_id.
+            // Otherwise the FFmpeg process keeps running after a restart and
+            // holds the provider/tuner slot for hours (the editor only knows
+            // the row is dead, not the broadcast) — which is exactly how a
+            // "5th recording" gets a 503 and existing recordings silently die.
+            if ($recording->proxy_network_id) {
+                $this->proxy->stopDvrBroadcast($recording->proxy_network_id);
+                $this->proxy->cleanupDvrBroadcast($recording->proxy_network_id);
+            }
+
             $recording->update([
                 'status' => DvrRecordingStatus::Failed->value,
                 'error_message' => 'Server restarted during recording',
@@ -116,53 +129,7 @@ class DvrRecorderService
         // circuit-breaker drops (provider kills one connection when a second opens).
         $channel = $recording->channel;
         if ($channel) {
-            $rawUrl = $channel->url_custom ?? $channel->url ?? $recording->stream_url;
-
-            // When the channel's source playlist pools provider profiles, resolve the
-            // URL through the proxy so a provider profile is selected and its capacity
-            // reserved - a DVR recording should draw from the pool exactly as a live
-            // viewer does. Fall back to the raw channel URL if resolution fails so a
-            // recording is never lost to a transient proxy/provider error.
-            $sourcePlaylist = $channel->playlist;
-            if ($sourcePlaylist instanceof Playlist && $sourcePlaylist->profiles_enabled) {
-                try {
-                    $streamUrl = $this->proxy->getChannelUrl(
-                        $sourcePlaylist,
-                        $channel,
-                        null,
-                        null,
-                        $recording->user?->name,
-                    );
-                    if (empty($streamUrl)) {
-                        $streamUrl = $rawUrl;
-                    }
-                } catch (\Throwable $e) {
-                    // UNRESOLVED - behavior still being decided.
-                    //
-                    // getChannelUrl() aborts (503) when every provider profile is at
-                    // capacity. Right now we swallow that and fall back to the raw
-                    // primary-account URL so the recording is never lost, relying on the
-                    // fact that most providers boot an older stream when a new one starts,
-                    // so DVR effectively wins.
-                    //
-                    // The counter-argument: the whole point of pooled profiles is to
-                    // manage the connection budget explicitly and reject at the limit.
-                    // Silently exceeding it here undermines that. The alternative is to
-                    // rethrow (or only catch genuinely transient errors) and let a
-                    // capacity-blocked recording fail loudly.
-                    //
-                    // TODO: decide between "DVR always wins (current)" vs "respect the
-                    // pool limit and fail the recording". Revisit once real-world pooled
-                    // DVR usage tells us which matters more.
-                    Log::warning('DVR: pooled-provider URL resolution failed, using raw channel URL', [
-                        'recording_id' => $recording->id,
-                        'exception' => $e->getMessage(),
-                    ]);
-                    $streamUrl = $rawUrl;
-                }
-            } else {
-                $streamUrl = $rawUrl;
-            }
+            $streamUrl = $channel->url_custom ?? $channel->url ?? $recording->stream_url;
         } else {
             $streamUrl = $recording->stream_url;
         }
@@ -194,18 +161,145 @@ class DvrRecorderService
             $recording->saveQuietly();
         }
 
+        // Provider-connection capacity guard. If this recording needs a NEW
+        // provider connection (no piggyback), verify the source account has a
+        // free slot BEFORE opening it. Opening a connection past the provider's
+        // limit can trip a circuit breaker / tuner eviction that kills EXISTING
+        // recordings — we must refuse here instead of letting the provider evict.
+        if (! $activeStreamId && $channel?->playlist instanceof Playlist) {
+            $sourcePlaylist = $channel->playlist;
+            $limit = (int) $sourcePlaylist->available_streams;
+
+            if ($limit > 0) {
+                // Count DISTINCT active channels (a channel that is both watched
+                // live AND recorded consumes ONE provider connection via piggyback).
+                $activeDvrChannelIds = $setting->recordings()
+                    ->where('status', DvrRecordingStatus::Recording)
+                    ->where('id', '!=', $recording->id)
+                    ->pluck('channel_id')
+                    ->map(fn ($c) => (int) $c)
+                    ->unique()
+                    ->values()
+                    ->all();
+
+                $liveIds = M3uProxyService::getActiveLiveChannelIds($sourcePlaylist->uuid);
+                $mergedUuids = \Illuminate\Support\Facades\DB::table('merged_playlist_playlist as mpp')
+                    ->join('merged_playlists as mp', 'mp.id', '=', 'mpp.merged_playlist_id')
+                    ->where('mpp.playlist_id', $sourcePlaylist->id)
+                    ->pluck('mp.uuid');
+                foreach ($mergedUuids as $mergedUuid) {
+                    if ($mergedUuid !== $sourcePlaylist->uuid) {
+                        $liveIds = array_merge($liveIds, M3uProxyService::getActiveLiveChannelIds((string) $mergedUuid));
+                    }
+                }
+
+                $activeChannelIds = array_values(array_unique(array_merge($activeDvrChannelIds, array_map('intval', $liveIds))));
+                $distinctActive = count($activeChannelIds);
+
+                // This recording needs a NEW connection UNLESS its channel is
+                // already active (it piggybacks on the existing live stream).
+                $willPiggyback = in_array((int) $recording->channel_id, $activeChannelIds, true);
+                $projected = $distinctActive + ($willPiggyback ? 0 : 1);
+
+                if ($projected > $limit) {
+                    Log::warning('DVR: Refusing to start recording — provider at capacity', [
+                        'recording_id' => $recording->id,
+                        'title' => $recording->title,
+                        'playlist_id' => $sourcePlaylist->id,
+                        'available_streams' => $limit,
+                        'distinct_active' => $distinctActive,
+                        'projected' => $projected,
+                        'will_piggyback' => $willPiggyback,
+                    ]);
+
+                    $recording->update([
+                        'status' => DvrRecordingStatus::Failed->value,
+                        'actual_end' => now(),
+                        'error_message' => 'Provider at capacity — cannot start recording without evicting an existing one.',
+                    ]);
+
+                    return;
+                }
+            }
+        }
+
+        // Provider-profile mapping (same mechanism as live playback): playlists
+        // with profiles_enabled (e.g. "2 Step 2 Provider") distribute recordings
+        // across provider accounts (Primary/Secondary) instead of piling every
+        // recording onto the raw Primary URL, which overflows a single provider's
+        // stream limit and makes subsequent recordings stuck at "Scheduled" and
+        // live playback fail with a generic "Source error".
+        $selectedProfile = null;
+        $reservationId = null;
+        if ($channel && $channel->playlist instanceof Playlist && $channel->playlist->profiles_enabled) {
+            $profileSourcePlaylist = $channel->playlist;
+            $forceSelect = $profileSourcePlaylist->bypass_provider_limits ?? false;
+            [$selectedProfile, $reservationId] = ProfileService::selectAndReserveProfile(
+                $profileSourcePlaylist,
+                null,
+                (int) $channel->id,
+                (string) ($channel->getEffectivePlaylist()?->uuid ?? $profileSourcePlaylist->uuid),
+                $forceSelect,
+                null,
+                'channel',
+            );
+
+            if (! $selectedProfile) {
+                Log::warning('DVR: No provider profile available — refusing to start recording', [
+                    'recording_id' => $recording->id,
+                    'title' => $recording->title,
+                    'playlist_id' => $profileSourcePlaylist->id,
+                ]);
+
+                $recording->update([
+                    'status' => DvrRecordingStatus::Failed->value,
+                    'actual_end' => now(),
+                    'error_message' => 'No provider profiles available — cannot start recording without evicting an existing one.',
+                ]);
+
+                return;
+            }
+
+            $streamUrl = PlaylistUrlService::getChannelUrl($channel, $selectedProfile);
+
+            Log::info('DVR: Selected provider profile for recording', [
+                'recording_id' => $recording->id,
+                'title' => $recording->title,
+                'provider_profile_id' => $selectedProfile->id,
+                'provider_profile_name' => $selectedProfile->name,
+                'stream_url' => $streamUrl,
+            ]);
+        }
+
         Log::info('DVR: Starting proxy broadcast', [
             'recording_id' => $recording->id,
             'title' => $recording->title,
             'stream_url' => $streamUrl,
         ]);
 
-        $networkId = $this->proxy->startDvrBroadcast($recording, $setting, $streamUrl);
+        try {
+            $networkId = $this->proxy->startDvrBroadcast($recording, $setting, $streamUrl);
+        } catch (Exception $e) {
+            // The broadcast never started — release the reserved provider slot.
+            if ($selectedProfile && $reservationId) {
+                ProfileService::cancelReservation($selectedProfile, $reservationId);
+            }
+
+            throw $e;
+        }
+
+        $metadata = $recording->metadata ?? [];
+        if ($selectedProfile && $reservationId) {
+            $metadata['provider_profile_id'] = $selectedProfile->id;
+            $metadata['provider_reservation_id'] = $reservationId;
+        }
 
         $recording->update([
             'status' => DvrRecordingStatus::Recording->value,
             'actual_start' => now(),
             'proxy_network_id' => $networkId,
+            'stream_url' => $streamUrl,
+            'metadata' => $metadata,
             'attempt_count' => ($recording->attempt_count ?? 0) + 1,
         ]);
 
@@ -254,6 +348,8 @@ class DvrRecorderService
 
         $this->proxy->stopDvrBroadcast($networkId);
 
+        $this->releaseProfileReservation($recording);
+
         $this->finalizeStop($recording);
     }
 
@@ -284,6 +380,8 @@ class DvrRecorderService
             // Do NOT cleanup here - let the callback and post-processing handle it
             // so we don't delete segments that are still being written
         }
+
+        $this->releaseProfileReservation($recording);
 
         // Delete "once" rules on cancel regardless of outcome below - they're one-shot.
         $rule = $recording->recordingRule;
@@ -337,8 +435,50 @@ class DvrRecorderService
     public function releaseProxyResources(DvrRecording $recording): void
     {
         if ($recording->proxy_network_id) {
+            // Stop a still-running broadcast BEFORE removing its record —
+            // otherwise the FFmpeg process keeps holding the provider/tuner
+            // slot after the row is gone (phantom broadcast that blocks
+            // capacity for every subsequent recording on that pool).
+            $this->proxy->stopDvrBroadcast($recording->proxy_network_id);
             $this->proxy->cleanupDvrBroadcast($recording->proxy_network_id);
         }
+
+        // Free the provider-profile slot too — otherwise the reservation
+        // leaks in Redis and the profile stays saturated forever.
+        $this->releaseProfileReservation($recording);
+    }
+
+    /**
+     * Release a recording's provider-profile reservation (if any).
+     *
+     * Profile-enabled playlists reserve a provider slot when the recording
+     * starts. That slot must be freed when the broadcast ends, fails, or is
+     * cancelled — otherwise the profile fills up with phantom reservations
+     * and future recordings can never start.
+     */
+    public function releaseProfileReservation(DvrRecording $recording): void
+    {
+        $metadata = $recording->metadata ?? [];
+        $profileId = $metadata['provider_profile_id'] ?? null;
+        $reservationId = $metadata['provider_reservation_id'] ?? null;
+
+        if (! $profileId || ! $reservationId) {
+            return;
+        }
+
+        $profile = PlaylistProfile::find($profileId);
+        if ($profile) {
+            ProfileService::cancelReservation($profile, $reservationId);
+
+            Log::info('DVR: Released provider profile reservation', [
+                'recording_id' => $recording->id,
+                'provider_profile_id' => $profileId,
+                'reservation_id' => $reservationId,
+            ]);
+        }
+
+        unset($metadata['provider_profile_id'], $metadata['provider_reservation_id']);
+        $recording->updateQuietly(['metadata' => $metadata]);
     }
 
     /**

@@ -61,11 +61,37 @@ class StartDvrRecording implements ShouldBeUnique, ShouldQueue
         try {
             $recorder->start($recording);
         } catch (Throwable $e) {
+            // Transient provider failures (e.g. an HDHomeRun tuner momentarily
+            // busy with a lingering session or another client) can clear
+            // within seconds. Retry a bounded number of times while the
+            // programme is still on air instead of failing the recording
+            // outright — a start that succeeds on attempt 2 is still a win.
+            $attempt = ($recording->attempt_count ?? 0) + 1;
+            $stillOnAir = $recording->scheduled_end && $recording->scheduled_end->isAfter(now());
+
+            if ($attempt < self::MAX_START_ATTEMPTS && $stillOnAir) {
+                $recording->update([
+                    'attempt_count' => $attempt,
+                ]);
+
+                Log::warning("StartDvrRecording: attempt {$attempt} failed — retrying in ".(self::RETRY_DELAY_SECONDS).'s', [
+                    'recording_id' => $this->recordingId,
+                    'error' => $e->getMessage(),
+                ]);
+
+                self::dispatch($recording->id)
+                    ->onQueue('dvr')
+                    ->delay(now()->addSeconds(self::RETRY_DELAY_SECONDS));
+
+                return;
+            }
+
             Log::error("StartDvrRecording: recording {$this->recordingId} failed to start — {$e->getMessage()}");
 
             $recording->update([
                 'status' => DvrRecordingStatus::Failed->value,
                 'error_message' => $e->getMessage(),
+                'attempt_count' => $attempt,
             ]);
 
             $recording->notifyTv(__('Recording Failed'), 'danger');

@@ -49,13 +49,18 @@ return Application::configure(basePath: dirname(__DIR__))
         // page, which those clients can't parse.
         $exceptions->shouldRenderJsonWhen(function (Request $request, Throwable $e) {
             // Force JSON for the Xtream endpoints regardless of Accept header
-            // (clients parse every response as JSON). For every other route,
-            // fall through to Laravel's default expectsJson() check so API
-            // routes that send Accept: application/json still get JSON
-            // 401/422 from auth/validation middleware.
+            // (clients parse every response as JSON). For stream routes, also
+            // return JSON so the Flutter TV client can read error messages
+            // (capacity exceeded, provider rejected, etc.) instead of getting
+            // an unparseable HTML page.
             return in_array($request->route()?->getName(), [
                 'xtream.api.player',
                 'xtream.api.get',
+                'xtream.stream.live.root',
+                'xtream.stream.vod.root',
+                'xtream.stream.series.root',
+                'xtream.stream.timeshift.root',
+                'xtream.stream.direct',
             ], true) || $request->expectsJson();
         });
     })->create();

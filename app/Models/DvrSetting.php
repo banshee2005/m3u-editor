@@ -38,13 +38,18 @@ class DvrSetting extends Model
             'default_series_mode' => DvrSeriesMode::class,
             'default_series_keep_last' => 'integer',
             'include_disabled_channels' => 'boolean',
-            'transcode_recordings' => 'boolean',
+            'stream_profile_id' => 'integer',
         ];
     }
 
     public function user(): BelongsTo
     {
         return $this->belongsTo(User::class);
+    }
+
+    public function streamProfile(): BelongsTo
+    {
+        return $this->belongsTo(StreamProfile::class);
     }
 
     public function recordingRules(): HasMany
@@ -86,22 +91,23 @@ class DvrSetting extends Model
     /**
      * Check if the DVR is at concurrent recording capacity.
      *
-     * Concurrent safety is provided at the scheduler level: DvrSchedulerTick implements
-     * ShouldBeUnique, ensuring only one tick executes at a time. The three
-     * createScheduledRecording paths additionally wrap their check + insert in a
-     * DB::transaction, giving row-level isolation there.
+     * Counts ONLY recordings that are actively consuming a provider
+     * connection (status = Recording). Scheduled rules are plans, not
+     * connections — the scheduler enforces capacity again at start time
+     * (via $pendingInTick) so over-scheduling is harmless.
      *
-     * @param  int  $pendingInTick  Recordings already scheduled to start in this tick
-     *                              but whose status flip to Recording has not yet
-     *                              happened (the StartDvrRecording job is queued but
-     *                              has not run). Counted toward the active total so
-     *                              a single tick cannot dispatch more starts than
-     *                              there are free slots.
+     * PostProcessing recordings are excluded: the upstream connection is
+     * already released and only local transcoding remains.
+     *
+     * @param  int  $pendingInTick  Recordings dispatched to start earlier in
+     *                              this scheduler tick but not yet flipped to
+     *                              Recording. Prevents one tick from starting
+     *                              more than there are free slots.
      */
     public function isAtCapacity(int $pendingInTick = 0): bool
     {
         $active = $this->recordings()
-            ->whereIn('status', [DvrRecordingStatus::Recording, DvrRecordingStatus::PostProcessing])
+            ->where('status', DvrRecordingStatus::Recording)
             ->count();
 
         return ($active + $pendingInTick) >= $this->max_concurrent_recordings;
