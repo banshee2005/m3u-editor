@@ -273,7 +273,7 @@ class DvrSchedulerService
             }
 
             $alreadyRecorded = $seriesKey !== null && $rule->alreadyHaveEpisode($seriesKey, $programme->season, $programme->episode);
-            $alreadyScheduled = $dryRun && $seriesKey !== null && in_array($seriesKey . '|' . ($programme->season ?? '') . '|' . ($programme->episode ?? ''), $scheduledProgrammeIds['scheduled_keys'] ?? []);
+            $alreadyScheduled = $dryRun && $seriesKey !== null && in_array($seriesKey.'|'.($programme->season ?? '').'|'.($programme->episode ?? ''), $scheduledProgrammeIds['scheduled_keys'] ?? []);
 
             if ($alreadyRecorded || $alreadyScheduled) {
                 Log::debug('DVR: Skipping programme — already have episode', [
@@ -286,12 +286,13 @@ class DvrSchedulerService
                 if ($dryRun) {
                     $scheduledProgrammeIds['skipped'][] = $programme->id;
                 }
+
                 continue;
             }
 
             if ($dryRun) {
                 $scheduledProgrammeIds['scheduled'][] = $programme->id;
-                $scheduledProgrammeIds['scheduled_keys'][] = $seriesKey . '|' . ($programme->season ?? '') . '|' . ($programme->episode ?? '');
+                $scheduledProgrammeIds['scheduled_keys'][] = $seriesKey.'|'.($programme->season ?? '').'|'.($programme->episode ?? '');
             } else {
                 $this->createScheduledRecordingFromProgramme($rule, $programme);
             }

@@ -860,6 +860,52 @@ it('unique_se mode still records a different episode (different season/episode n
     expect(DvrRecording::where('dvr_recording_rule_id', $rule->id)->count())->toBe(2);
 });
 
+it('unique_se mode does not re-record a purged episode after retention cleanup', function () {
+    $rule = DvrRecordingRule::factory()
+        ->series()
+        ->for($this->setting, 'dvrSetting')
+        ->for($this->user)
+        ->create([
+            'series_title' => 'My Show',
+            'series_mode' => DvrSeriesMode::UniqueSe,
+        ]);
+
+    // Retention deleted the file but deliberately kept the row as the record
+    // that the episode has already been recorded — the duplicate check must
+    // still see it, otherwise the same S/E gets scheduled again after cleanup.
+    DvrRecording::factory()
+        ->purged()
+        ->for($this->setting, 'dvrSetting')
+        ->for($this->user)
+        ->for($rule, 'recordingRule')
+        ->create([
+            'title' => 'My Show',
+            'season' => 1,
+            'episode' => 5,
+            'series_key' => "setting:{$this->setting->id}|title:my show",
+        ]);
+
+    $rerun = EpgProgramme::factory()->upcoming(5)->create([
+        'title' => 'My Show',
+        'epg_channel_id' => 'test.channel',
+        'season' => 1,
+        'episode' => 5,
+    ]);
+
+    $this->service->matchAndSchedule(30);
+
+    expect(DvrRecording::where('dvr_recording_rule_id', $rule->id)
+        ->where('programme_start', $rerun->start_time)
+        ->count())->toBe(0);
+
+    // The preview's skip-reason lookup sees the purged row too.
+    expect($rule->getEpisodeRecordingStatus(
+        "setting:{$this->setting->id}|title:my show",
+        1,
+        5,
+    ))->toBe(DvrRecordingStatus::Purged->value);
+});
+
 it('all mode records every programme regardless of prior S/E recordings', function () {
     $rule = DvrRecordingRule::factory()
         ->series()

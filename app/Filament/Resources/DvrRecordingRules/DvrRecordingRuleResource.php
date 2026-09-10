@@ -5,7 +5,6 @@ namespace App\Filament\Resources\DvrRecordingRules;
 use App\Enums\DvrMatchMode;
 use App\Enums\DvrRuleType;
 use App\Enums\DvrSeriesMode;
-use Illuminate\Support\Facades\Log;
 use App\Models\Channel;
 use App\Models\DvrRecordingRule;
 use App\Models\DvrSetting;

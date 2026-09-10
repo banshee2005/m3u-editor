@@ -10,6 +10,7 @@ use App\Models\EpgChannel;
 use App\Models\EpgProgramme;
 use App\Services\DvrSchedulerService;
 use App\Settings\GeneralSettings;
+use App\Support\SeriesKey;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Support\Facades\Log;
 
@@ -104,9 +105,9 @@ trait HasDvrMatchedAirings
 
             if (! $willRecord && in_array($p->id, $scheduledIds['skipped'] ?? [])) {
                 $seriesKey = ($season !== null && $episode !== null)
-                    ? \App\Support\SeriesKey::for($rule->dvrSetting->id, $rule->series_title)
-                    : \App\Support\SeriesKey::for($rule->dvrSetting->id, $p->title);
-                $lookupKey = ($seriesKey ?? '') . '|' . ($season ?? '') . '|' . ($episode ?? '');
+                    ? SeriesKey::for($rule->dvrSetting->id, $rule->series_title)
+                    : SeriesKey::for($rule->dvrSetting->id, $p->title);
+                $lookupKey = ($seriesKey ?? '').'|'.($season ?? '').'|'.($episode ?? '');
 
                 // Check the actual recording status to differentiate
                 $recordingStatus = $seriesKey !== null

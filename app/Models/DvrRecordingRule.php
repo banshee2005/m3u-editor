@@ -149,7 +149,12 @@ class DvrRecordingRule extends Model
 
     /**
      * Get the status of an existing recording for the given series_key + season + episode.
-     * Returns the status string ('scheduled', 'completed', etc.) or null if no recording exists.
+     * Returns the status string ('scheduled', 'completed', 'purged', etc.) or null if no recording exists.
+     *
+     * Purged is deliberately included: retention deletes the recording file but
+     * keeps the database row as the record that the episode has already been
+     * recorded, so a rule set to avoid repeat episodes must not schedule the
+     * same season + episode again after cleanup.
      */
     public function getEpisodeRecordingStatus(string $seriesKey, ?int $season, ?int $episode): ?string
     {
@@ -160,6 +165,7 @@ class DvrRecordingRule extends Model
                     DvrRecordingStatus::Recording,
                     DvrRecordingStatus::PostProcessing,
                     DvrRecordingStatus::Completed,
+                    DvrRecordingStatus::Purged,
                 ])
                 ->first();
 
@@ -174,6 +180,7 @@ class DvrRecordingRule extends Model
                 DvrRecordingStatus::Recording,
                 DvrRecordingStatus::PostProcessing,
                 DvrRecordingStatus::Completed,
+                DvrRecordingStatus::Purged,
             ])
             ->first();
 
