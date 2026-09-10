@@ -1215,28 +1215,43 @@ class M3uProxyService
             $originalUuid = $playlist->uuid;
 
             if ($activeStreams >= $limitPlaylist->available_streams) {
-                // Check if "stop oldest on limit" is enabled in settings
-                if ($this->stopOldestOnLimit) {
-                    // Stop the oldest stream to make room for the new one (latest wins)
-                    $stopResult = self::stopOldestPlaylistStream($limitPlaylist->uuid, $id);
+                // DVR-wins: recordings keep their slots unconditionally, so a
+                // LIVE request evicts the oldest LIVE-VIEWER stream (never a
+                // recording-backed one) instead of being refused — recording +
+                // playback share the pool exactly as two recordings do. Only a
+                // pool full of recordings (no live stream left to evict)
+                // refuses the request.
+                $liveCandidates = collect(self::getActiveLiveStreams())
+                    ->filter(fn (array $s) => ($s['metadata']['original_playlist_uuid'] ?? $s['metadata']['playlist_uuid'] ?? null) === $limitPlaylist->uuid)
+                    ->filter(fn (array $s) => (int) ($s['metadata']['channel_id'] ?? 0) !== (int) $id)
+                    ->filter(fn (array $s) => ! in_array((int) ($s['metadata']['channel_id'] ?? 0), $dvrChannelIds, true))
+                    ->sortBy(fn (array $s) => (string) ($s['created_at'] ?? ''))
+                    ->values();
 
-                    if ($stopResult['deleted_count'] > 0) {
-                        Log::debug('Stopped oldest stream to free capacity for new channel request', [
-                            'channel_id' => $id,
-                            'playlist_uuid' => $limitPlaylist->uuid,
-                            'stream_age_seconds' => $stopResult['stream_age_seconds'] ?? null,
-                        ]);
+                if ($liveCandidates->isNotEmpty()) {
+                    $oldest = $liveCandidates->first();
+                    self::deleteStream((string) $oldest['stream_id']);
 
-                        // Short delay to allow proxy to clean up
-                        usleep(100000); // 100ms
-                        $liveIds = array_map('intval', self::getActiveLiveChannelIds($limitPlaylist->uuid));
-                        $activeChannelIds = array_values(array_unique(array_merge($liveIds, $dvrChannelIds)));
-                        $activeStreams = count($activeChannelIds);
-                    }
+                    Log::debug('DVR-wins: stopped oldest live stream to free capacity for new channel request', [
+                        'channel_id' => $id,
+                        'playlist_uuid' => $limitPlaylist->uuid,
+                        'evicted_stream_id' => $oldest['stream_id'],
+                        'evicted_channel_id' => $oldest['metadata']['channel_id'] ?? null,
+                        'stream_created_at' => $oldest['created_at'] ?? null,
+                    ]);
+
+                    // A live slot was freed; the recording keeps its slot.
+                    // Recompute with live streams only — the new live request
+                    // may now proceed.
+                    usleep(100000); // 100ms to allow the proxy to clean up
+                    $liveIds = array_map('intval', self::getActiveLiveChannelIds($limitPlaylist->uuid));
+                    $activeStreams = count($liveIds);
                 }
+            }
 
-                // If still at capacity (either setting disabled or stop failed), check failovers
-                if ($activeStreams >= $playlist->available_streams) {
+            // If still at capacity (either no live stream was evictable or the
+            // eviction failed), check failovers
+            if ($activeStreams >= $limitPlaylist->available_streams) {
                     // Primary playlist is at capacity, check failovers
                     $failoverChannels = $channel->failoverChannels()
                         ->select([
@@ -1284,7 +1299,6 @@ class M3uProxyService
                     }
                 }
             }
-        }
 
         // Per-PlaylistAuth stream limit check (only applies when proxy is in use)
         if ($playlistAuthId && ! $this->checkAndEnforceAuthStreamLimit($playlistAuthId, $id)) {
