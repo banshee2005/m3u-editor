@@ -1186,28 +1186,52 @@ class M3uProxyService
         $primaryUrl = null;
         $actualChannel = $channel;  // Track the actual channel being used (may differ from original if failover)
 
-        if ($playlist->available_streams !== 0) {
-            $activeStreams = self::getActiveStreamsCountByMetadata('playlist_uuid', $playlist->uuid);
+        // The capacity authority is the SOURCE playlist (what streams key on) —
+        // a merged/custom wrapper may have available_streams=0 (unlimited)
+        // while its source has a hard limit (e.g. an HDHomeRun tuner pool).
+        $limitPlaylist = $channel->playlist instanceof Playlist
+            ? $channel->playlist
+            : $playlist;
+
+        if ($limitPlaylist->available_streams !== 0) {
+            // Count DISTINCT active channels: live proxy streams (which may be
+            // piggybacked by recordings) PLUS active DVR recordings. DVR
+            // recordings on direct-URL playlists (e.g. HDHomeRun tuners) never
+            // create a proxy stream, so counting streams alone lets a 5th live
+            // stream slip through while 4 recordings hold the tuners.
+            $liveIds = array_map('intval', self::getActiveLiveChannelIds($limitPlaylist->uuid));
+            $dvrChannelIds = [];
+            if ($limitPlaylist->dvrSetting) {
+                $dvrChannelIds = $limitPlaylist->dvrSetting->recordings()
+                    ->where('status', DvrRecordingStatus::Recording)
+                    ->pluck('channel_id')
+                    ->map(fn ($c) => (int) $c)
+                    ->all();
+            }
+            $activeChannelIds = array_values(array_unique(array_merge($liveIds, $dvrChannelIds)));
+            $activeStreams = count($activeChannelIds);
 
             // Keep track of original playlist in case we need to check failovers
             $originalUuid = $playlist->uuid;
 
-            if ($activeStreams >= $playlist->available_streams) {
+            if ($activeStreams >= $limitPlaylist->available_streams) {
                 // Check if "stop oldest on limit" is enabled in settings
                 if ($this->stopOldestOnLimit) {
                     // Stop the oldest stream to make room for the new one (latest wins)
-                    $stopResult = self::stopOldestPlaylistStream($playlist->uuid, $id);
+                    $stopResult = self::stopOldestPlaylistStream($limitPlaylist->uuid, $id);
 
                     if ($stopResult['deleted_count'] > 0) {
                         Log::debug('Stopped oldest stream to free capacity for new channel request', [
                             'channel_id' => $id,
-                            'playlist_uuid' => $playlist->uuid,
+                            'playlist_uuid' => $limitPlaylist->uuid,
                             'stream_age_seconds' => $stopResult['stream_age_seconds'] ?? null,
                         ]);
 
                         // Short delay to allow proxy to clean up
                         usleep(100000); // 100ms
-                        $activeStreams = self::getActiveStreamsCountByMetadata('playlist_uuid', $playlist->uuid);
+                        $liveIds = array_map('intval', self::getActiveLiveChannelIds($limitPlaylist->uuid));
+                        $activeChannelIds = array_values(array_unique(array_merge($liveIds, $dvrChannelIds)));
+                        $activeStreams = count($activeChannelIds);
                     }
                 }
 
