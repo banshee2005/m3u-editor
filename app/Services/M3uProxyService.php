@@ -359,6 +359,51 @@ class M3uProxyService
      * Get active streams count by any metadata field/value combination.
      * Returns the number of distinct upstream connections (streams), not proxy client count.
      */
+    /**
+     * Get the DISTINCT channel ids currently being watched live on the given
+     * playlist UUID (proxy streams keyed by playlist_uuid metadata). Used by
+     * DVR capacity accounting so live viewers and recordings share the pool.
+     *
+     * @return array<int, int>
+     */
+    public static function getActiveLiveChannelIds(string $playlistUuid): array
+    {
+        $service = new self;
+
+        if (empty($service->apiBaseUrl)) {
+            return [];
+        }
+
+        try {
+            $response = Http::timeout(5)->acceptJson()
+                ->withHeaders($service->apiToken ? ['X-API-Token' => $service->apiToken] : [])
+                ->get($service->apiBaseUrl.'/streams/by-metadata', [
+                    'field' => 'playlist_uuid',
+                    'value' => $playlistUuid,
+                    'active_only' => true,
+                ]);
+
+            if (! $response->successful()) {
+                return [];
+            }
+
+            $ids = [];
+            foreach ($response->json()['matching_streams'] ?? [] as $stream) {
+                $metadata = $stream['metadata'] ?? [];
+                $channelId = $metadata['original_channel_id'] ?? $metadata['channel_id'] ?? null;
+                if ($channelId !== null) {
+                    $ids[(int) $channelId] = true;
+                }
+            }
+
+            return array_keys($ids);
+        } catch (Exception $e) {
+            Log::warning('Error listing active live channels: '.$e->getMessage());
+
+            return [];
+        }
+    }
+
     public static function getActiveStreamsCountByMetadata(string $field, string $value): int
     {
         $service = new self;
@@ -3656,6 +3701,95 @@ class M3uProxyService
     public function getDvrBroadcastLiveUrl(string $networkId): string
     {
         return $this->getPublicUrl().'/broadcast/'.rawurlencode($networkId).'/live.m3u8';
+    }
+
+    /**
+     * Get the recording DB ids of all RUNNING DVR broadcasts on the proxy.
+     *
+     * Used as ground truth for capacity accounting: a broadcast may keep
+     * running after its DB row already flipped to post_processing (e.g. a
+     * stop that hasn't fully drained FFmpeg yet), so counting rows alone
+     * under-reports occupied provider slots.
+     */
+    public function getRunningDvrRecordingIds(): array
+    {
+        if (empty($this->apiBaseUrl)) {
+            return [];
+        }
+
+        try {
+            $endpoint = $this->apiBaseUrl.'/broadcast';
+            $response = Http::timeout(10)
+                ->acceptJson()
+                ->withHeaders($this->apiToken ? ['X-API-Token' => $this->apiToken] : [])
+                ->get($endpoint);
+
+            if (! $response->successful()) {
+                return [];
+            }
+
+            $ids = [];
+            foreach (($response->json('broadcasts') ?? []) as $broadcast) {
+                if (($broadcast['status'] ?? null) === 'running'
+                    && ! empty($broadcast['metadata']['recording_db_id'])) {
+                    $ids[] = (int) $broadcast['metadata']['recording_db_id'];
+                }
+            }
+
+            return array_values(array_unique($ids));
+        } catch (Exception $e) {
+            Log::warning('Failed to list running DVR broadcasts', [
+                'exception' => $e->getMessage(),
+            ]);
+
+            return [];
+        }
+    }
+
+    /**
+     * List active live streams on the proxy (optionally filtered by playlist
+     * UUID), including their metadata. Used to detect which streams a
+     * DVR-wins eviction stopped so the affected viewer can be notified.
+     *
+     * @return array<int, array{stream_id: string, metadata: array}>
+     */
+    public function getActiveLiveStreams(?string $playlistUuid = null): array
+    {
+        if (empty($this->apiBaseUrl)) {
+            return [];
+        }
+
+        try {
+            $endpoint = $this->apiBaseUrl.'/streams';
+            $response = Http::timeout(10)
+                ->acceptJson()
+                ->withHeaders($this->apiToken ? ['X-API-Token' => $this->apiToken] : [])
+                ->get($endpoint, ['active_only' => true]);
+
+            if (! $response->successful()) {
+                return [];
+            }
+
+            $result = [];
+            foreach (($response->json('streams') ?? []) as $stream) {
+                $metadata = $stream['metadata'] ?? [];
+                if ($playlistUuid !== null && ($metadata['playlist_uuid'] ?? null) !== $playlistUuid) {
+                    continue;
+                }
+                $result[] = [
+                    'stream_id' => (string) ($stream['stream_id'] ?? ''),
+                    'metadata' => $metadata,
+                ];
+            }
+
+            return $result;
+        } catch (Exception $e) {
+            Log::warning('Failed to list active live streams', [
+                'exception' => $e->getMessage(),
+            ]);
+
+            return [];
+        }
     }
 
     /**

@@ -10,6 +10,7 @@ use App\Models\CustomPlaylist;
 use App\Models\DvrRecording;
 use App\Models\MergedPlaylist;
 use App\Models\Playlist;
+use App\Models\PlaylistAuth;
 use App\Models\TvNotification;
 use App\Notifications\Notification as AppNotification;
 use Exception;
@@ -125,6 +126,11 @@ class DvrRecorderService
             // recording is never lost to a transient proxy/provider error.
             $sourcePlaylist = $channel->playlist;
             if ($sourcePlaylist instanceof Playlist && $sourcePlaylist->profiles_enabled) {
+                // Snapshot the active live streams so we can detect which ones a
+                // "DVR wins" eviction stopped (getChannelUrl stops the oldest
+                // stream when the pool is full) and notify the affected viewers.
+                $streamsBefore = $this->proxy->getActiveLiveStreams($sourcePlaylist->uuid);
+
                 try {
                     $streamUrl = $this->proxy->getChannelUrl(
                         $sourcePlaylist,
@@ -137,28 +143,29 @@ class DvrRecorderService
                         $streamUrl = $rawUrl;
                     }
                 } catch (\Throwable $e) {
-                    // UNRESOLVED - behavior still being decided.
-                    //
                     // getChannelUrl() aborts (503) when every provider profile is at
-                    // capacity. Right now we swallow that and fall back to the raw
-                    // primary-account URL so the recording is never lost, relying on the
-                    // fact that most providers boot an older stream when a new one starts,
-                    // so DVR effectively wins.
-                    //
-                    // The counter-argument: the whole point of pooled profiles is to
-                    // manage the connection budget explicitly and reject at the limit.
-                    // Silently exceeding it here undermines that. The alternative is to
-                    // rethrow (or only catch genuinely transient errors) and let a
-                    // capacity-blocked recording fail loudly.
-                    //
-                    // TODO: decide between "DVR always wins (current)" vs "respect the
-                    // pool limit and fail the recording". Revisit once real-world pooled
-                    // DVR usage tells us which matters more.
+                    // capacity. "DVR wins": swallow that and fall back to the raw
+                    // primary-account URL so the recording is never lost, relying on
+                    // the fact that most providers boot an older stream when a new
+                    // one starts. (When proxy_stop_oldest_on_limit is enabled,
+                    // getChannelUrl evicts the oldest live stream instead.)
                     Log::warning('DVR: pooled-provider URL resolution failed, using raw channel URL', [
                         'recording_id' => $recording->id,
                         'exception' => $e->getMessage(),
                     ]);
                     $streamUrl = $rawUrl;
+                }
+
+                // Notify the viewers of any live stream the DVR-wins eviction
+                // stopped while resolving this recording's URL.
+                $streamsAfter = $this->proxy->getActiveLiveStreams($sourcePlaylist->uuid);
+                foreach ($streamsBefore as $before) {
+                    $stillActive = collect($streamsAfter)->first(
+                        fn ($after) => ($after['stream_id'] ?? null) === ($before['stream_id'] ?? null),
+                    );
+                    if ($stillActive === null) {
+                        $this->notifyEvictedViewer($before, $recording);
+                    }
                 }
             } else {
                 $streamUrl = $rawUrl;
@@ -225,6 +232,49 @@ class DvrRecorderService
         }
 
         $recording->notifyTv(__('Recording Started'), 'info');
+    }
+
+    /**
+     * Notify the viewer whose live stream was evicted to make room for a DVR
+     * recording ("DVR wins" policy). Uses the stream metadata to target the
+     * owning playlist auth's devices specifically.
+     *
+     * @param  array{stream_id: string, metadata: array}  $stream
+     */
+    protected function notifyEvictedViewer(array $stream, DvrRecording $recording): void
+    {
+        $metadata = $stream['metadata'] ?? [];
+        $playlistUuid = $metadata['playlist_uuid'] ?? null;
+        $playlistAuthId = isset($metadata['playlist_auth_id'])
+            ? (int) $metadata['playlist_auth_id']
+            : null;
+
+        Log::info('DVR: live stream evicted for recording', [
+            'recording_id' => $recording->id,
+            'title' => $recording->title,
+            'evicted_stream_id' => $stream['stream_id'],
+            'playlist_uuid' => $playlistUuid,
+            'playlist_auth_id' => $playlistAuthId,
+        ]);
+
+        if (! $playlistUuid) {
+            return;
+        }
+
+        $playlist = Playlist::where('uuid', $playlistUuid)->first();
+        if (! $playlist) {
+            return;
+        }
+
+        $playlistAuth = $playlistAuthId
+            ? PlaylistAuth::find($playlistAuthId)
+            : null;
+
+        AppNotification::make()
+            ->title(__('DVR Recording Started'))
+            ->body(__('A DVR recording has taken precedence and stopped your live stream.'))
+            ->status('warning')
+            ->tvBroadcast($playlist, 'dvr', false, $playlistAuth);
     }
 
     /**

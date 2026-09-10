@@ -56,6 +56,11 @@ return Application::configure(basePath: dirname(__DIR__))
             return in_array($request->route()?->getName(), [
                 'xtream.api.player',
                 'xtream.api.get',
+                'xtream.stream.live.root',
+                'xtream.stream.vod.root',
+                'xtream.stream.series.root',
+                'xtream.stream.timeshift.root',
+                'xtream.stream.direct',
             ], true) || $request->expectsJson();
         });
     })->create();

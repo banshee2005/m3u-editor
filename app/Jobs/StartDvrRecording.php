@@ -23,6 +23,19 @@ class StartDvrRecording implements ShouldBeUnique, ShouldQueue
 {
     use Queueable;
 
+    /**
+     * How many total start attempts are allowed before the recording fails.
+     * Transient provider failures (an HDHomeRun tuner momentarily busy, a
+     * pooled provider connection settling) can clear within seconds — a
+     * recording that succeeds on attempt 2 or 3 is still a win.
+     */
+    public const int MAX_START_ATTEMPTS = 3;
+
+    /**
+     * Delay between retry attempts.
+     */
+    public const int RETRY_DELAY_SECONDS = 15;
+
     public int $tries = 1;
 
     public int $timeout = 30;
@@ -61,11 +74,37 @@ class StartDvrRecording implements ShouldBeUnique, ShouldQueue
         try {
             $recorder->start($recording);
         } catch (Throwable $e) {
+            // Transient provider failures (e.g. an HDHomeRun tuner momentarily
+            // busy with a lingering session or another client) can clear
+            // within seconds. Retry a bounded number of times while the
+            // programme is still on air instead of failing the recording
+            // outright.
+            $attempt = ($recording->attempt_count ?? 0) + 1;
+            $stillOnAir = $recording->scheduled_end && $recording->scheduled_end->isAfter(now());
+
+            if ($attempt < self::MAX_START_ATTEMPTS && $stillOnAir) {
+                $recording->update([
+                    'attempt_count' => $attempt,
+                ]);
+
+                Log::warning('StartDvrRecording: attempt '.$attempt.' failed — retrying in '.self::RETRY_DELAY_SECONDS.'s', [
+                    'recording_id' => $this->recordingId,
+                    'error' => $e->getMessage(),
+                ]);
+
+                self::dispatch($recording->id)
+                    ->onQueue('dvr')
+                    ->delay(now()->addSeconds(self::RETRY_DELAY_SECONDS));
+
+                return;
+            }
+
             Log::error("StartDvrRecording: recording {$this->recordingId} failed to start — {$e->getMessage()}");
 
             $recording->update([
                 'status' => DvrRecordingStatus::Failed->value,
                 'error_message' => $e->getMessage(),
+                'attempt_count' => $attempt,
             ]);
 
             $recording->notifyTv(__('Recording Failed'), 'danger');

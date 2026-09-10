@@ -100,8 +100,12 @@ class DvrSetting extends Model
      */
     public function isAtCapacity(int $pendingInTick = 0): bool
     {
+        // Count only in-progress recordings. PostProcessing recordings have
+        // finished capturing — counting them blocks new recordings during the
+        // entire post-processing window even though the tuner/connection is
+        // already free.
         $active = $this->recordings()
-            ->whereIn('status', [DvrRecordingStatus::Recording, DvrRecordingStatus::PostProcessing])
+            ->where('status', DvrRecordingStatus::Recording)
             ->count();
 
         return ($active + $pendingInTick) >= $this->max_concurrent_recordings;

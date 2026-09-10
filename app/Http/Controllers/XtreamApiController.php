@@ -4377,6 +4377,21 @@ class XtreamApiController extends Controller
     /**
      * Schedule a one-shot DVR recording rule from the TV app.
      */
+    private function resolveDvrSetting($playlist, ?int $channelId = null): ?\App\Models\DvrSetting
+    {
+        if ($playlist instanceof Playlist && $playlist->dvrSetting?->enabled) {
+            return $playlist->dvrSetting;
+        }
+        if ($channelId && ! $playlist instanceof Playlist) {
+            $channel = $playlist->channels()->where('channels.id', $channelId)->first();
+            if ($channel?->playlist instanceof Playlist && $channel->playlist->dvrSetting?->enabled) {
+                return $channel->playlist->dvrSetting;
+            }
+        }
+
+        return null;
+    }
+
     private function scheduleDvr(Request $request, $playlist, ?PlaylistAuth $playlistAuth): \Illuminate\Http\JsonResponse
     {
         $channelId = (int) $request->input('channel_id');
@@ -4388,7 +4403,15 @@ class XtreamApiController extends Controller
             return response()->json(['error' => 'channel_id, title, start_time, and end_time are required'], 400);
         }
 
-        $dvrSetting = $playlist->dvrSetting?->enabled ? $playlist->dvrSetting : null;
+        $channel = $playlist->channels()->where('channels.id', $channelId)->first();
+        if (! $channel) {
+            return response()->json(['error' => 'Channel not found'], 404);
+        }
+
+        // Resolve the DVR setting through the channel first so recordings
+        // scheduled via merged/custom playlists route to the real source
+        // playlist's DVR setting.
+        $dvrSetting = $this->resolveDvrSetting($playlist, $channelId);
 
         if (! $dvrSetting) {
             return response()->json(['error' => 'DVR is not enabled for this playlist'], 422);
@@ -4398,9 +4421,75 @@ class XtreamApiController extends Controller
             return response()->json(['error' => 'Concurrent recording limit reached'], 422);
         }
 
-        $channel = $playlist->channels()->where('channels.id', $channelId)->first();
-        if (! $channel) {
-            return response()->json(['error' => 'Channel not found'], 404);
+        if ($dvrSetting->isAtCapacity()) {
+            return response()->json(['error' => 'Concurrent recording limit reached'], 422);
+        }
+
+        // Provider-capacity check (e.g. an Antenna/HDHomeRun pool with a
+        // fixed tuner count): refuse at schedule time when the pool is full.
+        // Count recording rows PLUS still-running broadcasts (a broadcast can
+        // outlive its row's Recording status during stop drain) PLUS imminent
+        // scheduled recordings (starting within 10 minutes) so rapid-fire
+        // taps can't slip past before the previous ones start.
+        $sourceLimit = $channel->playlist instanceof Playlist ? $channel->playlist->available_streams : 0;
+        $effectiveLimit = 0;
+        if ($sourceLimit > 0) {
+            $effectiveLimit = $sourceLimit;
+        }
+        if ($playlist->available_streams > 0) {
+            $effectiveLimit = $effectiveLimit === 0
+                ? $playlist->available_streams
+                : min($effectiveLimit, $playlist->available_streams);
+        }
+        if ($effectiveLimit > 0) {
+            $activeDvrChannelIds = $dvrSetting->recordings()
+                ->where('status', DvrRecordingStatus::Recording)
+                ->pluck('channel_id')
+                ->map(fn ($c) => (int) $c)
+                ->unique()
+                ->values()
+                ->all();
+
+            $runningBroadcastChannelIds = [];
+            $runningDvrIds = app(M3uProxyService::class)->getRunningDvrRecordingIds();
+            if ($runningDvrIds !== []) {
+                $runningBroadcastChannelIds = $dvrSetting->recordings()
+                    ->whereIn('id', $runningDvrIds)
+                    ->pluck('channel_id')
+                    ->map(fn ($c) => (int) $c)
+                    ->unique()
+                    ->values()
+                    ->all();
+            }
+
+            $liveIds = M3uProxyService::getActiveLiveChannelIds($playlist->uuid);
+            if ($channel->playlist instanceof Playlist && $channel->playlist->uuid !== $playlist->uuid) {
+                $liveIds = array_merge($liveIds, M3uProxyService::getActiveLiveChannelIds($channel->playlist->uuid));
+            }
+
+            $activeChannelIds = array_values(array_unique(array_merge(
+                $activeDvrChannelIds,
+                $runningBroadcastChannelIds,
+                array_map('intval', $liveIds),
+            )));
+
+            $imminentScheduled = $dvrSetting->recordings()
+                ->where('status', DvrRecordingStatus::Scheduled)
+                ->where('scheduled_start', '<=', now()->addMinutes(10))
+                ->pluck('channel_id')
+                ->map(fn ($c) => (int) $c)
+                ->unique()
+                ->values()
+                ->all();
+
+            $projectedActiveChannelIds = array_values(array_unique(array_merge($activeChannelIds, $imminentScheduled)));
+
+            $willPiggyback = in_array((int) $channelId, $projectedActiveChannelIds, true);
+            $projected = count($projectedActiveChannelIds) + ($willPiggyback ? 0 : 1);
+
+            if ($projected > $effectiveLimit) {
+                return response()->json(['error' => 'Playlist has reached maximum stream limit.'], 422);
+            }
         }
 
         // manual_start/manual_end are cast as `datetime`, which Eloquent re-hydrates by
