@@ -94,7 +94,7 @@ class DvrRecorderService
      * The proxy manages the FFmpeg process, preserves all HLS segments (dvr_mode=true),
      * and calls back the editor when the recording ends or fails.
      */
-    public function start(DvrRecording $recording): void
+    public function start(DvrRecording $recording, bool $forceFresh = false): void
     {
         if ($recording->status !== DvrRecordingStatus::Scheduled) {
             Log::warning('DVR start skipped - recording not in SCHEDULED state', [
@@ -182,8 +182,12 @@ class DvrRecorderService
         // Use the channel's own real source playlist (not the DvrSetting's owner,
         // which may be a Custom/Merged playlist spanning multiple real playlists)
         // since that's what the proxy actually keys active streams by.
+        //
+        // On a retry ($forceFresh) the previous attempt may have piggybacked
+        // onto a pooled stream whose upstream went stale — reuse would fail
+        // again, so resolve a fresh stream instead.
         $playlistUuid = $channel?->getEffectivePlaylist()?->uuid;
-        if ($channel && $playlistUuid) {
+        if (! $forceFresh && $channel && $playlistUuid) {
             $activeStreamId = $this->proxy->getActiveStreamIdForChannel($channel->id, $playlistUuid);
             if ($activeStreamId) {
                 $proxyUrl = $this->proxy->getStreamProxyUrl($activeStreamId);

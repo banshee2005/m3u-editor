@@ -11,6 +11,7 @@ use App\Jobs\StartDvrRecording;
 use App\Jobs\StopDvrRecording;
 use App\Models\Channel;
 use App\Models\DvrRecording;
+use App\Services\M3uProxyService;
 use App\Models\DvrRecordingRule;
 use App\Models\DvrSetting;
 use App\Models\EpgChannel;
@@ -66,10 +67,47 @@ class DvrSchedulerService
             // Minute-level precision for trigger and stop.
             $this->triggerPendingRecordings();
             $this->stopExpiredRecordings();
+            $this->reconcileStaleRecordings();
         } catch (Exception $e) {
             Log::error('DVR scheduler tick failed: '.$e->getMessage(), [
                 'exception' => $e,
             ]);
+        }
+    }
+
+    /**
+     * Mark RECORDING rows whose proxy broadcast is no longer running as
+     * FAILED. The proxy's broadcast_failed callback can be lost (network
+     * blip, restart) — without this a dead broadcast leaves a stale
+     * "recording" row that consumes a DVR capacity slot and shows up as
+     * recording in the apps. Broadcasts younger than RECONCILE_GRACE_SECONDS
+     * are left alone so a just-started recording has time to appear.
+     */
+    public function reconcileStaleRecordings(): void
+    {
+        $grace = 90;
+
+        $runningIds = app(M3uProxyService::class)->getRunningDvrRecordingIds();
+
+        $stale = DvrRecording::where('status', DvrRecordingStatus::Recording)
+            ->where('actual_start', '<=', now()->subSeconds($grace))
+            ->get()
+            ->reject(fn (DvrRecording $r) => $r->proxy_network_id && in_array($r->id, $runningIds, true));
+
+        foreach ($stale as $recording) {
+            Log::warning('DVR: reconciling stale recording (broadcast no longer running)', [
+                'recording_id' => $recording->id,
+                'title' => $recording->title,
+                'proxy_network_id' => $recording->proxy_network_id,
+            ]);
+
+            $recording->update([
+                'status' => DvrRecordingStatus::Failed->value,
+                'actual_end' => now(),
+                'error_message' => 'Broadcast is no longer running (failure callback was lost).',
+            ]);
+
+            $recording->notifyTv(__('Recording Failed'), 'danger');
         }
     }
 
