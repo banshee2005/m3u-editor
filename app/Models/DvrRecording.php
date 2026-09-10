@@ -329,7 +329,12 @@ class DvrRecording extends Model
      */
     public function notifyTv(string $title, string $status): void
     {
-        $playlist = $this->dvrSetting?->owner();
+        // Guest-created recordings (playlistAuth) notify the playlist the
+        // guest authenticated through — for merged credentials that is the
+        // MergedPlaylist the app's notification scope queries, NOT the DVR
+        // setting's owner (the source playlist), which the app never sees.
+        $playlist = $this->playlistAuth?->playlist()
+            ?? $this->dvrSetting?->owner();
 
         if (! $playlist) {
             return;

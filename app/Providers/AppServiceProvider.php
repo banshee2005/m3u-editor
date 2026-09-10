@@ -355,6 +355,20 @@ class AppServiceProvider extends ServiceProvider
             return Limit::perMinute(60)->by(optional($request->user())->id ?: $request->ip());
         });
 
+        // TV app API routes (api/tv/...) are consumed exclusively by the TV
+        // frontend, which legitimately polls notifications on boot, resume,
+        // and live-stream end (plus mark-read + push + broadcast-auth calls).
+        // A per-IP limit shares one counter across every device on a LAN and
+        // trips on that polling; key by the URL credentials instead so each
+        // TV install gets generous headroom while brute-forcing credentials
+        // is still throttled per attempt.
+        RateLimiter::for('tv-api', function (Request $request) {
+            $segments = $request->segments();
+            $credentialKey = ($segments[2] ?? '').'|'.($segments[3] ?? '');
+
+            return Limit::perMinute(240)->by($credentialKey);
+        });
+
         // Note: Proxy rate limiting is handled by ProxyRateLimitMiddleware for better performance
 
         // Gate the copilot stream endpoint behind the use_ai_copilot permission.

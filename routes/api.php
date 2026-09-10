@@ -131,7 +131,7 @@ Route::prefix('device')->group(function () {
 /*
  * TV app API routes (authenticated via Xtream credentials in URL path - no Sanctum)
  */
-Route::prefix('tv/{username}/{password}')->middleware('throttle:60,1')->group(function () {
+Route::prefix('tv/{username}/{password}')->middleware('throttle:tv-api')->group(function () {
     Route::get('notifications', [TvApiController::class, 'notifications'])
         ->name('tv.notifications');
     Route::post('notifications/{id}/read', [TvApiController::class, 'markRead'])

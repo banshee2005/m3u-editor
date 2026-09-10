@@ -64,7 +64,8 @@ class DvrRecorderService
                 'proxy_network_id' => null,
             ]);
 
-            $playlist = $recording->dvrSetting?->owner();
+            $playlist = $recording->playlistAuth?->playlist()
+                ?? $recording->dvrSetting?->owner();
             if ($playlist) {
                 $playlistKey = $playlist->getMorphClass().':'.$playlist->id;
                 $byPlaylist[$playlistKey] ??= ['playlist' => $playlist, 'count' => 0];
@@ -331,18 +332,19 @@ class DvrRecorderService
             'playlist_auth_id' => $playlistAuthId,
         ]);
 
-        if (! $playlistUuid) {
-            return;
-        }
-
-        $playlist = Playlist::where('uuid', $playlistUuid)->first();
-        if (! $playlist) {
-            return;
-        }
-
+        // Target the notifiable the evicted viewer's app actually queries: the
+        // playlist the viewer authenticated through (for merged credentials,
+        // the MergedPlaylist — the source playlist would be invisible to the
+        // viewer's notification scope).
         $playlistAuth = $playlistAuthId
             ? PlaylistAuth::find($playlistAuthId)
             : null;
+
+        $playlist = $playlistAuth?->playlist()
+            ?? ($playlistUuid ? Playlist::where('uuid', $playlistUuid)->first() : null);
+        if (! $playlist) {
+            return;
+        }
 
         AppNotification::make()
             ->title(__('DVR Recording Started'))
