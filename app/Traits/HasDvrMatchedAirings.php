@@ -113,7 +113,7 @@ trait HasDvrMatchedAirings
                 // within the setting's dedup window — a same-title airing is
                 // a replay of a recent game (skipped) but a re-match beyond
                 // the window is a new event (recorded).
-                $windowDays = $rule->dvrSetting?->sportsDedupDays() ?? 2;
+                $windowDays = $rule->sportsDedupDays();
                 $lookupKey = ($seriesKey ?? '').'|'.($hasSeasonEpisode
                     ? ($season ?? '').'|'.($episode ?? '')
                     : ($p->start_time?->toDateString() ?? '').'|');

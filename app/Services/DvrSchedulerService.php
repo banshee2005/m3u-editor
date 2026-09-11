@@ -282,7 +282,7 @@ class DvrSchedulerService
                 ? ($programme->season ?? '').'|'.($programme->episode ?? '')
                 : ($programme->start_time?->toDateString() ?? '').'|');
 
-            $windowDays = $rule->dvrSetting?->sportsDedupDays() ?? 2;
+            $windowDays = $rule->sportsDedupDays();
 
             $alreadyRecorded = $seriesKey !== null && (
                 $hasSeasonEpisode

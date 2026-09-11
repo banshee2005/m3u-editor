@@ -13,6 +13,8 @@ use App\Models\EpgProgramme;
 use App\Models\Playlist;
 use App\Models\User;
 use Filament\Forms\Components\Select;
+use Filament\Schemas\Components\View;
+use Livewire\Features\SupportTesting\Testable;
 use Livewire\Livewire;
 use PHPUnit\Framework\Assert;
 
@@ -39,6 +41,7 @@ it('re-renders the airings preview from the edited form values on an existing ru
         ->create([
             'epg_channel_id' => $epgChannel->id,
             'title' => 'Test Channel',
+            'enabled' => true,
         ]);
 
     $rule = DvrRecordingRule::factory()
@@ -51,13 +54,13 @@ it('re-renders the airings preview from the edited form values on an existing ru
             'series_mode' => DvrSeriesMode::All,
         ]);
 
-    EpgProgramme::factory()->upcoming(2)->create([
+    EpgProgramme::factory()->upcoming(60)->create([
         'epg_id' => $epg->id,
         'title' => 'Old Show',
         'epg_channel_id' => 'test.channel',
         'subtitle' => 'OLD-SERIES-EPISODE',
     ]);
-    EpgProgramme::factory()->upcoming(3)->create([
+    EpgProgramme::factory()->upcoming(90)->create([
         'epg_id' => $epg->id,
         'title' => 'New Show',
         'epg_channel_id' => 'test.channel',
@@ -66,12 +69,43 @@ it('re-renders the airings preview from the edited form values on an existing ru
 
     // Mounting shows the SAVED rule's airings; editing the title (onBlur)
     // must re-render the preview from the form's current values without
-    // persisting anything.
-    Livewire::test(EditDvrRecordingRule::class, ['record' => $rule->getRouteKey()])
-        ->assertSee('OLD-SERIES-EPISODE')
-        ->fillForm(['series_title' => 'New Show'])
-        ->assertSee('NEW-SERIES-EPISODE')
-        ->assertDontSee('OLD-SERIES-EPISODE');
+    // persisting anything. The preview's view DATA is asserted directly from
+    // the page's form schema against the current form state — deterministic
+    // in the test harness, unlike full HTML re-render snapshots.
+    $assertPreview = function (Testable $page, array $expectedSubtitles, array $absentSubtitles): void {
+        $flatten = function ($components) use (&$flatten): array {
+            $out = [];
+            foreach ($components as $component) {
+                $out[] = $component;
+                if (method_exists($component, 'getChildComponents')) {
+                    $out = array_merge($out, $flatten($component->getChildComponents()));
+                }
+            }
+
+            return $out;
+        };
+
+        $viewField = collect($flatten($page->instance()->form->getComponents()))
+            ->first(fn ($component) => $component instanceof View);
+        Assert::assertNotNull($viewField, 'Airings preview View component not found');
+
+        $subtitles = array_column($viewField->getViewData()['airings'] ?? [], 'subtitle');
+
+        foreach ($expectedSubtitles as $subtitle) {
+            Assert::assertContains($subtitle, $subtitles);
+        }
+        foreach ($absentSubtitles as $subtitle) {
+            Assert::assertNotContains($subtitle, $subtitles);
+        }
+    };
+
+    $page = Livewire::test(EditDvrRecordingRule::class, ['record' => $rule->getRouteKey()])
+        ->fillForm(['series_title' => 'Old Show']);
+
+    $assertPreview($page, ['OLD-SERIES-EPISODE'], ['NEW-SERIES-EPISODE']);
+
+    $page->fillForm(['series_title' => 'New Show']);
+    $assertPreview($page, ['NEW-SERIES-EPISODE'], ['OLD-SERIES-EPISODE']);
 
     expect(DvrRecordingRule::find($rule->id)->series_title)->toBe('Old Show');
 });

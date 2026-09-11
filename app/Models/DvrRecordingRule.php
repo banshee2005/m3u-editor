@@ -36,9 +36,24 @@ class DvrRecordingRule extends Model
             'keep_last' => 'integer',
             'enabled' => 'boolean',
             'enable_comskip' => 'boolean',
+            'sports_dedup_days' => 'integer',
             'manual_start' => UtcDateTime::class,
             'manual_end' => UtcDateTime::class,
         ];
+    }
+
+    /**
+     * Dedup window for this rule's sports airings (no season/episode data).
+     * Rule override wins; falls back to the DVR setting's default (2 days).
+     * 0 = record every same-title airing.
+     */
+    public function sportsDedupDays(): int
+    {
+        if ($this->sports_dedup_days !== null) {
+            return max(0, (int) $this->sports_dedup_days);
+        }
+
+        return $this->dvrSetting?->sportsDedupDays() ?? 2;
     }
 
     /**

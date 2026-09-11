@@ -162,6 +162,15 @@ class DvrRecordingRuleResource extends Resource
                     ->visible(fn (Get $get): bool => self::isRuleType($get('type'), DvrRuleType::Series))
                     ->live(onBlur: true),
 
+                TextInput::make('sports_dedup_days')
+                    ->label(__('Sports Dedup Window (Days)'))
+                    ->helperText(__('For sports airings without season/episode data: a same-title airing within this many days of a recent game is treated as a replay (skipped); beyond it, a new event is recorded. Blank uses the playlist default (2 days); 0 records every same-title airing.'))
+                    ->numeric()
+                    ->minValue(0)
+                    ->placeholder(__('Playlist default'))
+                    ->visible(fn (Get $get): bool => self::isRuleType($get('type'), DvrRuleType::Series))
+                    ->live(onBlur: true),
+
                 Select::make('enable_comskip')
                     ->label(__('Commercial Detection (Comskip)'))
                     ->options([
@@ -220,7 +229,10 @@ class DvrRecordingRuleResource extends Resource
             return [];
         }
 
-        $seriesTitle = trim((string) ($get('series_title') ?? ''));
+        // On the initial mount the form state may not be filled yet, so fall back
+        // to the record's values — the preview must render for existing rules
+        // before any onBlur edit.
+        $seriesTitle = trim((string) ($get('series_title') ?? $record?->series_title ?? ''));
         if ($seriesTitle === '') {
             return [];
         }
@@ -248,6 +260,7 @@ class DvrRecordingRuleResource extends Resource
             'epg_channel_id' => $get('epg_channel_id') ?? $record?->epg_channel_id,
             'channel_id' => $get('channel_id') ?? $record?->channel_id,
             'source_channel_id' => $get('source_channel_id') ?? $record?->source_channel_id,
+            'sports_dedup_days' => $get('sports_dedup_days') ?? $record?->sports_dedup_days,
         ]);
 
         return static::resolveMatchedAirings($tempRule);
