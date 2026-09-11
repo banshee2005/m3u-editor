@@ -56,19 +56,33 @@ it('transitions to Failed and persists a TvNotification when recording fails to 
             'status' => DvrRecordingStatus::Scheduled,
             'title' => 'Evening News',
             'stream_url' => 'http://example.com/stream',
+            'scheduled_end' => now()->addHour(),
+            'attempt_count' => 0,
         ]);
 
     $exceptionMessage = 'FFmpeg binary not found';
     $recorder = Mockery::mock(DvrRecorderService::class);
     $recorder->shouldReceive('start')
-        ->once()
+        ->times(StartDvrRecording::MAX_START_ATTEMPTS)
         ->andThrow(new Exception($exceptionMessage));
     $this->app->instance(DvrRecorderService::class, $recorder);
 
     Event::fake([TvNotificationEvent::class]);
     Bus::fake([SendPushNotificationRelay::class]);
+    Queue::fake();
 
     $job = new StartDvrRecording($recording->id);
+
+    // Transient failures retry (bounded by MAX_START_ATTEMPTS): the first
+    // attempts keep the recording Scheduled and schedule the retry.
+    for ($attempt = 1; $attempt < StartDvrRecording::MAX_START_ATTEMPTS; $attempt++) {
+        $job->handle($recorder);
+        $recording->refresh();
+        expect($recording->status)->toBe(DvrRecordingStatus::Scheduled);
+        expect($recording->attempt_count)->toBe($attempt);
+    }
+
+    // The final attempt marks the recording Failed and notifies.
     $job->handle($recorder);
 
     $recording->refresh();

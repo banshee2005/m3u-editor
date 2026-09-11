@@ -118,6 +118,7 @@ it('resolves the URL through the proxy for a pooled-provider channel so a profil
     $mock->shouldReceive('startDvrBroadcast')->andReturn($recording->uuid);
     $mock->shouldReceive('getActiveStreamIdForChannel')->andReturnNull();
     $mock->shouldReceive('getStreamProxyUrl')->andReturn('');
+    $mock->shouldReceive('getActiveLiveStreams')->andReturn([]);
     app()->instance(M3uProxyService::class, $mock);
 
     app(DvrRecorderService::class)->start($recording);
@@ -142,6 +143,7 @@ it('falls back to the raw channel URL when proxy resolution fails for a pooled-p
     $mock->shouldReceive('startDvrBroadcast')->andReturn($recording->uuid);
     $mock->shouldReceive('getActiveStreamIdForChannel')->andReturnNull();
     $mock->shouldReceive('getStreamProxyUrl')->andReturn('');
+    $mock->shouldReceive('getActiveLiveStreams')->andReturn([]);
     app()->instance(M3uProxyService::class, $mock);
 
     app(DvrRecorderService::class)->start($recording);

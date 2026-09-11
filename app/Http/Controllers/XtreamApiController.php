@@ -4390,6 +4390,12 @@ class XtreamApiController extends Controller
             }
         }
 
+        // The requesting playlist's own setting (e.g. a MergedPlaylist with
+        // its own DvrSetting) as a fallback.
+        if ($playlist->dvrSetting?->enabled) {
+            return $playlist->dvrSetting;
+        }
+
         return null;
     }
 
