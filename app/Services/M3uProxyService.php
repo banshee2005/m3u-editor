@@ -1252,53 +1252,53 @@ class M3uProxyService
             // If still at capacity (either no live stream was evictable or the
             // eviction failed), check failovers
             if ($activeStreams >= $limitPlaylist->available_streams) {
-                    // Primary playlist is at capacity, check failovers
-                    $failoverChannels = $channel->failoverChannels()
-                        ->select([
-                            'channels.id',
-                            'channels.url',
-                            'channels.url_custom',
-                            'channels.playlist_id',
-                            'channels.custom_playlist_id',
-                        ])->get();
+                // Primary playlist is at capacity, check failovers
+                $failoverChannels = $channel->failoverChannels()
+                    ->select([
+                        'channels.id',
+                        'channels.url',
+                        'channels.url_custom',
+                        'channels.playlist_id',
+                        'channels.custom_playlist_id',
+                    ])->get();
 
-                    foreach ($failoverChannels as $failoverChannel) {
-                        $failoverPlaylist = $failoverChannel->getEffectivePlaylist();
+                foreach ($failoverChannels as $failoverChannel) {
+                    $failoverPlaylist = $failoverChannel->getEffectivePlaylist();
 
-                        // Check if failover playlist has limits and capacity
-                        if ($failoverPlaylist->available_streams === 0) {
-                            // No limits on this failover playlist, use it
+                    // Check if failover playlist has limits and capacity
+                    if ($failoverPlaylist->available_streams === 0) {
+                        // No limits on this failover playlist, use it
+                        $playlist = $failoverPlaylist;
+                        $actualChannel = $failoverChannel;  // Track that we're using a failover channel
+                        $primaryUrl = PlaylistUrlService::getChannelUrl($failoverChannel, $playlist);
+                        break;
+                    } else {
+                        // Check if failover playlist has capacity
+                        $failoverActiveStreams = self::getActiveStreamsCountByMetadata('playlist_uuid', $failoverPlaylist->uuid);
+
+                        if ($failoverActiveStreams < $failoverPlaylist->available_streams) {
+                            // Found available failover playlist
                             $playlist = $failoverPlaylist;
                             $actualChannel = $failoverChannel;  // Track that we're using a failover channel
                             $primaryUrl = PlaylistUrlService::getChannelUrl($failoverChannel, $playlist);
                             break;
-                        } else {
-                            // Check if failover playlist has capacity
-                            $failoverActiveStreams = self::getActiveStreamsCountByMetadata('playlist_uuid', $failoverPlaylist->uuid);
-
-                            if ($failoverActiveStreams < $failoverPlaylist->available_streams) {
-                                // Found available failover playlist
-                                $playlist = $failoverPlaylist;
-                                $actualChannel = $failoverChannel;  // Track that we're using a failover channel
-                                $primaryUrl = PlaylistUrlService::getChannelUrl($failoverChannel, $playlist);
-                                break;
-                            }
                         }
                     }
+                }
 
-                    // If we still have the original playlist, all are at capacity
-                    if ($playlist->uuid === $originalUuid) {
-                        Log::debug('Channel stream request denied - all playlists at capacity', [
-                            'channel_id' => $id,
-                            'primary_playlist' => $playlist->uuid,
-                            'primary_limit' => $playlist->available_streams,
-                            'primary_active' => $activeStreams,
-                        ]);
+                // If we still have the original playlist, all are at capacity
+                if ($playlist->uuid === $originalUuid) {
+                    Log::debug('Channel stream request denied - all playlists at capacity', [
+                        'channel_id' => $id,
+                        'primary_playlist' => $playlist->uuid,
+                        'primary_limit' => $playlist->available_streams,
+                        'primary_active' => $activeStreams,
+                    ]);
 
-                        abort(503, 'All playlists have reached their maximum stream limit. Please try again later.');
-                    }
+                    abort(503, 'All playlists have reached their maximum stream limit. Please try again later.');
                 }
             }
+        }
 
         // Per-PlaylistAuth stream limit check (only applies when proxy is in use)
         if ($playlistAuthId && ! $this->checkAndEnforceAuthStreamLimit($playlistAuthId, $id)) {

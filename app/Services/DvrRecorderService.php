@@ -127,71 +127,71 @@ class DvrRecorderService
             // recording is never lost to a transient proxy/provider error.
             $sourcePlaylist = $channel->playlist;
             if ($sourcePlaylist instanceof Playlist && ($sourcePlaylist->profiles_enabled || $sourcePlaylist->enable_proxy)) {
-// Snapshot the active live streams so we can detect which ones a
-            // "DVR wins" eviction stopped and notify the affected viewers.
-            // Live streams created via a merged/custom wrapper carry the
-            // WRAPPER's playlist_uuid (recordings' streams carry the source
-            // uuid), so match on original_playlist_uuid — upstream keys pool
-            // lookups on the source uuid, and both variants set it.
-            $allStreams = $this->proxy->getActiveLiveStreams();
-            $streamsBefore = array_values(array_filter(
-                $allStreams,
-                fn ($s) => ($s['metadata']['original_playlist_uuid'] ?? $s['metadata']['playlist_uuid'] ?? null) === $sourcePlaylist->uuid,
-            ));
+                // Snapshot the active live streams so we can detect which ones a
+                // "DVR wins" eviction stopped and notify the affected viewers.
+                // Live streams created via a merged/custom wrapper carry the
+                // WRAPPER's playlist_uuid (recordings' streams carry the source
+                // uuid), so match on original_playlist_uuid — upstream keys pool
+                // lookups on the source uuid, and both variants set it.
+                $allStreams = $this->proxy->getActiveLiveStreams();
+                $streamsBefore = array_values(array_filter(
+                    $allStreams,
+                    fn ($s) => ($s['metadata']['original_playlist_uuid'] ?? $s['metadata']['playlist_uuid'] ?? null) === $sourcePlaylist->uuid,
+                ));
 
-            // Pre-evict the oldest LIVE-VIEWER stream (never a recording's
-            // stream) when the pool is full, so getChannelUrl's age-based
-            // stopOldestOnLimit cannot kill an active recording's stream.
-            $totalProfileSlots = 0;
-            foreach ($sourcePlaylist->profiles()->where('enabled', true)->get() as $profile) {
-                $totalProfileSlots += (int) $profile->effective_max_streams;
-            }
-
-            if ($totalProfileSlots > 0 && count($streamsBefore) >= $totalProfileSlots) {
-                $recordingChannelIds = $setting->recordings()
-                    ->where('status', DvrRecordingStatus::Recording)
-                    ->pluck('channel_id')
-                    ->map(fn ($c) => (int) $c)
-                    ->all();
-
-                Log::info('DVR: pool full, evaluating pre-eviction', [
-                    'recording_id' => $recording->id,
-                    'streams' => array_map(fn ($s) => [
-                        'id' => substr($s['stream_id'], 0, 8),
-                        'channel_id' => $s['metadata']['channel_id'] ?? null,
-                        'created' => $s['created_at'],
-                    ], $streamsBefore),
-                    'recording_channel_ids' => $recordingChannelIds,
-                    'total_slots' => $totalProfileSlots,
-                ]);
-
-                // Oldest first — a viewer whose stream is evicted should be
-                // the one who has been watching the longest.
-                usort($streamsBefore, fn ($a, $b) => strcmp((string) ($a['created_at'] ?? ''), (string) ($b['created_at'] ?? '')));
-
-                $preEvictedStreamId = null;
-                foreach ($streamsBefore as $candidate) {
-                    $streamChannelId = (int) ($candidate['metadata']['channel_id'] ?? 0);
-                    if (in_array($streamChannelId, $recordingChannelIds, true)) {
-                        continue;
-                    }
-
-                    if ($this->proxy->deleteStream($candidate['stream_id'])) {
-                        $preEvictedStreamId = $candidate['stream_id'];
-                        Log::info('DVR: evicted oldest live stream for recording', [
-                            'recording_id' => $recording->id,
-                            'title' => $recording->title,
-                            'evicted_stream_id' => $candidate['stream_id'],
-                            'evicted_channel_id' => $streamChannelId,
-                        ]);
-                        $this->notifyEvictedViewer($candidate, $recording);
-                        usleep(200000); // 200ms for the proxy to release the slot
-                    }
-                    break;
+                // Pre-evict the oldest LIVE-VIEWER stream (never a recording's
+                // stream) when the pool is full, so getChannelUrl's age-based
+                // stopOldestOnLimit cannot kill an active recording's stream.
+                $totalProfileSlots = 0;
+                foreach ($sourcePlaylist->profiles()->where('enabled', true)->get() as $profile) {
+                    $totalProfileSlots += (int) $profile->effective_max_streams;
                 }
-            }
 
-            try {
+                if ($totalProfileSlots > 0 && count($streamsBefore) >= $totalProfileSlots) {
+                    $recordingChannelIds = $setting->recordings()
+                        ->where('status', DvrRecordingStatus::Recording)
+                        ->pluck('channel_id')
+                        ->map(fn ($c) => (int) $c)
+                        ->all();
+
+                    Log::info('DVR: pool full, evaluating pre-eviction', [
+                        'recording_id' => $recording->id,
+                        'streams' => array_map(fn ($s) => [
+                            'id' => substr($s['stream_id'], 0, 8),
+                            'channel_id' => $s['metadata']['channel_id'] ?? null,
+                            'created' => $s['created_at'],
+                        ], $streamsBefore),
+                        'recording_channel_ids' => $recordingChannelIds,
+                        'total_slots' => $totalProfileSlots,
+                    ]);
+
+                    // Oldest first — a viewer whose stream is evicted should be
+                    // the one who has been watching the longest.
+                    usort($streamsBefore, fn ($a, $b) => strcmp((string) ($a['created_at'] ?? ''), (string) ($b['created_at'] ?? '')));
+
+                    $preEvictedStreamId = null;
+                    foreach ($streamsBefore as $candidate) {
+                        $streamChannelId = (int) ($candidate['metadata']['channel_id'] ?? 0);
+                        if (in_array($streamChannelId, $recordingChannelIds, true)) {
+                            continue;
+                        }
+
+                        if ($this->proxy->deleteStream($candidate['stream_id'])) {
+                            $preEvictedStreamId = $candidate['stream_id'];
+                            Log::info('DVR: evicted oldest live stream for recording', [
+                                'recording_id' => $recording->id,
+                                'title' => $recording->title,
+                                'evicted_stream_id' => $candidate['stream_id'],
+                                'evicted_channel_id' => $streamChannelId,
+                            ]);
+                            $this->notifyEvictedViewer($candidate, $recording);
+                            usleep(200000); // 200ms for the proxy to release the slot
+                        }
+                        break;
+                    }
+                }
+
+                try {
                     $streamUrl = $this->proxy->getChannelUrl(
                         $sourcePlaylist,
                         $channel,

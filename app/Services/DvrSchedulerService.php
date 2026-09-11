@@ -11,7 +11,6 @@ use App\Jobs\StartDvrRecording;
 use App\Jobs\StopDvrRecording;
 use App\Models\Channel;
 use App\Models\DvrRecording;
-use App\Services\M3uProxyService;
 use App\Models\DvrRecordingRule;
 use App\Models\DvrSetting;
 use App\Models\EpgChannel;

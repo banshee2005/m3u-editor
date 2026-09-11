@@ -18,6 +18,7 @@ use App\Models\Channel;
 use App\Models\CustomPlaylist;
 use App\Models\DvrRecording;
 use App\Models\DvrRecordingRule;
+use App\Models\DvrSetting;
 use App\Models\DynamicGroup;
 use App\Models\EmbyLibraryMapping;
 use App\Models\Epg;
@@ -4377,7 +4378,7 @@ class XtreamApiController extends Controller
     /**
      * Schedule a one-shot DVR recording rule from the TV app.
      */
-    private function resolveDvrSetting($playlist, ?int $channelId = null): ?\App\Models\DvrSetting
+    private function resolveDvrSetting($playlist, ?int $channelId = null): ?DvrSetting
     {
         if ($playlist instanceof Playlist && $playlist->dvrSetting?->enabled) {
             return $playlist->dvrSetting;
@@ -4410,7 +4411,7 @@ class XtreamApiController extends Controller
             ->where('merged_playlist_id', $playlist->id)
             ->pluck('playlist_id');
 
-        $settingIds = \App\Models\DvrSetting::whereIn('playlist_id', $sourcePlaylistIds)
+        $settingIds = DvrSetting::whereIn('playlist_id', $sourcePlaylistIds)
             ->pluck('id')
             ->toArray();
 
