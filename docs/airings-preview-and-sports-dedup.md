@@ -63,3 +63,35 @@ The title-only dedup was a false dichotomy:
 - opcache has `validate_timestamps=Off`: hot-patched files never load in FPM;
   only a full image rebuild + container recreate takes effect. Horizon queue
   workers need `php artisan horizon:terminate`.
+
+## m3u-tv PR #282 (DVR capacity UI) — CI + test learnings
+
+- **Fork-PR CI approval gate**: workflow runs from forks are `action_required`
+  until a maintainer approves them (that is why the maintainer saw "checks
+  skipped" on the original PR). Nothing can fix this from the fork side —
+  approve the run on GitHub (Actions → run page → "Approve and run").
+- **`dart format --set-exit-if-changed lib test` is a CI gate**: 11 feature
+  files were unformatted after the dev merge; always run `dart format` before
+  pushing.
+- **`flutter analyze lib test` gate**: the local Flutter (3.47.2) flags lints
+  the CI's pinned 3.44.8 may not (unnecessary_unawaited etc. — pre-existing on
+  dev in files like notification_toast/row_action_menu). Fix YOUR files; use
+  `mounted` (State) rather than `context.mounted` for State-owned contexts.
+- **Test regressions found via a base worktree** (`git worktree add <dir>
+  <base>` + run the same files): the 30s DVR poll introduced three real bugs —
+  1) active+scheduled merge order flipped a started recording back to
+  Scheduled (active must win); 2) a debug `uuid.substring(0, 8)` crashed on
+  short fixture uuids; 3) a connect-time active refresh leaked recordings
+  across account handoffs (the reverb onConnected refresh already covers it).
+- **Preflight pass-through**: the live preflight must not swallow 403/404
+  (backends type them as expired_token/stream_not_found) — only 5xx JSON
+  messages should be surfaced; and replacing an error must not bypass its
+  emission.
+- **Deferring work to post-frame in build() breaks pump-based widget tests** —
+  the repo's LiveTvScreen test contract expects synchronous EPG loading;
+  revert such perf tweaks rather than rewriting repo tests.
+- **Baseline isolation**: `release_matrix_documentation_test`,
+  `tvos_port_drift_test`, `transcoding_contract_test`, and two
+  `push_token_lifecycle_test` cases fail on the BASE with the local Flutter
+  (version-documentation + contract tests) — environment noise, not PR
+  regressions.
