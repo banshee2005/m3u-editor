@@ -5256,37 +5256,6 @@ class XtreamApiController extends Controller
         return null;
     }
 
-    /**
-     * Resolve the DVR setting ids a playlist can see recordings for. For a
-     * real Playlist that's its own setting; for a MergedPlaylist it's the
-     * settings of all source playlists (recordings are always created on the
-     * source playlist's setting).
-     *
-     * @return array<int, int>
-     */
-    private function resolveDvrSettingIds($playlist): array
-    {
-        if ($playlist instanceof Playlist) {
-            return $playlist->dvrSetting ? [$playlist->dvrSetting->id] : [];
-        }
-
-        $sourcePlaylistIds = DB::table('merged_playlist_playlist')
-            ->where('merged_playlist_id', $playlist->id)
-            ->pluck('playlist_id');
-
-        $settingIds = DvrSetting::whereIn('playlist_id', $sourcePlaylistIds)
-            ->pluck('id')
-            ->toArray();
-
-        // Include the merged playlist's own setting too, in case recordings
-        // were ever created against it directly.
-        if ($playlist->dvrSetting) {
-            $settingIds[] = $playlist->dvrSetting->id;
-        }
-
-        return array_values(array_unique($settingIds));
-    }
-
     private function scheduleDvr(Request $request, $playlist, ?PlaylistAuth $playlistAuth): \Illuminate\Http\JsonResponse
     {
         $channelId = (int) $request->input('channel_id');

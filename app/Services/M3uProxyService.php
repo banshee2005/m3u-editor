@@ -375,51 +375,6 @@ class M3uProxyService
      * Get active streams count by any metadata field/value combination.
      * Returns the number of distinct upstream connections (streams), not proxy client count.
      */
-    /**
-     * Get the DISTINCT channel ids currently being watched live on the given
-     * playlist UUID (proxy streams keyed by playlist_uuid metadata). Used by
-     * DVR capacity accounting so live viewers and recordings share the pool.
-     *
-     * @return array<int, int>
-     */
-    public static function getActiveLiveChannelIds(string $playlistUuid): array
-    {
-        $service = new self;
-
-        if (empty($service->apiBaseUrl)) {
-            return [];
-        }
-
-        try {
-            $response = Http::timeout(5)->acceptJson()
-                ->withHeaders($service->apiToken ? ['X-API-Token' => $service->apiToken] : [])
-                ->get($service->apiBaseUrl.'/streams/by-metadata', [
-                    'field' => 'playlist_uuid',
-                    'value' => $playlistUuid,
-                    'active_only' => true,
-                ]);
-
-            if (! $response->successful()) {
-                return [];
-            }
-
-            $ids = [];
-            foreach ($response->json()['matching_streams'] ?? [] as $stream) {
-                $metadata = $stream['metadata'] ?? [];
-                $channelId = $metadata['original_channel_id'] ?? $metadata['channel_id'] ?? null;
-                if ($channelId !== null) {
-                    $ids[(int) $channelId] = true;
-                }
-            }
-
-            return array_keys($ids);
-        } catch (Exception $e) {
-            Log::warning('Error listing active live channels: '.$e->getMessage());
-
-            return [];
-        }
-    }
-
     public static function getActiveStreamsCountByMetadata(string $field, string $value): int
     {
         $service = new self;
@@ -568,51 +523,6 @@ class M3uProxyService
         }
 
         return array_keys($ids);
-    }
-
-    /**
-     * List active live streams on the proxy, including their metadata and
-     * creation time. Used to pick the oldest LIVE-VIEWER stream to evict when
-     * a playlist is at capacity, while excluding DVR-recording-backed channels.
-     *
-     * @return array<int, array{stream_id: string, created_at: ?string, metadata: array}>
-     */
-    public function getActiveLiveStreams(): array
-    {
-        if (empty($this->apiBaseUrl)) {
-            return [];
-        }
-
-        try {
-            $response = Http::timeout(5)->acceptJson()
-                ->withHeaders($this->apiToken ? ['X-API-Token' => $this->apiToken] : [])
-                ->get($this->apiBaseUrl.'/streams');
-
-            if (! $response->successful()) {
-                return [];
-            }
-
-            $result = [];
-            foreach ($response->json('streams') ?? [] as $stream) {
-                if (! ($stream['is_active'] ?? false) || (int) ($stream['client_count'] ?? 0) === 0) {
-                    continue;
-                }
-
-                $result[] = [
-                    'stream_id' => (string) ($stream['stream_id'] ?? ''),
-                    'created_at' => $stream['created_at'] ?? null,
-                    'metadata' => $stream['metadata'] ?? [],
-                ];
-            }
-
-            return $result;
-        } catch (Exception $e) {
-            Log::warning('Failed to list active live streams', [
-                'exception' => $e->getMessage(),
-            ]);
-
-            return [];
-        }
     }
 
     /**
