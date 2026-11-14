@@ -318,6 +318,7 @@ Supported permissions:
 - `queue_jobs`
 - `hook_subscriptions`
 - `scheduled_runs`
+- `api_endpoints`
 
 Rules:
 
@@ -325,6 +326,7 @@ Rules:
 - scheduled capability requires `scheduled_runs`
 - declared schema requires `schema_manage`
 - declared files/directories require `filesystem_write`
+- declared `api_endpoints` require both the `api_endpoints` capability and the `api_endpoints` permission
 
 `network_egress` is declarative only in this phase. It is shown during review, but not OS-sandboxed.
 
@@ -556,6 +558,7 @@ Current capabilities:
 - `channel_processor`
 - `stream_analysis`
 - `scheduled`
+- `api_endpoints` (see [API Endpoints](#api-endpoints))
 
 ## Hooks
 
@@ -615,6 +618,121 @@ class Plugin implements PluginInterface, PluginSelectOptionsProviderInterface
 
 `$context->value($key, $default)` returns the current row value for a field listed in `depends_on`. Use this to build context-aware option lists that change based on related column values in the same row.
 
+## API Endpoints
+
+A plugin can answer HTTP requests from outside M3U Editor (for example a media server plugin reading data your plugin stored). Endpoints are declared in `plugin.json`, so they are covered by the integrity hash: adding or changing one sends the plugin back to review.
+
+### Declaring endpoints
+
+```json
+{
+  "capabilities": ["api_endpoints"],
+  "permissions": ["db_read", "api_endpoints"],
+  "api_endpoints": [
+    {
+      "id": "echo",
+      "label": "Echo",
+      "description": "Echoes a validated message.",
+      "fields": [
+        { "id": "message", "type": "text", "label": "Message", "required": true },
+        { "id": "shout", "type": "boolean", "label": "Shout" }
+      ]
+    }
+  ]
+}
+```
+
+- `id`: 1-64 lowercase letters, digits, hyphens or underscores, starting with a letter or digit. Only declared ids are routable.
+- `fields`: the payload the host accepts, using the normal field definitions. Allowed types are `boolean`, `number`, `text`, `textarea`, `tags` and static-option `select`. `model_select`, `table_select`, `options_provider`, `visible_when` and `visibility_provider` are rejected: they depend on a signed-in user or an admin form, and API callers have neither.
+- The plugin class must implement `App\Plugins\Contracts\ApiEndpointPluginInterface`:
+
+```php
+use App\Plugins\Contracts\ApiEndpointPluginInterface;
+use App\Plugins\Support\PluginApiRequestContext;
+
+class Plugin implements ApiEndpointPluginInterface, PluginInterface
+{
+    public function handleApiRequest(string $endpoint, array $payload, PluginApiRequestContext $context): array
+    {
+        return match ($endpoint) {
+            'echo' => ['message' => $payload['message']],
+        };
+    }
+}
+```
+
+`tests/Fixtures/plugins/api-demo` is a complete reference plugin.
+
+### Calling an endpoint
+
+```http
+POST /api/plugins/{plugin_id}/{endpoint}
+Authorization: Basic base64(username:password)
+Content-Type: application/json
+
+{"payload": {"message": "hi"}}
+```
+
+- **Authentication** is an existing Xtream login: playlist owner default login, PlaylistAuth or playlist alias. It goes through the same authenticator as `/player_api.php`, so expiry, disabled PlaylistAuths and disabled Xtream output are rejected the same way. Send it in a Basic header (preferred) or as `username` and `password` in the JSON body. The query string is never read, so credentials in a URL do not authenticate.
+- **Body** must be JSON (`415` otherwise) and at most 128 KiB. `payload` must be a JSON object.
+- **Response** is at most 512 KiB, including the envelope:
+
+```json
+{ "api_version": 1, "plugin_id": "api-demo", "endpoint": "echo", "data": { "message": "hi" } }
+```
+
+- **Rate limit**: 120 requests per minute per client IP, across all plugins (`PLUGIN_API_RATE_LIMIT`).
+
+| Status | `error` | Meaning |
+|---|---|---|
+| 401 | `unauthorized` | Missing, wrong, expired or disabled login, or Xtream output disabled |
+| 403 | `plugin_unavailable` | Plugin is disabled, untrusted, blocked, invalid, or its files changed since trust |
+| 404 | `not_found` | Plugin system disabled, unknown plugin, or undeclared endpoint |
+| 405 | | Not a POST |
+| 413 | `request_too_large` / `response_too_large` | A size limit was exceeded |
+| 415 | `json_required` | Body is not JSON |
+| 422 | `invalid_payload` | Payload failed validation; `fields` lists the field names, never values or messages |
+| 429 | | Rate limit reached; respect `Retry-After` |
+| 500 | `plugin_request_failed` | The plugin threw or returned non-JSON data. Details go to the server log only |
+
+### What the host guarantees
+
+- The plugin's files are re-hashed against the trusted snapshot before its code loads on every request, the same check actions and hooks get.
+- The plugin only receives the endpoint's declared fields, after validation. Text values are capped at 2048 characters.
+- `$context` carries identifiers, never credentials:
+  - `$context->playlist`: `id`, `type` (model class) and `user_id` of the playlist the login unlocks
+  - `$context->playlistAuth`: `id` and `user_id` for PlaylistAuth logins, otherwise `null`
+  - `$context->settings`: the plugin's resolved settings (never echo these back)
+- Calls are synchronous and create no `PluginRun`.
+
+### What the plugin must do
+
+Plugins are trusted in-process PHP, not a sandbox. The host cannot stop plugin code from reaching the database or network directly, so:
+
+- **Resolve the playlist from `$context` only**, never from the payload. Allowlist the four model classes and scope by `user_id`:
+
+```php
+$class = match ($context->playlist->type) {
+    \App\Models\Playlist::class,
+    \App\Models\CustomPlaylist::class,
+    \App\Models\MergedPlaylist::class,
+    \App\Models\PlaylistAlias::class => $context->playlist->type,
+    default => throw new \RuntimeException('Unsupported playlist type.'),
+};
+$playlist = $class::query()->where('user_id', $context->playlist->user_id)->findOrFail($context->playlist->id);
+```
+
+- **Keep the exact playlist scope.** Do not widen an alias, custom or merged playlist to its owner's other playlists, and reject ids from the payload that do not belong to it.
+- **Fetch caller-influenced URLs only with `$context->safeGet($url)`.** It blocks non-HTTP schemes and private, loopback, link-local and reserved destinations, re-checks every redirect, and pins the resolved IP against DNS rebinding. It requires the `network_egress` permission. A plugin that declares both `api_endpoints` and `network_egress` is flagged during review for exactly this reason.
+- **Stay read-only** and bound your own work (pagination, result sizes).
+- **Throw `Illuminate\Validation\ValidationException`** for invalid input. Callers see only the field names.
+
+### Review and visibility
+
+- The install review flags `api_endpoints` as a high-risk permission and lists every endpoint URL.
+- The plugin page shows an **API Endpoints** section with each copyable URL and the fields it accepts, plus a warning when the plugin can also make outbound requests.
+- The plugin list has an **API Endpoints** column showing how many endpoints each plugin exposes.
+
 ## Field Types
 
 Field types apply to both `settings` and `ui_tables[*].fields`.
@@ -639,6 +757,64 @@ Common field keys:
 - `helper_text` — hint shown below the field
 - `multiple` — allow multiple selections (`select`, `model_select`, `table_select`)
 - `placeholder` — select placeholder text
+
+### Conditional fields and sections
+
+`visible_when` maps another field's name to a list of allowed values. All conditions
+must match. Numbers compare by value, so `2` and `"2"` are equivalent; other values,
+including booleans and `null`, must match exactly. For example:
+
+```json
+{
+  "id": "source_playlist_id",
+  "type": "model_select",
+  "label": "Reference playlist",
+  "model": "App\\Models\\Playlist",
+  "scope": "owned",
+  "visible_when": { "source_mode": ["native_playlist"] }
+}
+```
+
+Names follow the same prefix rules as `depends_on`. The host makes controlling
+fields reactive. Visibility changes retain saved and unsaved values; they do not
+reset fields, disable settings, or change validation rules. Hidden fields are still
+validated, so a field that can be hidden (it declares `visible_when` or
+`visibility_provider`, or sits inside a section that does) cannot set `required`;
+manifest validation rejects that combination. Use optional fields or valid defaults
+for inactive settings, and check required values in plugin code. Existing
+`depends_on` option resets still apply independently.
+
+For conditions requiring plugin logic, declare `visibility_provider` and a
+`visibility_depends_on` list. The plugin may implement this optional method:
+
+```php
+public function isFieldVisible(string $provider, PluginSelectOptionsContext $context): bool
+{
+    return $provider === 'download_key'
+        && $context->value('settings.download_method') === 'api';
+}
+```
+
+The existing form context carries the current user, plugin settings, field
+metadata and declared dependency values. Providers must be read-only, return a
+boolean and enforce ownership on model lookups. Missing or failing providers hide
+the affected component and log a warning. Static conditions and a provider may be
+combined; both must allow visibility. Visibility is presentation, not authorization.
+Older hosts ignore these optional manifest properties and display every field;
+the optional method does not add a required interface to existing plugin classes.
+
+Dynamic options and visibility results are reused only within a request, keyed by
+user, plugin configuration, provider, dependency state and field definition.
+Plugin validation scans are also reused within the UI request; current registry
+trust is checked before each provider access. Execution, trust and explicit
+validation still verify files afresh. Equivalent model/table option queries,
+individual label lookups (including missing labels), and table existence/column
+metadata are shared within the request. Labels are resolved independently of
+dropdown limits. Table cells serialize only their displayed attribute and declared
+provider dependencies, retaining Eloquent's date and enum formatting without
+decoding unrelated JSON columns. Plugin table writes clear option, label and visibility results.
+Schema apply/purge also clears these results and table metadata, including when
+a schema change fails partway through.
 
 ### select
 

@@ -12,7 +12,7 @@ $horizonIntEnv = static function (string $key, int $default): int {
     return is_numeric($value) ? (int) $value : $default;
 };
 
-return [
+$config = [
 
     /*
     |--------------------------------------------------------------------------
@@ -258,17 +258,39 @@ return [
         // low-concurrency and isolated from the general queue on purpose: bursts of
         // resolution jobs (e.g. bulk-add, or many exhausted failover chains around the
         // same time) hit AIOStreams and, transitively, debrid backends that penalize
-        // aggressive/concurrent request patterns.
+        // aggressive/concurrent request patterns. Auto balancing idles at one worker
+        // and adds the second only while jobs are waiting ('simple' kept both running).
         'aiostreams-queue' => [
             'connection' => 'redis',
             'queue' => ['aiostreams-resolve'],
-            'balance' => 'simple',
+            'balance' => 'auto',
+            'autoScalingStrategy' => 'time',
+            'minProcesses' => 1,
             'maxProcesses' => $horizonIntEnv('HORIZON_AIOSTREAMS_MAX_PROCESSES', 2),
             'maxTime' => $horizonIntEnv('HORIZON_AIOSTREAMS_MAX_TIME', 1800), // recycle every 30 min, jobs are short
             'maxJobs' => $horizonIntEnv('HORIZON_AIOSTREAMS_MAX_JOBS', 300),
             'memory' => $horizonIntEnv('HORIZON_AIOSTREAMS_MEMORY', 256), // MB
             'tries' => 1, // jobs handle their own empty-result retry/backoff internally
             'timeout' => 60 * 5,
+            'nice' => 5,
+        ],
+
+        // Cached content downloads (DownloadCachedContentFile) run here only, so a
+        // slow provider or a 1-hour download can't stall import/sync work. The job
+        // itself allows one download per playlist at a time; maxProcesses caps
+        // downloads across playlists. SQLite deployments collapse to 1 process.
+        'cache-queue' => [
+            'connection' => 'redis',
+            'queue' => ['cache'],
+            'balance' => 'auto',
+            'autoScalingStrategy' => 'time',
+            'minProcesses' => $horizonIntEnv('HORIZON_CACHE_MIN_PROCESSES', 1),
+            'maxProcesses' => $horizonIntEnv('HORIZON_CACHE_MAX_PROCESSES', env('DB_CONNECTION', 'sqlite') === 'sqlite' ? 1 : 4),
+            'maxTime' => $horizonIntEnv('HORIZON_CACHE_MAX_TIME', 3600),
+            'maxJobs' => $horizonIntEnv('HORIZON_CACHE_MAX_JOBS', 50),
+            'memory' => $horizonIntEnv('HORIZON_CACHE_MEMORY', 256),
+            'tries' => 3,
+            'timeout' => 60 * 60, // 1 hour - cached files can be multi-GB
             'nice' => 5,
         ],
     ],
@@ -279,3 +301,29 @@ return [
         ],
     ],
 ];
+
+// Horizon can't scale a queue below one worker, so with DVR switched off the DVR
+// supervisor would still keep an idle worker on each of its three queues. Mirrors
+// the global DVR gate (User::canUseDvr): DVR_ENABLED and proxy integration.
+if (! (env('DVR_ENABLED', true) && env('M3U_PROXY_INTEGRATION_ENABLED', true))) {
+    unset($config['defaults']['dvr-queue']);
+}
+
+// Same for the optional features: switching one off (which also hides it in the app
+// and stops its background work) drops its supervisor, saving the supervisor plus its
+// idle worker. Each mirrors the feature's own config flag, where only an explicit
+// false disables it; unset, blank or other values keep it on.
+$optionalFeatureSupervisors = [
+    'PLUGINS_ENABLED' => 'm3u-editor-plugin-queue', // config('plugins.enabled')
+    'SCHEDULES_DIRECT_ENABLED' => 'm3u-editor-sd-queue', // config('services.schedules_direct.enabled')
+    'AIOSTREAMS_ENABLED' => 'aiostreams-queue', // config('services.aiostreams.enabled')
+    'CACHED_CONTENT_ENABLED' => 'cache-queue', // config('cached_content.enabled')
+];
+
+foreach ($optionalFeatureSupervisors as $envKey => $supervisor) {
+    if (env($envKey, true) === false) {
+        unset($config['defaults'][$supervisor]);
+    }
+}
+
+return $config;

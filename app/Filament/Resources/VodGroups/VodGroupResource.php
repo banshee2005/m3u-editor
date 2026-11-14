@@ -19,6 +19,7 @@ use App\Models\StreamProfile;
 use App\Services\DateFormatService;
 use App\Services\FindReplaceService;
 use App\Services\GenreGroupReclassifyService;
+use App\Services\GroupChannelStateService;
 use App\Services\MergedGroupService;
 use App\Services\PlaylistService;
 use App\Services\TmdbService;
@@ -43,6 +44,7 @@ use Filament\Tables\Columns\IconColumn;
 use Filament\Tables\Columns\TextColumn;
 use Filament\Tables\Columns\TextInputColumn;
 use Filament\Tables\Columns\ToggleColumn;
+use Filament\Tables\Contracts\HasTable;
 use Filament\Tables\Enums\RecordActionsPosition;
 use Filament\Tables\Filters\TernaryFilter;
 use Filament\Tables\Table;
@@ -98,8 +100,8 @@ class VodGroupResource extends Resource implements CopilotResource
     {
         return $table->persistFiltersInSession()
             ->persistSortInSession()
-            ->modifyQueryUsing(function (Builder $query) {
-                $query->with('parent')
+            ->modifyQueryUsing(function (Builder $query, HasTable $livewire) {
+                $query->with(['parent', 'playlist'])
                     ->withCount('vod_channels')
                     ->withCount('enabled_vod_channels')
                     ->withCount('children')
@@ -108,6 +110,12 @@ class VodGroupResource extends Resource implements CopilotResource
                         'descendantChannels as enabled_descendant_vod_channels_count' => fn (Builder $subQuery) => $subQuery->where('channels.is_vod', true)->where('channels.enabled', true),
                     ])
                     ->where('groups.type', 'vod');
+
+                // Filament can't lock single rows from dragging, so sort mode only lists
+                // groups the next sync won't renumber (custom, or Group Auto Sort off).
+                if ($livewire->isTableReordering()) {
+                    $query->sortOrderUnlocked();
+                }
             })
             ->filtersTriggerAction(function ($action) {
                 return $action->button()->label(__('Filters'));
@@ -137,15 +145,17 @@ class VodGroupResource extends Resource implements CopilotResource
                     ->type('number')
                     ->placeholder(__('Sort Order'))
                     ->sortable()
-                    ->tooltip(fn ($record) => $record->playlist->auto_sort ? 'Playlist auto-sort enabled; any changes will be overwritten on next sync' : 'Group sort order')
+                    ->disabled(fn (Group $record): bool => $record->isSortOrderLockedToProvider())
+                    ->tooltip(fn (Group $record): string => $record->isSortOrderLockedToProvider()
+                        ? __('Auto sort is on for this playlist, so this group follows the provider order.')
+                        : __('Group sort order'))
                     ->toggleable(),
                 ToggleColumn::make('enabled')
                     ->label(__('Auto Enable'))
                     ->toggleable()
-                    ->tooltip(__('Auto enable newly added group channels'))
-                    ->tooltip(fn ($record) => $record->playlist?->enable_channels ? 'Playlist auto-enable new channels is enabled, all group channels will automatically be enabled on next sync.' : 'Auto enable newly added group channels')
-                    ->disabled(fn ($record) => $record->playlist?->enable_channels)
-                    ->getStateUsing(fn ($record) => $record->playlist?->enable_channels ? true : $record->enabled)
+                    ->tooltip(fn ($record) => $record->playlist?->enable_vod_channels ? __('Playlist "Enable new VOD channels" is on, so all new channels added to this group will be enabled on sync.') : __('Auto enable newly added group channels'))
+                    ->disabled(fn ($record) => (bool) $record->playlist?->enable_vod_channels)
+                    ->getStateUsing(fn ($record) => $record->playlist?->enable_vod_channels ? true : $record->enabled)
                     ->sortable(),
                 TextColumn::make('name_internal')
                     ->label(__('Default name'))
@@ -483,11 +493,8 @@ class VodGroupResource extends Resource implements CopilotResource
 
                     Action::make('enable')
                         ->label(__('Enable group channels'))
-                        ->action(function ($record): void {
-                            $record->channels()->update([
-                                'enabled' => true,
-                            ]);
-                        })->after(function () {
+                        ->action(fn (Group $record) => app(GroupChannelStateService::class)->enable($record))
+                        ->after(function () {
                             Notification::make()
                                 ->success()
                                 ->title(__('Group channels enabled'))
@@ -502,11 +509,8 @@ class VodGroupResource extends Resource implements CopilotResource
                         ->modalSubmitActionLabel(__('Yes, enable now')),
                     Action::make('disable')
                         ->label(__('Disable group channels'))
-                        ->action(function ($record): void {
-                            $record->channels()->update([
-                                'enabled' => false,
-                            ]);
-                        })->after(function () {
+                        ->action(fn (Group $record) => app(GroupChannelStateService::class)->disable($record))
+                        ->after(function () {
                             Notification::make()
                                 ->success()
                                 ->title(__('Group channels disabled'))
@@ -638,9 +642,7 @@ class VodGroupResource extends Resource implements CopilotResource
                         ->label(__('Enable Group Channels'))
                         ->action(function (Collection $records): void {
                             foreach ($records as $record) {
-                                $record->channels()->update([
-                                    'enabled' => true,
-                                ]);
+                                app(GroupChannelStateService::class)->enable($record, dispatchSync: false);
                             }
                         })->after(function () {
                             Notification::make()
@@ -659,9 +661,7 @@ class VodGroupResource extends Resource implements CopilotResource
                         ->label(__('Disable Group Channels'))
                         ->action(function (Collection $records): void {
                             foreach ($records as $record) {
-                                $record->channels()->update([
-                                    'enabled' => false,
-                                ]);
+                                app(GroupChannelStateService::class)->disable($record, dispatchSync: false);
                             }
                         })->after(function () {
                             Notification::make()

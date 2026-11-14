@@ -2,14 +2,20 @@
 
 namespace App\Filament\Clusters\Settings\Pages;
 
+use App\Enums\ImageProfile;
 use App\Filament\Clusters\Settings\Pages\Concerns\BaseSettingsPage;
 use App\Filament\Resources\Assets\AssetResource;
+use App\Services\AssetInventoryService;
 use BackedEnum;
 use Filament\Actions\Action;
 use Filament\Forms\Components\FileUpload;
+use Filament\Forms\Components\TextInput;
 use Filament\Forms\Components\Toggle;
+use Filament\Notifications\Notification;
 use Filament\Schemas\Components\Section;
+use Filament\Schemas\Components\Utilities\Get;
 use Filament\Schemas\Schema;
+use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\HtmlString;
 
 class ManageAssetSettings extends BaseSettingsPage
@@ -18,7 +24,7 @@ class ManageAssetSettings extends BaseSettingsPage
 
     protected static ?string $slug = 'assets';
 
-    protected static ?int $navigationSort = 5;
+    protected static ?int $navigationSort = 6;
 
     public static function getNavigationLabel(): string
     {
@@ -30,6 +36,51 @@ class ManageAssetSettings extends BaseSettingsPage
         return __('Assets');
     }
 
+    protected function getHeaderActions(): array
+    {
+        return [
+            Action::make('manage_assets')
+                ->label(__('Manage Assets'))
+                ->color('gray')
+                ->icon('heroicon-o-photo')
+                ->url(AssetResource::getUrl('index')),
+            Action::make('clear_expired_logo_cache')
+                ->label(__('Clear Expired Logo Cache'))
+                ->action(fn () => Artisan::call('app:logo-cleanup --force'))
+                ->after(function () {
+                    Notification::make()
+                        ->success()
+                        ->title(__('Expired logo cache cleared'))
+                        ->body(__('Expired logo cache files were removed successfully.'))
+                        ->duration(10000)
+                        ->send();
+                })
+                ->color('warning')
+                ->requiresConfirmation()
+                ->icon('heroicon-o-trash')
+                ->modalIcon('heroicon-o-trash')
+                ->modalDescription(__('Only expired logo cache entries (those older than 30 days). If permanent cache is enabled, nothing will be removed.'))
+                ->modalSubmitActionLabel(__('Clear expired cache')),
+            Action::make('clear_logo_cache')
+                ->label(__('Clear All Logo Cache'))
+                ->action(fn () => Artisan::call('app:logo-cleanup --force --all'))
+                ->after(function () {
+                    Notification::make()
+                        ->success()
+                        ->title(__('Logo cache cleared'))
+                        ->body(__('The logo cache has been cleared. Logos will be fetched again on next request wherever logo proxy is enabled.'))
+                        ->duration(10000)
+                        ->send();
+                })
+                ->color('danger')
+                ->requiresConfirmation()
+                ->icon('heroicon-o-exclamation-triangle')
+                ->modalIcon('heroicon-o-exclamation-triangle')
+                ->modalDescription(__('Clearing the logo cache will remove all cached logo images. If permanent cache is enabled, it will be ignored. This action cannot be undone.'))
+                ->modalSubmitActionLabel(__('I understand, clear now')),
+        ];
+    }
+
     public function form(Schema $schema): Schema
     {
         return $schema
@@ -38,12 +89,6 @@ class ManageAssetSettings extends BaseSettingsPage
                     ->description(__('Manage logo cache behavior and storage used by logo proxy URLs.'))
                     ->columns(1)
                     ->headerActions([
-                        Action::make('manage_assets')
-                            ->label(__('Manage Assets'))
-                            ->color('gray')
-                            ->iconPosition('after')
-                            ->size('sm')
-                            ->url(AssetResource::getUrl('index')),
                         Action::make('view_repo')
                             ->label(__('View Logo Repository'))
                             ->icon('heroicon-o-arrow-top-right-on-square')
@@ -63,18 +108,58 @@ class ManageAssetSettings extends BaseSettingsPage
                             ->helperText(__('When enabled, /logo-repository endpoints are publicly accessible for apps like UHF.')),
 
                     ]),
+                Section::make(__('Image Optimization'))
+                    ->description(__('Artwork from the logo proxy, media servers and Schedules Direct is cached as a downscaled copy sized for where it is shown, so clients download a right-sized image instead of the full-resolution source.'))
+                    ->columns(2)
+                    ->schema([
+                        Toggle::make('image_optimization_enabled')
+                            ->label(__('Optimize cached artwork'))
+                            ->live()
+                            ->columnSpanFull()
+                            ->disabled(fn () => config('proxy.image_resize_enabled') !== null)
+                            ->hint(fn () => config('proxy.image_resize_enabled') !== null ? __('Already set by environment variable!') : null)
+                            ->dehydrated(fn () => config('proxy.image_resize_enabled') === null)
+                            ->afterStateHydrated(function (Toggle $component) {
+                                if (config('proxy.image_resize_enabled') !== null) {
+                                    $component->state((bool) config('proxy.image_resize_enabled'));
+                                }
+                            })
+                            ->helperText(__('When disabled, artwork is cached and served at its original size. Changing a size below creates new cached copies; old ones expire or can be cleared from Manage Assets.')),
+                        ...array_map(fn (ImageProfile $profile): TextInput => $this->profileWidthInput($profile), ImageProfile::cases()),
+                        TextInput::make('image_quality')
+                            ->label(__('Image quality'))
+                            ->visible(fn (Get $get): bool => (bool) $get('image_optimization_enabled'))
+                            ->suffixIcon(fn () => ! empty(config('proxy.image_resize_quality')) ? 'heroicon-m-lock-closed' : null)
+                            ->disabled(fn () => ! empty(config('proxy.image_resize_quality')))
+                            ->hint(fn () => ! empty(config('proxy.image_resize_quality')) ? __('Already set by environment variable!') : null)
+                            ->dehydrated(fn () => empty(config('proxy.image_resize_quality')))
+                            ->afterStateHydrated(function (TextInput $component) {
+                                if (! empty(config('proxy.image_resize_quality'))) {
+                                    $component->state(config('proxy.image_resize_quality'));
+                                }
+                            })
+                            ->integer()
+                            ->minValue(1)
+                            ->maxValue(100)
+                            ->placeholder(70)
+                            ->helperText(__('Encoder quality (1-100) for downscaled artwork. Leave empty for the default (70). Applies to newly cached copies; the source format is always kept.')),
+                    ]),
                 Section::make(__('Placeholder Images'))
                     ->description(__('Override app-wide placeholder images for logos, episode previews, and VOD/Series poster fallbacks.'))
                     ->columns(3)
                     ->schema([
                         FileUpload::make('logo_placeholder_url')
                             ->label(__('Logo placeholder'))
-                            ->image()
                             ->disk('public')
                             ->directory('assets/placeholders')
                             ->visibility('public')
                             ->openable()
                             ->downloadable()
+                            ->acceptedFileTypes(AssetInventoryService::SAFE_IMAGE_MIME_TYPES)
+                            ->rules([
+                                'mimes:'.implode(',', AssetInventoryService::SAFE_IMAGE_EXTENSIONS),
+                                'extensions:'.implode(',', AssetInventoryService::SAFE_IMAGE_EXTENSIONS),
+                            ])
                             ->hintIcon(
                                 'heroicon-m-question-mark-circle',
                                 tooltip: __('Used when a channel logo is missing. Clear to use the default placeholder.')
@@ -82,12 +167,16 @@ class ManageAssetSettings extends BaseSettingsPage
                             ->helperText(new HtmlString('<strong>Recommended size:</strong> 300x300px for best results.<br/>Default image: <img src="'.url('/placeholder.png').'" alt="Default Logo Placeholder" style="width:80px; height:80px; margin-top:5px;">')),
                         FileUpload::make('episode_placeholder_url')
                             ->label(__('Episode preview placeholder'))
-                            ->image()
                             ->disk('public')
                             ->directory('assets/placeholders')
                             ->visibility('public')
                             ->openable()
                             ->downloadable()
+                            ->acceptedFileTypes(AssetInventoryService::SAFE_IMAGE_MIME_TYPES)
+                            ->rules([
+                                'mimes:'.implode(',', AssetInventoryService::SAFE_IMAGE_EXTENSIONS),
+                                'extensions:'.implode(',', AssetInventoryService::SAFE_IMAGE_EXTENSIONS),
+                            ])
                             ->hintIcon(
                                 'heroicon-m-question-mark-circle',
                                 tooltip: __('Used when an episode preview image is missing. Clear to use the default placeholder.')
@@ -95,12 +184,16 @@ class ManageAssetSettings extends BaseSettingsPage
                             ->helperText(new HtmlString('<strong>Recommended size:</strong> 600x400px for best results.<br/>Default image: <img src="'.url('/episode-placeholder.png').'" alt="Default Episode Placeholder" style="width:120px; height:80px; margin-top:5px;">')),
                         FileUpload::make('vod_series_poster_placeholder_url')
                             ->label(__('VOD/Series poster placeholder'))
-                            ->image()
                             ->disk('public')
                             ->directory('assets/placeholders')
                             ->visibility('public')
                             ->openable()
                             ->downloadable()
+                            ->acceptedFileTypes(AssetInventoryService::SAFE_IMAGE_MIME_TYPES)
+                            ->rules([
+                                'mimes:'.implode(',', AssetInventoryService::SAFE_IMAGE_EXTENSIONS),
+                                'extensions:'.implode(',', AssetInventoryService::SAFE_IMAGE_EXTENSIONS),
+                            ])
                             ->hintIcon(
                                 'heroicon-m-question-mark-circle',
                                 tooltip: __('Used when VOD/Series poster or cover images are missing. Clear to use the default placeholder.')
@@ -108,5 +201,32 @@ class ManageAssetSettings extends BaseSettingsPage
                             ->helperText(new HtmlString('<strong>Recommended size:</strong> 600x900px for best results.<br/>Default image: <img src="'.url('/vod-series-poster-placeholder.png').'" alt="Default VOD/Series Poster Placeholder" style="width:80px; height:120px; margin-top:5px;">')),
                     ]),
             ]);
+    }
+
+    /**
+     * Max width input for one artwork size profile, locked when its env var is set.
+     */
+    private function profileWidthInput(ImageProfile $profile): TextInput
+    {
+        $envValue = config($profile->configKey());
+
+        return TextInput::make($profile->settingKey())
+            ->label($profile->getLabel())
+            ->visible(fn (Get $get): bool => (bool) $get('image_optimization_enabled'))
+            ->suffixIcon(! empty($envValue) ? 'heroicon-m-lock-closed' : null)
+            ->disabled(! empty($envValue))
+            ->hint(! empty($envValue) ? __('Already set by environment variable!') : null)
+            ->dehydrated(empty($envValue))
+            ->afterStateHydrated(function (TextInput $component) use ($envValue) {
+                if (! empty($envValue)) {
+                    $component->state($envValue);
+                }
+            })
+            ->integer()
+            ->minValue(100)
+            ->maxValue((int) config('proxy.image_resize_max', 1920))
+            ->placeholder($profile->defaultWidth())
+            ->suffix(__('px max width'))
+            ->helperText($profile->getDescription());
     }
 }

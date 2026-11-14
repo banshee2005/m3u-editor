@@ -30,6 +30,7 @@ interface MediaServer
         array $paths,
         bool $refreshLibrary = true,
         ?string $libraryId = null,
+        bool $createIfMissing = true,
     ): array;
 
     public function fetchMovies(): Collection;
@@ -96,7 +97,11 @@ interface MediaServer
 
     public function getImageUrl(string $itemId, string $imageType = 'Primary'): string;
 
-    public function getDirectImageUrl(string $itemId, string $imageType = 'Primary'): string;
+    /**
+     * Direct (authenticated) image URL. [$maxWidth] asks the server for a
+     * downscaled copy where it supports that; null fetches the original.
+     */
+    public function getDirectImageUrl(string $itemId, string $imageType = 'Primary', ?int $maxWidth = null): string;
 
     /**
      * Return the total byte size of the item's primary static stream alongside its runtime,

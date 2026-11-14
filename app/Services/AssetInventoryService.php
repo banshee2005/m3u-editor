@@ -12,6 +12,25 @@ use Illuminate\Support\Str;
 class AssetInventoryService
 {
     /**
+     * Extensions accepted for user-uploaded assets. Raster images only - SVG is deliberately
+     * excluded (it can embed <script> and this app has no sanitizer for it), and nothing here
+     * is an executable server-side extension, since uploaded files are served back from the
+     * public disk with a Content-Type derived from this same extension.
+     *
+     * @var list<string>
+     */
+    public const SAFE_IMAGE_EXTENSIONS = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'ico'];
+
+    /**
+     * MIME types matching {@see SAFE_IMAGE_EXTENSIONS}, for Filament's acceptedFileTypes().
+     *
+     * @var list<string>
+     */
+    public const SAFE_IMAGE_MIME_TYPES = [
+        'image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/bmp', 'image/x-icon', 'image/vnd.microsoft.icon',
+    ];
+
+    /**
      * @return array<int, array{disk: string, directory: string, source: string}>
      */
     protected function directories(): array
@@ -115,7 +134,9 @@ class AssetInventoryService
     {
         $disk = Storage::disk($asset->disk);
 
-        if ($asset->source === 'logo_cache') {
+        // A size variant shares its source's metadata, which still describes
+        // any other copies, so only deleting the source clears it.
+        if ($asset->source === 'logo_cache' && ! $this->isLogoVariant($asset->path)) {
             $this->deleteCompanionLogoMetadata($disk, $asset->path);
         }
 
@@ -203,6 +224,11 @@ class AssetInventoryService
         }
     }
 
+    protected function isLogoVariant(string $path): bool
+    {
+        return LogoCacheService::cacheBaseNameOf($path) !== pathinfo($path, PATHINFO_FILENAME);
+    }
+
     protected function companionLogoMetadataPath(string $path): ?string
     {
         if (str_ends_with(strtolower($path), '.json')) {
@@ -210,7 +236,8 @@ class AssetInventoryService
         }
 
         $directory = pathinfo($path, PATHINFO_DIRNAME);
-        $filename = pathinfo($path, PATHINFO_FILENAME);
+        // `logo_x@w600.jpg` is a size variant of `logo_x`: same metadata file.
+        $filename = LogoCacheService::cacheBaseNameOf($path);
         $metaPath = trim($directory !== '.' ? $directory : '', '/');
 
         return ($metaPath !== '' ? $metaPath.'/' : '').$filename.'.meta.json';

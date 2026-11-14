@@ -3,16 +3,13 @@
 namespace App\Http\Controllers;
 
 use App\Enums\DvrRecordingStatus;
-use App\Models\CustomPlaylist;
+use App\Http\Controllers\Concerns\StreamLocalFile;
 use App\Models\DvrRecording;
-use App\Models\MergedPlaylist;
-use App\Models\Playlist;
-use App\Models\PlaylistAlias;
 use App\Models\PlaylistAuth;
 use App\Models\User;
 use App\Services\DvrCapabilityGate;
 use App\Services\M3uProxyService;
-use Illuminate\Database\Eloquent\ModelNotFoundException;
+use App\Services\PlaylistCredentialResolver;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
@@ -24,7 +21,7 @@ use Symfony\Component\HttpFoundation\StreamedResponse;
 
 class DvrStreamController extends Controller
 {
-    public function __construct(protected M3uProxyService $proxy) {}
+    public function __construct(protected M3uProxyService $proxy, protected PlaylistCredentialResolver $resolver) {}
 
     /**
      * Stream a DVR recording.
@@ -33,7 +30,7 @@ class DvrStreamController extends Controller
      *
      * Authentication mirrors the Xtream stream pattern:
      * - Method 1: PlaylistAuth credentials
-     * - Method 2: username = playlist owner's name, password = playlist UUID
+     * - Method 2: the owner's default login (owner name + playlist UUID or custom password)
      *
      * Once authenticated, the recording must belong to that user.
      * Supports HTTP range requests for seeking.
@@ -55,6 +52,16 @@ class DvrStreamController extends Controller
             abort(404, 'Recording not found');
         }
 
+        return $this->serveRecording($request, $recording);
+    }
+
+    /**
+     * Serve an already-authorized recording: the live HLS playlist while it is
+     * still recording, otherwise the finished file with HTTP range support.
+     * Callers are responsible for authentication and ownership checks.
+     */
+    public function serveRecording(Request $request, DvrRecording $recording): Response|StreamedResponse|RedirectResponse
+    {
         // In-progress recording — serve through the editor so segment URLs resolve correctly.
         // The proxy's HLS playlist uses relative segment filenames (live000001.ts) which the
         // browser resolves relative to the playlist URL. If we redirect to the proxy directly,
@@ -81,62 +88,27 @@ class DvrStreamController extends Controller
         }
 
         $fullPath = Storage::disk($disk)->path($recording->file_path);
-        $fileSize = filesize($fullPath);
-        $mimeType = $recording->resolveMimeType();
 
-        $range = $request->header('Range');
-
-        if ($range && preg_match('/bytes=(\d+)-(\d*)/', $range, $matches)) {
-            $start = (int) $matches[1];
-            $end = isset($matches[2]) && $matches[2] !== '' ? (int) $matches[2] : $fileSize - 1;
-            $length = $end - $start + 1;
-
-            $headers = [
-                'Content-Type' => $mimeType,
-                'Content-Length' => $length,
-                'Content-Range' => "bytes {$start}-{$end}/{$fileSize}",
-                'Accept-Ranges' => 'bytes',
-                'Content-Disposition' => 'inline; filename="'.basename($recording->file_path).'"',
-            ];
-
-            return response()->stream(function () use ($fullPath, $start, $length) {
-                $handle = fopen($fullPath, 'rb');
-                if ($handle === false) {
-                    return;
-                }
-                fseek($handle, $start);
-                $remaining = $length;
-
-                while (! feof($handle) && $remaining > 0) {
-                    $chunkSize = min(8192, $remaining);
-                    echo fread($handle, $chunkSize);
-                    $remaining -= $chunkSize;
-                }
-
-                fclose($handle);
-            }, 206, $headers);
+        // Storage::size() throws on a missing file; some drivers return
+        // false. Both are unacceptable for the int $fileSize contract
+        // that StreamLocalFile::serve() enforces.
+        try {
+            $fileSize = Storage::disk($disk)->size($recording->file_path);
+        } catch (\Throwable) {
+            abort(404, 'Recording file not found on disk');
         }
+        if ($fileSize === false || $fileSize < 1) {
+            abort(404, 'Recording file not found on disk');
+        }
+        $fileSize = (int) $fileSize;
 
-        $headers = [
-            'Content-Type' => $mimeType,
-            'Content-Length' => $fileSize,
-            'Accept-Ranges' => 'bytes',
-            'Content-Disposition' => 'inline; filename="'.basename($recording->file_path).'"',
-        ];
-
-        return response()->stream(function () use ($fullPath) {
-            $handle = fopen($fullPath, 'rb');
-            if ($handle === false) {
-                return;
-            }
-
-            while (! feof($handle)) {
-                echo fread($handle, 8192);
-                flush();
-            }
-
-            fclose($handle);
-        }, 200, $headers);
+        return StreamLocalFile::serve(
+            fullPath: $fullPath,
+            fileSize: $fileSize,
+            mimeType: $recording->resolveMimeType(),
+            filename: basename($recording->file_path),
+            range: $request->header('Range'),
+        );
     }
 
     /**
@@ -147,7 +119,7 @@ class DvrStreamController extends Controller
      * This means only the small playlist file (~1 KB) passes through the editor on
      * each reload; all TS segment traffic goes straight from the proxy to the client.
      */
-    protected function serveLivePlaylist(Request $request, DvrRecording $recording): Response
+    public function serveLivePlaylist(Request $request, DvrRecording $recording): Response
     {
         $networkId = $recording->proxy_network_id;
         // Use the internal API URL for the editor→proxy fetch (within Docker).
@@ -200,7 +172,7 @@ class DvrStreamController extends Controller
      * Serve the HLS playlist for an in-progress DVR recording.
      *
      * Authentication mirrors stream(): PlaylistAuth credentials or
-     * username = owner's name / password = playlist UUID (Method 2).
+     * the owner's default login (Method 2).
      * Segment traffic never passes through the editor — only this playlist does.
      */
     public function hlsPlaylist(Request $request, string $username, string $password, string $uuid): Response
@@ -223,6 +195,51 @@ class DvrStreamController extends Controller
         }
 
         return $this->serveLivePlaylist($request, $recording);
+    }
+
+    /**
+     * Serve the HLS playlist for an in-progress DVR recording via a signed URL.
+     *
+     * GET /dvr/signed/{uuid}/live.m3u8
+     *
+     * M3uProxyService hands this URL to anyone watching a channel while it is being
+     * recorded, so they share the existing broadcast. The signature (checked by route
+     * middleware) authorizes this one recording only, so the redirect never exposes
+     * the owner's credentials to a guest. The DVR capability check matches the
+     * owner-credential route this replaces.
+     */
+    public function signedHlsPlaylist(Request $request, string $uuid): Response
+    {
+        $recording = DvrRecording::where('uuid', $uuid)
+            ->where('status', DvrRecordingStatus::Recording)
+            ->whereNotNull('proxy_network_id')
+            ->first();
+
+        if (! $recording || ! DvrCapabilityGate::granted($recording->dvrSetting, null, false)) {
+            abort(404, 'Recording not found or not in progress');
+        }
+
+        return $this->serveLivePlaylist($request, $recording);
+    }
+
+    /**
+     * Stream a DVR recording via a signed URL.
+     *
+     * GET /dvr/signed/{uuid}.{format?}
+     *
+     * DVR VOD entries store this URL, and it reaches guests unchanged (raw M3U
+     * output, or the Xtream redirect when the proxy is off), so it authorizes this
+     * one recording by signature instead of carrying the owner's credentials.
+     */
+    public function signedStream(Request $request, string $uuid): Response|StreamedResponse|RedirectResponse
+    {
+        $recording = DvrRecording::where('uuid', $uuid)->first();
+
+        if (! $recording || ! DvrCapabilityGate::granted($recording->dvrSetting, null, false)) {
+            abort(404, 'Recording not found');
+        }
+
+        return $this->serveRecording($request, $recording);
     }
 
     /**
@@ -288,12 +305,15 @@ class DvrStreamController extends Controller
     /**
      * Resolve a User from credentials using the same two-step auth as XtreamStreamController:
      * 1. PlaylistAuth username/password lookup
-     * 2. Fallback: username = user's name, password = any playlist UUID owned by that user
+     * 2. Fallback: the owner's default login for any playlist owned by that user
      *
-     * Recordings must additionally be scoped to the resolved PlaylistAuth (Method 1) so one
-     * guest credential can't reach another guest's recordings just because they share an
-     * owning user — mirrors the playlist_auth_id scoping XtreamApiController applies to every
-     * other DVR query.
+     * The actual credential resolution is delegated to the shared
+     * `PlaylistCredentialResolver` service. This wrapper remains here
+     * because the DVR query then needs to additionally filter by the
+     * resolved PlaylistAuth (Method 1) so one guest credential cannot
+     * reach another guest's recordings just because they share an
+     * owning user (mirrors the playlist_auth_id scoping
+     * XtreamApiController applies to every other DVR query).
      *
      * @return array{0: ?User, 1: ?PlaylistAuth, 2: bool} The owning user, the resolved guest
      *                                                    credential (null for owner auth), and
@@ -302,30 +322,18 @@ class DvrStreamController extends Controller
     private function resolveUser(string $username, string $password): array
     {
         // Method 1: PlaylistAuth credentials
-        $playlistAuth = PlaylistAuth::where('username', $username)
-            ->where('password', $password)
-            ->where('enabled', true)
-            ->first();
+        $playlistAuth = $this->resolver->resolveAuth($username, $password);
 
-        if ($playlistAuth && ! $playlistAuth->isExpired()) {
+        if ($playlistAuth) {
             $playlist = $playlistAuth->getAssignedModel();
 
             return [$playlist?->user, $playlistAuth, true];
         }
 
-        // Method 2: password = playlist UUID, username = owner's name
-        $playlistTypes = [Playlist::class, MergedPlaylist::class, CustomPlaylist::class, PlaylistAlias::class];
-
-        foreach ($playlistTypes as $type) {
-            try {
-                $playlist = $type::with('user')->where('uuid', $password)->firstOrFail();
-
-                if ($playlist->user && $playlist->user->name === $username) {
-                    return [$playlist->user, null, false];
-                }
-            } catch (ModelNotFoundException) {
-                // Try next type
-            }
+        // Method 2: the owner's default login (UUID or custom password, per playlist)
+        $playlist = $this->resolver->resolveDefaultLogin($username, $password);
+        if ($playlist) {
+            return [$playlist->user, null, false];
         }
 
         return [null, null, false];

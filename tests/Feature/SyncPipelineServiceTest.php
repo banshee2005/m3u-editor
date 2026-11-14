@@ -14,6 +14,7 @@ use App\Jobs\ProcessVodChannels;
 use App\Jobs\SyncSeriesStrmFiles;
 use App\Jobs\SyncVodStrmFiles;
 use App\Models\Channel;
+use App\Models\Episode;
 use App\Models\Playlist;
 use App\Models\Series;
 use App\Models\SyncRun;
@@ -828,7 +829,7 @@ it('does not create a concurrent run for the same playlist when called simultane
     $this->assertDatabaseCount('sync_runs', 1);
 });
 
-it('fails a stale Running run (import complete, pipeline dead) and creates a fresh run', function () {
+it('fails a stale Running run (import complete, no heartbeat) and creates a fresh run', function () {
     $playlist = Playlist::factory()->for($this->user)->create();
 
     $stale = SyncRun::create([
@@ -843,6 +844,13 @@ it('fails a stale Running run (import complete, pipeline dead) and creates a fre
         'started_at' => now()->subMinutes(30),
     ]);
 
+    // Neither the run nor the playlist has been touched in 30 minutes — no phase
+    // transition, no progress heartbeat. Genuinely dead pipeline.
+    $stale->timestamps = false;
+    $stale->update(['updated_at' => now()->subMinutes(30)]);
+    $playlist->timestamps = false;
+    $playlist->update(['updated_at' => now()->subMinutes(30)]);
+
     $fresh = $this->service->startImport($playlist, 'scheduled_refresh');
 
     // Stale run must be failed, a new run created
@@ -851,6 +859,39 @@ it('fails a stale Running run (import complete, pipeline dead) and creates a fre
         ->and($fresh->status)->toBe(SyncRunStatus::Running->value);
 
     $this->assertDatabaseCount('sync_runs', 2);
+});
+
+it('does not fail an actively running post-Import run when the playlist is still receiving progress heartbeats', function () {
+    // Regression for the force-reimport loop: a long VOD/series sync can sit past
+    // Import for a long time without the SyncRun row itself changing (no phase
+    // transition), but chunked jobs keep touching playlist->updated_at as they go.
+    // That must count as "alive", not stale.
+    $playlist = Playlist::factory()->for($this->user)->create();
+
+    $active = SyncRun::create([
+        'playlist_id' => $playlist->id,
+        'user_id' => $this->user->id,
+        'trigger' => 'scheduled_refresh',
+        'status' => SyncRunStatus::Running->value,
+        'current_phase' => 'vod_metadata',
+        'phases' => [SyncRunPhase::Import->value, 'vod_metadata', SyncRunPhase::SyncCompleted->value],
+        'phase_statuses' => ['import' => ['status' => 'completed']], // Import marked complete
+        'context' => ['playlist_id' => $playlist->id],
+        'started_at' => now()->subMinutes(30),
+    ]);
+    $active->timestamps = false;
+    $active->update(['updated_at' => now()->subMinutes(30)]);
+
+    // Playlist row was just touched (e.g. a vod_progress write from a chunk job).
+    $playlist->timestamps = false;
+    $playlist->update(['updated_at' => now()]);
+
+    $returned = $this->service->startImport($playlist, 'scheduled_refresh');
+
+    expect($returned->id)->toBe($active->id)
+        ->and($returned->status)->toBe(SyncRunStatus::Running->value);
+
+    $this->assertDatabaseCount('sync_runs', 1);
 });
 
 // ── ProcessM3uImport: duplicate-import guard ─────────────────────────────────
@@ -970,4 +1011,67 @@ it('dispatchProbe forwards playlist vod and series probe scope settings', functi
             && $job->includeDisabled === true
             && $job->isSeriesProbe === true,
     );
+});
+
+// ── Probe phases cover each content type on their own ──────────────────────
+
+it('plans SeriesProbe without SeriesMetadata when only vod is enabled but enabled episodes exist', function () {
+    mockPipelineSettings();
+    $playlist = makePlaylistWithVod($this->user, [
+        'auto_probe_vod_streams' => true,
+        'auto_fetch_series_metadata' => true,
+    ]);
+    $disabledSeries = Series::factory()->for($playlist)->for($this->user)->create(['enabled' => false]);
+    Episode::factory()->create([
+        'user_id' => $this->user->id,
+        'playlist_id' => $playlist->id,
+        'series_id' => $disabledSeries->id,
+        'enabled' => true,
+    ]);
+
+    $run = $this->service->buildPipeline($playlist, app(GeneralSettings::class));
+
+    expect($run->phases)->toContain(SyncRunPhase::VodProbe->value)
+        ->toContain(SyncRunPhase::SeriesProbe->value)
+        ->not->toContain(SyncRunPhase::SeriesMetadata->value)
+        ->not->toContain(SyncRunPhase::SeriesStrmPostProbe->value);
+});
+
+it('plans VodProbe without VodMetadata for disabled vod only when include disabled is on', function () {
+    mockPipelineSettings();
+    $playlist = makePlaylistWithSeries($this->user, [
+        'auto_probe_vod_streams' => true,
+        'auto_probe_vod_streams_include_disabled' => true,
+        'auto_fetch_vod_metadata' => true,
+    ]);
+    Channel::factory()->for($playlist)->for($this->user)->create(['enabled' => false, 'is_vod' => true]);
+
+    $run = $this->service->buildPipeline($playlist, app(GeneralSettings::class));
+
+    expect($run->phases)->toContain(SyncRunPhase::VodProbe->value)
+        ->toContain(SyncRunPhase::SeriesProbe->value)
+        ->not->toContain(SyncRunPhase::VodMetadata->value);
+
+    $playlist->update(['auto_probe_vod_streams_include_disabled' => false]);
+    $run = $this->service->buildPipeline($playlist->fresh(), app(GeneralSettings::class));
+
+    expect($run->phases)->not->toContain(SyncRunPhase::VodProbe->value)
+        ->toContain(SyncRunPhase::SeriesProbe->value);
+});
+
+it('plans VodProbe for a disabled-only VOD catalogue with include disabled on, even with no enabled series', function () {
+    // Regression: the planner previously keyed the "probe disabled VOD" path on
+    // an enabled series existing ($hasSeries), so Include Disabled was silently
+    // ignored for a playlist with no series content at all - not just no enabled
+    // VOD, which the "disabled vod only" test above already covers via a series.
+    mockPipelineSettings();
+    $playlist = Playlist::factory()->for($this->user)->create([
+        'auto_probe_vod_streams' => true,
+        'auto_probe_vod_streams_include_disabled' => true,
+    ]);
+    Channel::factory()->for($playlist)->for($this->user)->create(['enabled' => false, 'is_vod' => true]);
+
+    $run = $this->service->buildPipeline($playlist, app(GeneralSettings::class));
+
+    expect($run->phases)->toContain(SyncRunPhase::VodProbe->value);
 });

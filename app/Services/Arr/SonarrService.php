@@ -396,8 +396,10 @@ class SonarrService extends BaseArrService
         return $this->safeCall(function () use ($sonarrSeriesId, $seasonNumber, $episodeNumber) {
             $episodeId = $this->resolveEpisodeId($sonarrSeriesId, $seasonNumber, $episodeNumber);
 
+            // Thrown (not returned) so safeCall reports ok=false and the
+            // RequestArrEpisode job retries instead of treating it as done.
             if (! $episodeId) {
-                return ['ok' => false, 'error' => "Episode S{$seasonNumber}E{$episodeNumber} not yet indexed."];
+                throw new \RuntimeException("Episode S{$seasonNumber}E{$episodeNumber} not yet indexed.");
             }
 
             $this->client()
@@ -408,7 +410,7 @@ class SonarrService extends BaseArrService
                 ->post('/command', ['name' => 'EpisodeSearch', 'episodeIds' => [$episodeId]])
                 ->throw();
 
-            return ['ok' => true, 'data' => $episodeId];
+            return $episodeId;
         }, "monitor and search episode S{$seasonNumber}E{$episodeNumber}");
     }
 
@@ -445,6 +447,30 @@ class SonarrService extends BaseArrService
         }
 
         return null;
+    }
+
+    /**
+     * Unmonitor a single episode without touching its file. Unlike deleting
+     * the series (which Sonarr can do with deleteFiles), this only stops
+     * Sonarr looking for that one episode.
+     *
+     * @return array{ok: bool, error?: string}
+     */
+    public function unmonitorEpisode(int $seriesId, int $seasonNumber, int $episodeNumber): array
+    {
+        return $this->safeCall(function () use ($seriesId, $seasonNumber, $episodeNumber) {
+            $episodeId = $this->resolveEpisodeId($seriesId, $seasonNumber, $episodeNumber);
+
+            if ($episodeId === null) {
+                return true; // Not indexed (yet); nothing to unmonitor.
+            }
+
+            $this->client()
+                ->put('/episode/monitor', ['episodeIds' => [$episodeId], 'monitored' => false])
+                ->throw();
+
+            return true;
+        }, 'unmonitor episode');
     }
 
     /**
@@ -567,6 +593,8 @@ class SonarrService extends BaseArrService
                     'protocol' => $item['protocol'] ?? null,
                     'indexer' => $item['indexer'] ?? null,
                     'episode' => $episodeLabel,
+                    'seasonNumber' => isset($episode['seasonNumber']) ? (int) $episode['seasonNumber'] : null,
+                    'episodeNumber' => isset($episode['episodeNumber']) ? (int) $episode['episodeNumber'] : null,
                     'trackedDownloadState' => $item['trackedDownloadState'] ?? null,
                 ];
             })

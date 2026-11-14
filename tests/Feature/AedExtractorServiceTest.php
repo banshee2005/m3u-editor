@@ -225,3 +225,102 @@ test('year rollover does not bump events dated today or later', function () {
 
     expect($result->start->year)->toBe(2026);
 });
+
+test('year rollover keeps a finished event in the past instead of jumping a year ahead', function () {
+    // Regression test for #1549: a stale title (event already over, provider hasn't renamed
+    // the channel) was rolled forward 12 months, producing a year of pre-event padding.
+    Carbon::setTestNow(Carbon::create(2026, 9, 28, 10, 0, 0, 'UTC'));
+
+    $profile = makeProfile([
+        'time_regex' => '(\d{1,2}:\d{2})',
+        'date_regex' => '\((\d{2}\.\d{2})',
+        'date_format' => 'm.d',
+        'time_format' => 'H:i',
+    ]);
+
+    $result = (new AedExtractorService)->extract($profile, 'Event (09.27 19:00)');
+
+    expect($result->start->toDateString())->toBe('2026-09-27');
+});
+
+test('year rollover still moves an early-january date seen in late december into next year', function () {
+    Carbon::setTestNow(Carbon::create(2026, 12, 30, 10, 0, 0, 'UTC'));
+
+    $profile = makeProfile([
+        'time_regex' => '(\d{1,2}:\d{2})',
+        'date_regex' => '\((\d{2}\.\d{2})',
+        'date_format' => 'm.d',
+        'time_format' => 'H:i',
+    ]);
+
+    $result = (new AedExtractorService)->extract($profile, 'Event (01.02 19:00)');
+
+    expect($result->start->toDateString())->toBe('2027-01-02');
+});
+
+test('a mixed date format list still applies year rollover to a yearless match, even though an explicit-year alternative is also listed', function () {
+    // Regression: AedExtractorService::extractStartTime() checked str_contains() on
+    // the entire pipe-separated date_format list for 'Y', not the specific alternative
+    // that actually parsed. With 'm.d.Y|m.d', the unmatched 'm.d.Y' alternative's 'Y'
+    // suppressed year-rollover inference for a title that only matched the yearless 'm.d'.
+    Carbon::setTestNow(Carbon::create(2026, 12, 30, 12, 0, 0, 'UTC'));
+
+    $profile = makeProfile([
+        'time_regex' => ' (\d{2}:\d{2})\)',
+        'date_regex' => '\((\d{2}\.\d{2}(?:\.\d{4})?) ',
+        'date_format' => 'm.d.Y|m.d',
+        'time_format' => 'H:i',
+    ]);
+
+    $result = (new AedExtractorService)->extract($profile, 'Synthetic Event (01.02 19:00)');
+
+    // "m.d" means January 2 - a near-term date, so nearest-year inference must roll
+    // it forward to 2027, exactly as it would for the single-format 'm.d' case above.
+    expect($result->start->toDateString())->toBe('2027-01-02');
+});
+
+test('a mixed date format list still honors an explicit year when the explicit-year alternative actually matches', function () {
+    Carbon::setTestNow(Carbon::create(2026, 12, 30, 12, 0, 0, 'UTC'));
+
+    $profile = makeProfile([
+        'time_regex' => ' (\d{2}:\d{2})\)',
+        'date_regex' => '\((\d{2}\.\d{2}(?:\.\d{4})?) ',
+        'date_format' => 'm.d.Y|m.d',
+        'time_format' => 'H:i',
+    ]);
+
+    $result = (new AedExtractorService)->extract($profile, 'Synthetic Event (01.02.2027 19:00)');
+
+    expect($result->start->toDateString())->toBe('2027-01-02');
+});
+
+test('year rollover moves a late-december date seen in early january into last year', function () {
+    Carbon::setTestNow(Carbon::create(2027, 1, 2, 10, 0, 0, 'UTC'));
+
+    $profile = makeProfile([
+        'time_regex' => '(\d{1,2}:\d{2})',
+        'date_regex' => '\((\d{2}\.\d{2})',
+        'date_format' => 'm.d',
+        'time_format' => 'H:i',
+    ]);
+
+    $result = (new AedExtractorService)->extract($profile, 'Event (12.30 19:00)');
+
+    expect($result->start->toDateString())->toBe('2026-12-30');
+});
+
+test('tries each pipe-separated date format with each time format', function () {
+    $profile = makeProfile([
+        'title_regex' => '^NFL Game Pass \d+:\s*(?!NO EVENT)(.+?)\s*@',
+        'time_regex' => '@\s*\d{1,2}\s+[A-Za-z]{3}\s+(\d{1,2}:\d{2}\s*[AP]M)',
+        'time_format' => 'h:i A|g:i A',
+        'date_regex' => '@\s*(\d{1,2}\s+[A-Za-z]{3})\s+\d{1,2}:\d{2}',
+        'date_format' => 'M j|j M',
+        'source_timezone' => 'America/New_York',
+        'output_timezone' => 'America/New_York',
+    ]);
+    $result = (new AedExtractorService)->extract($profile, 'NFL Game Pass 01: Buffalo Bills vs. Los Angeles Rams @ 30 Jun 4:25 PM');
+
+    expect($result->hasTime())->toBeTrue()
+        ->and($result->start->format('Y-m-d H:i'))->toBe('2026-06-30 16:25');
+});

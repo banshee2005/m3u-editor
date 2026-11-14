@@ -2,16 +2,20 @@
 
 namespace App\Http\Controllers;
 
+use App\Casts\UtcDateTime;
 use App\Enums\ChannelLogoType;
 use App\Enums\DvrMatchMode;
 use App\Enums\DvrRecordingStatus;
 use App\Enums\DvrRuleType;
 use App\Enums\DvrSeriesMode;
-use App\Enums\PlaylistChannelId;
+use App\Enums\ImageProfile;
 use App\Events\ViewerFavoriteEvent;
 use App\Facades\PlaylistFacade;
 use App\Facades\ProxyFacade;
+use App\Filament\Support\DvrPaddingFields;
+use App\Jobs\FetchTmdbIds;
 use App\Jobs\RefreshMediaServerLibraryJob;
+use App\Models\AedProfile;
 use App\Models\ArrIntegration;
 use App\Models\Category;
 use App\Models\Channel;
@@ -37,25 +41,41 @@ use App\Models\Series;
 use App\Models\StreamProfile;
 use App\Models\ViewerFavorite;
 use App\Models\ViewerWatchProgress;
+use App\Models\WatchHistoryIntegration;
 use App\Providers\VersionServiceProvider;
+use App\Services\AedExtractorService;
 use App\Services\AIOStreamsAuthorizationService;
+use App\Services\ChannelNumberSequence;
 use App\Services\ContentRequestService;
-use App\Services\DvrCapabilityGate;
+use App\Services\DvrAccessScope;
 use App\Services\DvrRecorderService;
 use App\Services\EmbyPublicationCatalogService;
 use App\Services\EpgCacheService;
 use App\Services\LogoCacheService;
 use App\Services\M3uProxyService;
+use App\Services\Sports\SportsChannelMatcher;
+use App\Services\Sports\SportsService;
+use App\Services\TmdbService;
+use App\Services\TvClientConfigService;
 use App\Services\VodFileNameService;
+use App\Services\WatchHistory\WatchHistoryScrobbler;
+use App\Services\WatchProgressLinker;
 use App\Services\XtreamCategoryService;
+use App\Services\XtreamLoginAuthenticator;
 use App\Settings\GeneralSettings;
+use App\Support\ChannelNumber;
+use App\Support\DvrLibraryFallback;
+use App\Support\EpgProgrammeArtwork;
+use App\Support\EpisodeNumberParser;
 use App\Support\SeriesKey;
 use App\Support\TmdbRating;
 use Carbon\Carbon;
+use Dedoc\Scramble\Attributes\Group as ApiGroup;
 use Dedoc\Scramble\Attributes\QueryParameter;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Http\Request;
 use Illuminate\Http\Response;
+use Illuminate\Support\Arr;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Bus;
 use Illuminate\Support\Facades\Config;
@@ -67,6 +87,7 @@ use Illuminate\Support\Str;
 use Spatie\Tags\Tag;
 use Symfony\Component\HttpFoundation\JsonResponse;
 
+#[ApiGroup('Xtream API', 'Xtream Codes compatible player API, for IPTV players that speak the Xtream protocol.', weight: 90)]
 class XtreamApiController extends Controller
 {
     private const REQUEST_ACTIONS = [
@@ -76,6 +97,28 @@ class XtreamApiController extends Controller
         'request_status',
         'request_dismiss',
     ];
+
+    private const SPORTS_ACTIONS = [
+        'get_sports_fixtures',
+        'get_sports_channels',
+        'get_sports_fixture_details',
+        'get_sports_teams',
+        'get_sports_follows',
+        'toggle_sports_follow',
+        'sync_sports_follows',
+    ];
+
+    /** `get_sports_channels` matches against the guide, so it serves about a day at a time. */
+    private const int SPORTS_CHANNELS_MAX_RANGE_SECONDS = 2 * 86400;
+
+    /**
+     * Longest `leagues` list, in characters: room for every league of every
+     * provider. Clients send a long one in a POST body, where no URL limit applies.
+     */
+    private const int SPORTS_LEAGUES_MAX_LENGTH = 32000;
+
+    /** A team's follow key: "{sport}/{league}:{team id}". */
+    private const string SPORTS_TEAM_KEY_PATTERN = '/^([a-z0-9-]+\/[a-z0-9._-]+):([A-Za-z0-9-]+)$/';
 
     private const DVR_ACTIONS = [
         'get_dvr_recordings',
@@ -105,6 +148,8 @@ class XtreamApiController extends Controller
      */
     private const int MAX_RECENT_EPISODES = 40;
 
+    private const int SCHEDULE_DVR_MAX_DURATION_SECONDS = 86400;
+
     /**
      * Xtream API request handler.
      *
@@ -126,7 +171,7 @@ class XtreamApiController extends Controller
      * Supports optional category filtering via `category_id` parameter.
      * Each stream object contains: `num`, `name`, `stream_type`, `stream_id`, `stream_icon`, `epg_channel_id`,
      * `added`, `category_id`, `category_ids`, `tv_archive`, `tv_archive_duration`, `custom_sid`, `thumbnail`, `direct_source`.
-     * The `direct_source` field contains the proxy URL when proxy is enabled, otherwise the Xtream-style stream URL.
+     * `direct_source` is always an empty string (kept for Xtream compatibility). Clients build playback URLs from `stream_id`, so upstream provider URLs and credentials are never exposed.
      * The `thumbnail` field contains the same value as `stream_icon`.
      * `tv_archive_duration` is in days. It falls back to `dev.default_epg_catchup_days` (env `DEFAULT_EPG_CATCHUP_DAYS`,
      * default 7) when `tv_archive` is `1` but the actual retention window is unknown (catchup enabled with no known
@@ -137,13 +182,14 @@ class XtreamApiController extends Controller
      * Supports optional category filtering via `category_id` parameter.
      * Each object contains: `num`, `name`, `title`, `year`, `stream_type` (always "movie"), `stream_id`, `stream_icon`,
      * `rating`, `rating_5based`, `added`, `category_id`, `category_ids`, `tmdb`, `tmdb_id`, `container_extension`, `custom_sid`, `direct_source`.
-     * The `direct_source` field contains the proxy URL when proxy is enabled, otherwise the Xtream-style movie URL.
+     * `direct_source` is always an empty string (kept for Xtream compatibility), same as for live streams and series episodes.
      *
      * ### get_series
      * Returns a JSON array of series objects. Only enabled series are included.
      * Supports optional category filtering via `category_id` parameter.
      * Each object contains: `num`, `name`, `series_id`, `cover`, `plot`, `cast`, `director`, `genre`, `releaseDate`,
-     * `last_modified`, `rating`, `rating_5based`, `backdrop_path`, `youtube_trailer`, `episode_run_time`, `category_id`.
+     * `last_modified`, `rating`, `rating_5based`, `backdrop_path`, `tmdb`, `tmdb_id`, `youtube_trailer`, `episode_run_time`,
+     * `category_id`, `category_ids`.
      *
      * ### get_live_categories
      * Returns a JSON array of live stream categories/groups. Only groups with enabled, non-VOD channels are included.
@@ -195,10 +241,7 @@ class XtreamApiController extends Controller
      * ### get_user_info
      * ### get_account_info
      * ### get_server_info
-     * Returns account and server information including user details and allowed output formats.
-     * This provides the same user information as the panel.
-     * Contains: `username`, `password`, `message`, `auth`, `status`, `exp_date`, `is_trial`,
-     * `active_cons`, `created_at`, `max_connections`, `allowed_output_formats`.
+     * Aliases of `panel`: return the same `user_info`, `server_info` and `m3u_editor` objects.
      *
      * ### create_dvr_series_rule
      * Creates a Series-type DVR recording rule for a show title. Query parameters:
@@ -215,11 +258,12 @@ class XtreamApiController extends Controller
      *   - `priority` (int, optional): Defaults to 50 via the column migration default.
      *     Clamped 0-100 when supplied. **Omit to inherit the column default; do not send
      *     a hardcoded value.**
-     *   - `start_early_seconds` (int, optional): Seconds to start early. **Omit to inherit
+     *   - `start_early_seconds` (int, optional): Seconds to start early; a negative value
+     *     starts late. Clamped to ±24h. **Omit to inherit
      *     `dvr_setting.default_start_early_seconds`** (resolved at runtime). Blank is not
      *     coerced to 0 — `0` is a meaningful value (no padding) distinct from "inherit".
-     *   - `end_late_seconds` (int, optional): Seconds to end late. Same omit-to-inherit
-     *     semantics as `start_early_seconds`.
+     *   - `end_late_seconds` (int, optional): Seconds to end late; a negative value finishes
+     *     early. Clamped to ±24h. Same omit-to-inherit semantics as `start_early_seconds`.
      * Returns `{success: true, rule_id: <int>}`. Returns 409 `{error, rule_id, duplicate: true}`
      * when a Series rule for the same normalized title already exists under this DVR
      * setting (+ auth).
@@ -259,264 +303,23 @@ class XtreamApiController extends Controller
      * `recent_episodes` (up to MAX_RECENT_EPISODES airings, upcoming first soonest, then
      * most-recent-past). Entry shape for `airing_now[]` and `recent_episodes[]` is identical.
      *
-     *
      * @param  string  $uuid  The UUID of the playlist (required path parameter)
      * @param  Request  $request  The HTTP request containing query parameters:
      *                            - username (string, required): User's Xtream API username
      *                            - password (string, required): User's Xtream API password
      *                            - action (string, optional): Defaults to 'panel'. Determines the API action
-     *                            - category_id (string, optional): Filter results by category ID (required for get_series, optional for get_live_streams and get_vod_streams)
+     *                            - category_id (string, optional): Filter results by category ID (optional for get_live_streams, get_vod_streams and get_series)
      *                            - series_id (int, optional): Series ID (required for get_series_info action)
      *                            - vod_id (int, optional): VOD/Movie ID (required for get_vod_info action)
      *                            - stream_id (int, optional): Channel/Stream ID (required for get_short_epg and get_simple_data_table actions)
      *                            - limit (int, optional): Number of EPG programmes to return for get_short_epg (default=4)
-     *
-     * @response 200 scenario="Panel action response" {
-     *   "user_info": {
-     *     "username": "test_user",
-     *     "password": "test_pass",
-     *     "message": "",
-     *     "auth": 1,
-     *     "status": "Active",
-     *     "exp_date": "1767225600",
-     *     "is_trial": "0",
-     *     "active_cons": 1,
-     *     "created_at": "1640995200",
-     *     "max_connections": "2",
-     *     "allowed_output_formats": ["m3u8", "ts"]
-     *   },
-     *   "server_info": {
-     *     "url": "https://example.com",
-     *     "port": "443",
-     *     "https_port": "443",
-     *     "server_protocol": "https",
-     *     "timezone": "UTC",
-     *     "server_software": "M3U Proxy Editor Xtream API",
-     *     "timestamp_now": "1719187200",
-     *     "time_now": "2025-06-20 12:00:00"
-     *   }
-     * }
-     * @response 200 scenario="Live streams response" [
-     *   {
-     *     "num": 1,
-     *     "name": "CNN HD",
-     *     "stream_type": "live",
-     *     "stream_id": "12345",
-     *     "stream_icon": "https://example.com/logos/cnn.png",
-     *     "epg_channel_id": "cnn.us",
-     *     "added": "1640995200",
-     *     "category_id": "1",
-     *     "category_ids": [1],
-     *     "tv_archive": 1,
-     *     "tv_archive_duration": 7,
-     *     "custom_sid": "cnn-hd",
-     *     "thumbnail": "https://example.com/logos/cnn.png",
-     *     "direct_source": ""
-     *   }
-     * ]
-     * @response 200 scenario="VOD streams response" [
-     *   {
-     *     "num": 1,
-     *     "name": "The Matrix",
-     *     "title": "The Matrix",
-     *     "year": "1999",
-     *     "stream_type": "movie",
-     *     "stream_id": "67890",
-     *     "stream_icon": "https://example.com/covers/matrix.jpg",
-     *     "rating": "8.7",
-     *     "rating_5based": 4.35,
-     *     "added": "1640995200",
-     *     "category_id": "3",
-     *     "category_ids": [3],
-     *     "tmdb": "603",
-     *     "tmdb_id": 603,
-     *     "container_extension": "mkv",
-     *     "custom_sid": "the-matrix",
-     *     "direct_source": ""
-     *   }
-     * ]
-     * @response 200 scenario="Series response" [
-     *   {
-     *     "num": 1,
-     *     "name": "Breaking Bad",
-     *     "series_id": 101,
-     *     "cover": "https://example.com/covers/breaking_bad.jpg",
-     *     "plot": "A high school chemistry teacher turned meth cook...",
-     *     "cast": "Bryan Cranston, Aaron Paul",
-     *     "director": "Vince Gilligan",
-     *     "genre": "Crime, Drama",
-     *     "releaseDate": "2008-01-20",
-     *     "last_modified": "1640995200",
-     *     "rating": "9.5",
-     *     "rating_5based": 4.75,
-     *     "backdrop_path": [],
-     *     "youtube_trailer": "HhesaQXLuRY",
-     *     "episode_run_time": "47",
-     *     "category_id": "2"
-     *   }
-     * ]
-     * @response 200 scenario="Series info response" {
-     *   "info": {
-     *     "name": "Breaking Bad",
-     *     "cover": "https://example.com/covers/breaking_bad.jpg",
-     *     "plot": "A high school chemistry teacher turned meth cook...",
-     *     "cast": "Bryan Cranston, Aaron Paul",
-     *     "director": "Vince Gilligan",
-     *     "genre": "Crime, Drama",
-     *     "releaseDate": "2008-01-20",
-     *     "last_modified": "1640995200",
-     *     "rating": "9.5",
-     *     "rating_5based": 4.75,
-     *     "backdrop_path": [],
-     *     "youtube_trailer": "HhesaQXLuRY",
-     *     "episode_run_time": "47",
-     *     "category_id": "2"
-     *   },
-     *   "episodes": {
-     *     "1": [
-     *       {
-     *         "id": "1001",
-     *         "episode_num": 1,
-     *         "title": "Pilot",
-     *         "container_extension": "mp4",
-     *         "info": {
-     *             "release_date" => "2024-06-29"
-     *             "plot" => "Kafka's final fate is determined as the monster within him tries to take control."
-     *             "duration_secs" => 1440
-     *             "duration" => "00:24:00"
-     *             "movie_image" => "http://23.227.147.172:80/images/e11236b82442615bc6e44d3555dce478.jpg"
-     *             "bitrate" => 0
-     *             "rating" => "7.3"
-     *             "season" => "1"
-     *             "tmdb_id" => "5188924"
-     *             "cover_big" => "http://23.227.147.172:80/images/e11236b82442615bc6e44d3555dce478.jpg"
-     *         },
-     *         "added": "1640995200",
-     *         "season": 1,
-     *         "stream_id": "1001",
-     *         "direct_source": ""
-     *       }
-     *     ]
-     *   },
-     *   "seasons": {
-     *     "1": []
-     *   }
-     * }
-     * @response 200 scenario="Live categories response" [
-     *   {
-     *     "category_id": "1",
-     *     "category_name": "News",
-     *     "parent_id": 0
-     *   },
-     *   {
-     *     "category_id": "2",
-     *     "category_name": "Sports",
-     *     "parent_id": 0
-     *   }
-     * ]
-     * @response 200 scenario="VOD categories response" [
-     *   {
-     *     "category_id": "1",
-     *     "category_name": "Action Movies",
-     *     "parent_id": 0
-     *   },
-     *   {
-     *     "category_id": "2",
-     *     "category_name": "Comedy Movies",
-     *     "parent_id": 0
-     *   }
-     * ]
-     * @response 200 scenario="Series categories response" [
-     *   {
-     *     "category_id": "1",
-     *     "category_name": "Drama Series",
-     *     "parent_id": 0
-     *   },
-     *   {
-     *     "category_id": "2",
-     *     "category_name": "Comedy Series",
-     *     "parent_id": 0
-     *   }
-     * ]
-     * @response 200 scenario="Short EPG response" {
-     *   "epg_listings": [
-     *     {
-     *       "id": "8037716",
-     *       "epg_id": "8",
-     *       "title": "Morning News",
-     *       "lang": "en",
-     *       "start": "2025-08-14 07:00:00",
-     *       "end": "2025-08-14 07:15:00",
-     *       "description": "Latest morning news and updates",
-     *       "channel_id": "cnn.us",
-     *       "start_timestamp": "1755154800",
-     *       "stop_timestamp": "1755155700",
-     *       "now_playing": 1,
-     *       "has_archive": 0
-     *     },
-     *     {
-     *       "id": "8037717",
-     *       "epg_id": "8",
-     *       "title": "Business Report",
-     *       "lang": "en",
-     *       "start": "2025-08-14 07:15:00",
-     *       "end": "2025-08-14 07:30:00",
-     *       "description": "Financial market updates",
-     *       "channel_id": "cnn.us",
-     *       "start_timestamp": "1755155700",
-     *       "stop_timestamp": "1755156600",
-     *       "now_playing": 0,
-     *       "has_archive": 0
-     *     }
-     *   ]
-     * }
-     * @response 200 scenario="Simple date table response" {
-     *   "epg_listings": [
-     *     {
-     *       "id": "8037716",
-     *       "epg_id": "8",
-     *       "title": "Morning News",
-     *       "lang": "en",
-     *       "start": "2025-08-14 07:00:00",
-     *       "end": "2025-08-14 07:15:00",
-     *       "description": "Latest morning news and updates",
-     *       "channel_id": "cnn.us",
-     *       "start_timestamp": "1755154800",
-     *       "stop_timestamp": "1755155700",
-     *       "now_playing": 1,
-     *       "has_archive": 0
-     *     }
-     *   ]
-     * }
-     * @response 200 scenario="Account info response" {
-     *   "username": "test_user",
-     *   "password": "test_pass",
-     *   "message": "",
-     *   "auth": 1,
-     *   "status": "Active",
-     *   "exp_date": "1767225600",
-     *   "is_trial": "0",
-     *   "active_cons": 1,
-     *   "created_at": "1640995200",
-     *   "max_connections": "2",
-     *   "allowed_output_formats": ["m3u8", "ts"]
-     * }
-     * @response 400 scenario="Bad Request" {"error": "Invalid action"}
-     * @response 400 scenario="Missing category_id for get_series" {"error": "category_id parameter is required for get_series action"}
-     * @response 400 scenario="Missing series_id for get_series_info" {"error": "series_id parameter is required for get_series_info action"}
-     * @response 400 scenario="Missing stream_id for get_short_epg" {"error": "stream_id parameter is required for get_short_epg action"}
-     * @response 400 scenario="Missing stream_id for get_simple_data_table" {"error": "stream_id parameter is required for get_simple_data_table action"}
-     * @response 401 scenario="Unauthorized - Missing Credentials" {"error": "Unauthorized - Missing credentials"}
-     * @response 401 scenario="Unauthorized - Invalid Credentials" {"error": "Unauthorized"}
-     * @response 404 scenario="Not Found (e.g., playlist not found)" {"error": "Playlist not found"}
-     * @response 404 scenario="Series not found" {"error": "Series not found or not enabled"}
      *
      * @unauthenticated
      */
     #[QueryParameter('username', 'Your m3u editor login username (default is "admin").', required: true, type: 'string', example: 'admin')]
     #[QueryParameter('password', 'The unique identifier (UUID) of the playlist you want to access via the Xtream API.', required: true, type: 'string', example: '00000000-0000-0000-0000-000000000000')]
     #[QueryParameter('action', 'Determines the API action to perform. Defaults to "panel" when omitted. Common values: panel, get_live_streams, get_vod_streams, get_series, get_live_categories, get_vod_categories, get_series_categories, get_series_info, get_vod_info, get_short_epg, get_simple_data_table.', required: false, type: 'string', default: 'panel', example: 'get_live_streams')]
-    #[QueryParameter('category_id', 'Filter results by category ID. Required for get_series; optional for get_live_streams and get_vod_streams.', required: false, type: 'string', example: '1')]
+    #[QueryParameter('category_id', 'Filter results by category ID. Optional for get_live_streams, get_vod_streams and get_series.', required: false, type: 'string', example: '1')]
     #[QueryParameter('series_id', 'Series ID. Required for the get_series_info action.', required: false, type: 'integer', example: 101)]
     #[QueryParameter('vod_id', 'VOD/Movie ID. Required for the get_vod_info action.', required: false, type: 'integer', example: 202)]
     #[QueryParameter('stream_id', 'Channel/Stream ID. Required for the get_short_epg and get_simple_data_table actions.', required: false, type: 'integer', example: 303)]
@@ -551,15 +354,22 @@ class XtreamApiController extends Controller
         }
 
         $playlistAuth = $authMethod === 'playlist_auth'
-            ? PlaylistAuth::where('username', $username)
-                ->where('password', $password)
-                ->where('enabled', true)
-                ->where(function ($query) {
-                    $query->whereNull('expires_at')
-                        ->orWhere('expires_at', '>', now());
-                })
-                ->first()
+            ? app(XtreamLoginAuthenticator::class)->activePlaylistAuth($username, $password)
             : null;
+
+        return $this->handleAs($request, $playlist, $authMethod, (string) $username, (string) $password, $playlistAuth);
+    }
+
+    /**
+     * Answers an already-authenticated request as [$playlist]. handle() calls
+     * it after checking the credentials; TvHomeScreenCategories calls it to
+     * read a playlist's categories exactly as its logins get them.
+     *
+     * @param  Playlist|CustomPlaylist|MergedPlaylist|PlaylistAlias  $playlist
+     */
+    public function handleAs(Request $request, $playlist, string $authMethod, string $username = '', string $password = '', ?PlaylistAuth $playlistAuth = null)
+    {
+        $action = (string) $request->input('action', 'panel');
 
         $urlSafePass = urlencode($password);
         $urlSafeUser = urlencode($username);
@@ -595,6 +405,10 @@ class XtreamApiController extends Controller
         $aliasCategoryFilter = $playlist instanceof PlaylistAlias
             ? $playlist->getAllowedCategoryNames()
             : [];
+        // Whether the alias narrows a type at all - an allow-list, an "everything except"
+        // list or a block bouquet. The name lists above are only the Only-mode allow-lists.
+        $aliasFiltersVod = $playlist instanceof PlaylistAlias && $playlist->hasVodGroupFilter();
+        $aliasFiltersSeries = $playlist instanceof PlaylistAlias && $playlist->hasCategoryFilter();
 
         $baseUrl = ProxyFacade::getBaseUrl();
         $rateLimitedResponse = $this->requestRateLimit($action, $playlist, $authMethod, $playlistAuth);
@@ -752,6 +566,24 @@ class XtreamApiController extends Controller
                     $m3uEditorPayload['aiostreams'] = $aiostreamsData;
                 }
 
+                if (in_array('sports', $features, true)) {
+                    $m3uEditorPayload['sports'] = [
+                        'api_version' => 1,
+                        'actions' => [
+                            'fixtures' => 'get_sports_fixtures',
+                            'channels' => 'get_sports_channels',
+                            'details' => 'get_sports_fixture_details',
+                            'teams' => 'get_sports_teams',
+                            'follows' => 'get_sports_follows',
+                            'toggle_follow' => 'toggle_sports_follow',
+                            'sync_follows' => 'sync_sports_follows',
+                        ],
+                        'max_range_days' => SportsService::MAX_RANGE_DAYS,
+                        'leagues' => app(SportsService::class)->clientLeagues(),
+                        'sport_names' => app(SportsService::class)->sportNames(),
+                    ];
+                }
+
                 $proxyData = $this->resolveProxyData($playlist, $features, $authMethod, $playlistAuth);
                 if (! empty($proxyData)) {
                     $m3uEditorPayload['proxy'] = $proxyData;
@@ -776,6 +608,29 @@ class XtreamApiController extends Controller
                     ];
                 }
 
+                // Trakt / SIMKL accounts the server already sends this auth's
+                // progress to. A client that scrobbles to one of these
+                // providers itself sends it in `client_scrobblers` on
+                // update_progress, and the server skips that provider.
+                if ($playlistAuth) {
+                    $m3uEditorPayload['watch_history'] = $playlistAuth->watchHistoryIntegrations()
+                        ->pushing()
+                        ->get(['watch_history_integrations.id', 'provider', 'account_name'])
+                        ->map(fn (WatchHistoryIntegration $integration): array => [
+                            'provider' => $integration->provider->value,
+                            'account' => $integration->account_name,
+                        ])
+                        ->all();
+                }
+
+                // TV Client Profile (settings managed from the editor). Always
+                // advertised so an app whose profile was removed drops it too.
+                $tvClientConfig = app(TvClientConfigService::class);
+                $m3uEditorPayload['client_config'] = $tvClientConfig->capability(
+                    $tvClientConfig->resolveProfile($playlist, $authMethod, $playlistAuth),
+                    $tvClientConfig->resolveHomeScreen($playlist),
+                );
+
                 $payload['m3u_editor'] = $m3uEditorPayload;
             }
 
@@ -787,6 +642,7 @@ class XtreamApiController extends Controller
             }
 
             $categoryId = $request->input('category_id');
+            $isCategoryRequest = $categoryId && $categoryId !== 'all';
 
             // Use the optimised query: JOINs instead of eager loads, SQL-level ordering, cursor-compatible.
             $channelsQuery = PlaylistGenerateController::getChannelQuery($playlist, isVod: false);
@@ -804,21 +660,33 @@ class XtreamApiController extends Controller
                     ->selectRaw(
                         '(SELECT ccp.channel_number FROM channel_custom_playlist ccp WHERE ccp.channel_id = channels.id AND ccp.custom_playlist_id = ?) as ccp_channel_number',
                         [$customPlaylistId]
+                    )
+                    ->selectRaw(
+                        '(SELECT ccp.channel_minor FROM channel_custom_playlist ccp WHERE ccp.channel_id = channels.id AND ccp.custom_playlist_id = ?) as ccp_channel_minor',
+                        [$customPlaylistId]
                     );
             }
 
             // Apply category filtering when requested.
-            if ($categoryId && $categoryId !== 'all') {
+            if ($isCategoryRequest) {
                 if ($isCustomPlaylist) {
+                    // A custom tag id and a fallback group id live in disjoint ranges
+                    // (see XtreamCategoryService::CUSTOM_PLAYLIST_FALLBACK_ID_OFFSET),
+                    // so only one of these branches can ever actually match.
                     $channelsQuery->where(function ($query) use ($categoryId, $tagUuid) {
                         $query->whereHas('tags', function ($tagQuery) use ($categoryId, $tagUuid) {
                             $tagQuery->where('type', $tagUuid)
                                 ->where('id', $categoryId);
-                        })->orWhere(function ($subQuery) use ($categoryId, $tagUuid) {
-                            $subQuery->whereDoesntHave('tags', function ($tagQuery) use ($tagUuid) {
-                                $tagQuery->where('type', $tagUuid);
-                            })->where('group_id', $categoryId);
                         });
+
+                        if (XtreamCategoryService::isCustomPlaylistFallbackCategoryId($categoryId)) {
+                            $groupId = XtreamCategoryService::decodeCustomPlaylistFallbackCategoryId($categoryId);
+                            $query->orWhere(function ($subQuery) use ($groupId, $tagUuid) {
+                                $subQuery->whereDoesntHave('tags', function ($tagQuery) use ($tagUuid) {
+                                    $tagQuery->where('type', $tagUuid);
+                                })->where('group_id', $groupId);
+                            });
+                        }
                     });
                 } else {
                     // A merged group's category_id also matches every child folded into it.
@@ -826,11 +694,20 @@ class XtreamApiController extends Controller
                 }
             }
 
+            // Numbered as in the full listing rather than restarting the sequence for
+            // one category. With include_vod_in_m3u on, that is the M3U/XMLTV output,
+            // which interleaves VOD (see getChannelQuery()), so a live-only walk would
+            // drift from it (issue #1683). Otherwise live channels are the whole
+            // output, so an unfiltered listing is numbered as it streams.
+            $numberSequence = new ChannelNumberSequence($playlist);
+            $categoryNumbers = $numberSequence->isPositional() && ($isCategoryRequest || $playlist->include_vod_in_m3u)
+                ? ChannelNumberSequence::numbersFor($playlist, PlaylistGenerateController::getChannelQuery($playlist), $channelsQuery, $isCustomPlaylist)
+                : null;
+
             $cursor = $channelsQuery->cursor();
 
-            return response()->stream(function () use ($cursor, $playlist, $baseUrl, $isCustomPlaylist, $disableCatchup) {
+            return response()->stream(function () use ($cursor, $playlist, $baseUrl, $isCustomPlaylist, $disableCatchup, $numberSequence, $categoryNumbers) {
                 $idChannelBy = $playlist->id_channel_by;
-                $channelNumber = ($playlist->auto_channel_increment || $playlist->force_channel_numbering) ? $playlist->channel_start - 1 : 0;
 
                 echo '[';
                 $first = true;
@@ -857,19 +734,22 @@ class XtreamApiController extends Controller
                         if (! empty($channel->custom_group_id)) {
                             $channelCategoryId = (string) $channel->custom_group_id;
                         } elseif ($channel->group_id) {
-                            $channelCategoryId = (string) $channel->group_id;
+                            $channelCategoryId = XtreamCategoryService::customPlaylistFallbackCategoryId($channel->group_id);
                         }
                     } else {
                         // Non-custom playlist: a group folded into a merged group reports the merged group's id.
                         $channelCategoryId = XtreamCategoryService::channelStreamCategoryId($channel);
                     }
 
-                    $channelNo = ($isCustomPlaylist && ! empty($channel->ccp_channel_number))
-                        ? (int) $channel->ccp_channel_number
-                        : $channel->channel;
-                    if ($playlist->force_channel_numbering || (! $channelNo && ($playlist->auto_channel_increment || $idChannelBy === PlaylistChannelId::Number))) {
-                        $channelNo = ++$channelNumber;
-                    }
+                    $channelNo = ChannelNumber::resolve(
+                        $channel->channel,
+                        $channel->channel_minor,
+                        $isCustomPlaylist ? $channel->ccp_channel_number : null,
+                        $isCustomPlaylist ? $channel->ccp_channel_minor : null,
+                    );
+                    $channelNo = $categoryNumbers !== null
+                        ? ($categoryNumbers[$channel->id] ?? $channelNo)
+                        : $numberSequence->next($channelNo);
 
                     $tvgId = $channel->resolveTvgId($idChannelBy, $channelNo);
 
@@ -881,7 +761,9 @@ class XtreamApiController extends Controller
                     $tvgId = preg_replace(config('dev.tvgid.regex'), '', $tvgId);
 
                     $liveStream = [
-                        'num' => $channelNo,
+                        // Xtream clients parse `num` as an integer, so a sub-channel
+                        // ("5.1") reports its major number here; tvg-id keeps the full one.
+                        'num' => ChannelNumber::major($channelNo),
                         'name' => $channel->title_custom ?? $channel->title,
                         'stream_type' => 'live',
                         'stream_id' => $channel->id,
@@ -921,6 +803,7 @@ class XtreamApiController extends Controller
             }
 
             $categoryId = $request->input('category_id');
+            $isCategoryRequest = $categoryId && $categoryId !== 'all';
 
             // Resolved once, used both by the filter branch below and the
             // streamed response closure further down. Must be declared up
@@ -940,20 +823,32 @@ class XtreamApiController extends Controller
                     ->selectRaw(
                         '(SELECT ccp.channel_number FROM channel_custom_playlist ccp WHERE ccp.channel_id = channels.id AND ccp.custom_playlist_id = ?) as ccp_channel_number',
                         [$customPlaylistId]
+                    )
+                    ->selectRaw(
+                        '(SELECT ccp.channel_minor FROM channel_custom_playlist ccp WHERE ccp.channel_id = channels.id AND ccp.custom_playlist_id = ?) as ccp_channel_minor',
+                        [$customPlaylistId]
                     );
             }
 
-            if ($categoryId && $categoryId !== 'all') {
+            if ($isCategoryRequest) {
                 if ($isCustomPlaylist) {
+                    // A custom tag id and a fallback group id live in disjoint ranges
+                    // (see XtreamCategoryService::CUSTOM_PLAYLIST_FALLBACK_ID_OFFSET),
+                    // so only one of these branches can ever actually match.
                     $channelsQuery->where(function ($query) use ($categoryId, $tagUuid) {
                         $query->whereHas('tags', function ($tagQuery) use ($categoryId, $tagUuid) {
                             $tagQuery->where('type', $tagUuid)
                                 ->where('id', $categoryId);
-                        })->orWhere(function ($subQuery) use ($categoryId, $tagUuid) {
-                            $subQuery->whereDoesntHave('tags', function ($tagQuery) use ($tagUuid) {
-                                $tagQuery->where('type', $tagUuid);
-                            })->where('group_id', $categoryId);
                         });
+
+                        if (XtreamCategoryService::isCustomPlaylistFallbackCategoryId($categoryId)) {
+                            $groupId = XtreamCategoryService::decodeCustomPlaylistFallbackCategoryId($categoryId);
+                            $query->orWhere(function ($subQuery) use ($groupId, $tagUuid) {
+                                $subQuery->whereDoesntHave('tags', function ($tagQuery) use ($tagUuid) {
+                                    $tagQuery->where('type', $tagUuid);
+                                })->where('group_id', $groupId);
+                            });
+                        }
                     });
                 } else {
                     // Dynamic groups use a reserved id range
@@ -971,6 +866,22 @@ class XtreamApiController extends Controller
                 }
             }
 
+            // Numbered as in the full listing rather than restarting the sequence for
+            // one category. With include_vod_in_m3u on, that is the M3U/XMLTV output,
+            // which interleaves live channels around these VOD entries (see
+            // getChannelQuery()), so a VOD-only walk would drift from it (issue #1683).
+            // Otherwise VOD is not in that output and keeps its own sequence, so an
+            // unfiltered listing is numbered as it streams.
+            $numberSequence = new ChannelNumberSequence($playlist);
+            $categoryNumbers = $numberSequence->isPositional() && ($isCategoryRequest || $playlist->include_vod_in_m3u)
+                ? ChannelNumberSequence::numbersFor(
+                    $playlist,
+                    PlaylistGenerateController::getChannelQuery($playlist, isVod: $playlist->include_vod_in_m3u ? null : true),
+                    $channelsQuery,
+                    $isCustomPlaylist,
+                )
+                : null;
+
             $cursor = $channelsQuery->cursor();
             $vodFileNameService = app(VodFileNameService::class);
 
@@ -980,14 +891,12 @@ class XtreamApiController extends Controller
             // see XtreamCategoryService::dynamicCategoryIdsByItem() for why
             // the full listing needs them.
             $dynamicCategoryIdsByChannel = [];
-            if (! $isCustomPlaylist && $dynamicGroupId === null && $sourcePlaylist && empty($aliasVodGroupFilter)) {
+            if (! $isCustomPlaylist && $dynamicGroupId === null && $sourcePlaylist && ! $aliasFiltersVod) {
                 $dynamicCategoryIdsByChannel = XtreamCategoryService::dynamicCategoryIdsByItem($sourcePlaylist, isVod: true);
             }
 
-            return response()->stream(function () use ($cursor, $playlist, $baseUrl, $isCustomPlaylist, $vodFileNameService, $categoryId, $dynamicGroupId, $dynamicCategoryIdsByChannel) {
+            return response()->stream(function () use ($cursor, $playlist, $baseUrl, $isCustomPlaylist, $vodFileNameService, $categoryId, $dynamicGroupId, $dynamicCategoryIdsByChannel, $numberSequence, $categoryNumbers) {
                 $num = 0;
-                $idChannelBy = $playlist->id_channel_by;
-                $channelNumber = ($playlist->auto_channel_increment || $playlist->force_channel_numbering) ? $playlist->channel_start - 1 : 0;
                 echo '[';
                 $first = true;
                 foreach ($cursor as $channel) {
@@ -1006,7 +915,8 @@ class XtreamApiController extends Controller
                         $streamIcon = filter_var($logo, FILTER_VALIDATE_URL) ? $logo : $baseUrl."/$logo";
                     }
                     if ($playlist->enable_logo_proxy && filter_var($streamIcon, FILTER_VALIDATE_URL) && ! str_starts_with($streamIcon, url('/'))) {
-                        $streamIcon = LogoProxyController::generateProxyUrl($streamIcon);
+                        // VOD stream_icon is a poster: downscale it like series covers.
+                        $streamIcon = LogoProxyController::generateProxyUrl($streamIcon, profile: ImageProfile::Poster);
                     }
 
                     $channelCategoryId = 'all';
@@ -1014,7 +924,7 @@ class XtreamApiController extends Controller
                         if (! empty($channel->custom_group_id)) {
                             $channelCategoryId = (string) $channel->custom_group_id;
                         } elseif ($channel->group_id) {
-                            $channelCategoryId = (string) $channel->group_id;
+                            $channelCategoryId = XtreamCategoryService::customPlaylistFallbackCategoryId($channel->group_id);
                         }
                     } elseif ($dynamicGroupId !== null) {
                         // When serving a dynamic category, clients group by
@@ -1027,15 +937,18 @@ class XtreamApiController extends Controller
                     }
 
                     $tmdb = $channel->info['tmdb_id'] ?? $channel->movie_data['tmdb_id'] ?? 0;
-                    $vodChannelNo = ($isCustomPlaylist && ! empty($channel->ccp_channel_number))
-                        ? (int) $channel->ccp_channel_number
-                        : $channel->channel;
-                    if ($playlist->force_channel_numbering || (! $vodChannelNo && ($playlist->auto_channel_increment || $idChannelBy === PlaylistChannelId::Number))) {
-                        $vodChannelNo = ++$channelNumber;
-                    }
+                    $vodChannelNo = ChannelNumber::resolve(
+                        $channel->channel,
+                        $channel->channel_minor,
+                        $isCustomPlaylist ? $channel->ccp_channel_number : null,
+                        $isCustomPlaylist ? $channel->ccp_channel_minor : null,
+                    );
+                    $vodChannelNo = $categoryNumbers !== null
+                        ? ($categoryNumbers[$channel->id] ?? $vodChannelNo)
+                        : $numberSequence->next($vodChannelNo);
 
                     echo json_encode([
-                        'num' => $vodChannelNo,
+                        'num' => ChannelNumber::major($vodChannelNo),
                         'name' => $channel->title_custom ?? $channel->title,
                         'title' => $channel->title_custom ?? $channel->title,
                         'year' => $vodFileNameService->resolveMovieYearAsInt($channel),
@@ -1047,7 +960,7 @@ class XtreamApiController extends Controller
                             $channel->info['vote_count'] ?? null
                         ),
                         'rating_5based' => $channel->rating_5based ?? 0,
-                        'added' => (string) $channel->created_at->timestamp,
+                        'added' => (string) ($channel->source_added_at ?? $channel->created_at)->timestamp,
                         'category_id' => $channelCategoryId,
                         'category_ids' => array_values(array_unique(array_merge(
                             [(int) $channelCategoryId],
@@ -1092,19 +1005,26 @@ class XtreamApiController extends Controller
             // Apply category filtering if category_id is provided
             if ($categoryId && $categoryId !== 'all') {
                 if ($isCustomPlaylist) {
-                    // For CustomPlaylist, filter by tag ID or group_id
+                    // For CustomPlaylist, filter by tag ID or category_id. These live
+                    // in disjoint ranges (see
+                    // XtreamCategoryService::CUSTOM_PLAYLIST_FALLBACK_ID_OFFSET), so
+                    // only one of these branches can ever actually match.
                     $seriesQuery->where(function ($query) use ($categoryId, $tagUuid) {
-                        // Channels with custom tags matching the category ID
+                        // Series with custom tags matching the category ID
                         $query->whereHas('tags', function ($tagQuery) use ($categoryId, $tagUuid) {
                             $tagQuery->where('type', $tagUuid.'-category')
                                 ->where('id', $categoryId);
-                        })
-                            // OR channels without custom tags but with matching group_id
-                            ->orWhere(function ($subQuery) use ($categoryId, $tagUuid) {
+                        });
+
+                        if (XtreamCategoryService::isCustomPlaylistFallbackCategoryId($categoryId)) {
+                            $categoryTableId = XtreamCategoryService::decodeCustomPlaylistFallbackCategoryId($categoryId);
+                            // OR series without custom tags but with matching category_id
+                            $query->orWhere(function ($subQuery) use ($categoryTableId, $tagUuid) {
                                 $subQuery->whereDoesntHave('tags', function ($tagQuery) use ($tagUuid) {
                                     $tagQuery->where('type', $tagUuid.'-category');
-                                })->where('category_id', $categoryId);
+                                })->where('category_id', $categoryTableId);
                             });
+                        }
                     });
                 } else {
                     // Dynamic groups expose a reserved id range — see
@@ -1125,7 +1045,11 @@ class XtreamApiController extends Controller
 
             // Keyset pagination: compound (sort, id) cursor avoids the O(n²) offset
             // degradation of lazy() while still delivering correct sort order.
-            $seriesIterable = PlaylistGenerateController::seriesKeysetLazy($seriesQuery, 500);
+            // Dynamic groups are ordered by TMDB rank instead (a subquery the
+            // keyset cursor can't page on), and are small enough for lazy().
+            $seriesIterable = $dynamicGroupId !== null
+                ? $seriesQuery->lazy(500)
+                : PlaylistGenerateController::seriesKeysetLazy($seriesQuery, 500);
 
             // Custom playlists need tag-based ordering — materialise to sort, then stream.
             if ($isCustomPlaylist) {
@@ -1154,7 +1078,7 @@ class XtreamApiController extends Controller
             // Dynamic-category membership for the listing — mirrors the
             // get_vod_streams wiring; see XtreamCategoryService::dynamicCategoryIdsByItem().
             $dynamicCategoryIdsBySeries = [];
-            if (! $isCustomPlaylist && $dynamicGroupId === null && $sourcePlaylist && empty($aliasCategoryFilter)) {
+            if (! $isCustomPlaylist && $dynamicGroupId === null && $sourcePlaylist && ! $aliasFiltersSeries) {
                 $dynamicCategoryIdsBySeries = XtreamCategoryService::dynamicCategoryIdsByItem($sourcePlaylist, isVod: false);
             }
 
@@ -1174,7 +1098,7 @@ class XtreamApiController extends Controller
                         if ($customCat) {
                             $seriesCategoryId = (string) $customCat->id;
                         } elseif ($seriesItem->category_id) {
-                            $seriesCategoryId = (string) $seriesItem->category_id;
+                            $seriesCategoryId = XtreamCategoryService::customPlaylistFallbackCategoryId($seriesItem->category_id);
                         }
                     } elseif ($dynamicGroupId !== null) {
                         // Dynamic category — echo the requested id rather
@@ -1197,11 +1121,11 @@ class XtreamApiController extends Controller
                         $backdropPaths = json_decode($backdropPaths, true) ?? [];
                     }
                     $backdropPaths = array_filter($backdropPaths);
-                    $clearLogo = $seriesItem->metadata['clearlogo'] ?? null;
+                    $clearLogo = TmdbService::rasterLogoUrl($seriesItem->metadata['clearlogo'] ?? null);
                     if ($playlist->enable_logo_proxy) {
-                        $cover = $this->proxyImageUrl($cover, self::posterProxyWidth());
-                        $backdropPaths = array_map(fn ($path) => $this->proxyImageUrl($path, self::backdropProxyWidth()), $backdropPaths);
-                        $clearLogo = $clearLogo ? $this->proxyImageUrl($clearLogo) : null;
+                        $cover = $this->proxyImageUrl($cover, ImageProfile::Poster);
+                        $backdropPaths = array_map(fn ($path) => $this->proxyImageUrl($path, ImageProfile::Backdrop), $backdropPaths);
+                        $clearLogo = $clearLogo ? $this->proxyImageUrl($clearLogo, ImageProfile::TitleLogo) : null;
                     }
 
                     $seriesRow = [
@@ -1229,6 +1153,7 @@ class XtreamApiController extends Controller
                         'tmdb_id' => (int) ($tmdb ?: 0),
                         'youtube_trailer' => $seriesItem->youtube_trailer ?? '',
                         'episode_run_time' => (string) ($seriesItem->episode_run_time ?? 0),
+                        'mpaa_rating' => $seriesItem->getContentRating() ?? '',
                         'category_id' => $seriesCategoryId,
                         'category_ids' => array_values(array_unique(array_merge(
                             [(int) $seriesCategoryId],
@@ -1290,10 +1215,28 @@ class XtreamApiController extends Controller
                     refresh: ! $playlist->auto_fetch_series_metadata,
                     sync: false,
                     dispatchTmdb: (bool) $playlist->auto_fetch_series_metadata,
+                    // With on-demand TMDB enrichment on, an enriched series keeps its TMDB
+                    // fields rather than having the provider refresh overwrite them.
+                    preferTmdb: (bool) app(GeneralSettings::class)->tmdb_auto_enrich_on_fetch,
                 );
                 if ($results !== null && $results !== false) {
                     // Provider returned new data — reload the model with fresh relations
                     $seriesItem = $seriesItem->fresh(['seasons.episodes', 'category']) ?? $seriesItem;
+                }
+            }
+
+            // On-demand TMDB enrichment: global opt-in (Settings > Integrations > TMDB >
+            // "Auto-enrichment on fetch"), for installs that don't run the bulk "Fetch TMDB
+            // Metadata" action. processSingleSeries() is self-gating on existing tmdb_id/
+            // plot/cover/cast_list/related_tmdb, so once a series is fully enriched this
+            // is a cheap no-op on every later view - a one-time cost per series, persisted
+            // to $seriesItem. Media server series (Plex/Emby) are included: their synced
+            // metadata often has plot/cover but a cast_list with no TMDB person ids, so
+            // the self-gating check still routes them through TMDB to fill that gap.
+            if (app(GeneralSettings::class)->tmdb_auto_enrich_on_fetch) {
+                $tmdb = app(TmdbService::class);
+                if ($tmdb->isConfigured()) {
+                    app(FetchTmdbIds::class)->processSingleSeries($tmdb, $seriesItem, backfillEnrichment: true);
                 }
             }
 
@@ -1315,7 +1258,7 @@ class XtreamApiController extends Controller
 
             if ($dvrGranted) {
                 $seriesItem->load([
-                    'seasons.episodes.dvrRecording' => fn ($query) => $query->with(['dvrSetting', 'recordingRule']),
+                    'seasons.episodes.dvrRecording' => fn ($query) => $query->with(['dvrSetting', 'recordingRule', 'channel']),
                 ]);
             }
 
@@ -1325,11 +1268,11 @@ class XtreamApiController extends Controller
                 $backdropPaths = json_decode($backdropPaths, true) ?? [];
             }
             $backdropPaths = array_filter($backdropPaths);
-            $clearLogo = $seriesItem->metadata['clearlogo'] ?? null;
+            $clearLogo = TmdbService::rasterLogoUrl($seriesItem->metadata['clearlogo'] ?? null);
             if ($playlist->enable_logo_proxy) {
-                $cover = $this->proxyImageUrl($cover, self::posterProxyWidth());
-                $backdropPaths = array_map(fn ($path) => $this->proxyImageUrl($path, self::backdropProxyWidth()), $backdropPaths);
-                $clearLogo = $clearLogo ? $this->proxyImageUrl($clearLogo) : null;
+                $cover = $this->proxyImageUrl($cover, ImageProfile::Poster);
+                $backdropPaths = array_map(fn ($path) => $this->proxyImageUrl($path, ImageProfile::Backdrop), $backdropPaths);
+                $clearLogo = $clearLogo ? $this->proxyImageUrl($clearLogo, ImageProfile::TitleLogo) : null;
             }
 
             // Report the merged category id when this series' category is folded into one,
@@ -1358,9 +1301,12 @@ class XtreamApiController extends Controller
                     $seriesItem->metadata['vote_count'] ?? null,
                     0
                 ),
+                // Same wire key get_vod_info uses for movies.
+                'mpaa_rating' => $seriesItem->getContentRating() ?? '',
                 'backdrop_path' => $backdropPaths,
                 'tmdb' => (string) $tmdb,
                 'tmdb_id' => (int) ($tmdb ?: 0),
+                'imdb_id' => (string) ($seriesItem->getMovieDbIds()['imdb'] ?? ''),
                 'youtube_trailer' => $seriesItem->youtube_trailer ?? '',
                 'episode_run_time' => (string) ($seriesItem->episode_run_time ?? 0),
                 'category_id' => (string) ($seriesItem->category?->effective_id ?? $seriesItem->category_id ?? 'all'),
@@ -1377,7 +1323,7 @@ class XtreamApiController extends Controller
                 $castList = $seriesItem->metadata['cast_list'];
                 if ($playlist->enable_logo_proxy) {
                     $castList = array_map(function ($member) {
-                        $member['photo'] = $this->proxyImageUrl($member['photo'] ?? null, self::photoProxyWidth());
+                        $member['photo'] = $this->proxyImageUrl($member['photo'] ?? null, ImageProfile::Photo);
 
                         return $member;
                     }, $castList);
@@ -1392,19 +1338,36 @@ class XtreamApiController extends Controller
                 $seriesInfo['clearlogo'] = $clearLogo;
             }
 
+            // Marks a series the DVR created, so clients can tag it as recorded.
+            // Omitted for ordinary series, keeping those payloads unchanged.
+            if ($seriesItem->import_batch_no === 'dvr') {
+                $seriesInfo['dvr_recording'] = true;
+            }
+
+            // "More like this" - persisted on series->metadata['related_tmdb'] during TMDB
+            // enrichment, resolved here against the playlist's own VOD/series library.
+            // Absent on non-TMDB-enriched rows or when nothing in the library matches,
+            // so those responses stay byte-identical to today.
+            if (! empty($seriesItem->metadata['related_tmdb'])) {
+                $related = $this->resolveRelatedLibraryItems($seriesItem->metadata['related_tmdb'], $playlist, 'series', $seriesItem->id);
+                if (! empty($related)) {
+                    $seriesInfo['related'] = $related;
+                }
+            }
+
             $seasons = [];
             $episodesBySeason = [];
             if ($seriesItem->seasons && $seriesItem->seasons->isNotEmpty()) {
                 foreach ($seriesItem->seasons as $season) {
                     $seasonNumber = $season->season_number;
                     $seasonCover = $playlist->enable_logo_proxy && ($season->cover ?? false)
-                        ? $this->proxyImageUrl($season->cover, self::posterProxyWidth())
+                        ? $this->proxyImageUrl($season->cover, ImageProfile::Poster)
                         : $season->cover;
                     $tmdbCover = $playlist->enable_logo_proxy && ($seriesItem->metadata['cover_tmdb'] ?? false)
-                        ? $this->proxyImageUrl($seriesItem->metadata['cover_tmdb'], self::posterProxyWidth())
+                        ? $this->proxyImageUrl($seriesItem->metadata['cover_tmdb'], ImageProfile::Poster)
                         : ($seriesItem->metadata['cover_tmdb'] ?? null);
                     $coverBig = $playlist->enable_logo_proxy && ($season->cover_big ?? false)
-                        ? $this->proxyImageUrl($season->cover_big, self::posterProxyWidth())
+                        ? $this->proxyImageUrl($season->cover_big, ImageProfile::Poster)
                         : ($season->cover_big ?? null);
                     $seasons[] = [
                         'name' => $season->metadata['name'] ?? "Season {$seasonNumber}",
@@ -1417,6 +1380,7 @@ class XtreamApiController extends Controller
                         'cover_big' => $coverBig,
                         'releaseDate' => $season->metadata['release_date'] ?? $season->metadata['releaseDate'] ?? $season->metadata['air_date'] ?? '',
                         'duration' => (string) ($season->metadata['duration'] ?? 0),
+                        'youtube_trailer' => $season->metadata['youtube_trailer'] ?? '',
                     ];
                     $seasonEpisodes = [];
                     if ($season->episodes && $season->episodes->isNotEmpty()) {
@@ -1425,22 +1389,26 @@ class XtreamApiController extends Controller
                             $containerExtension = $episode->container_extension ?? 'mp4';
                             if ($episode->info['movie_image'] ?? false) {
                                 $movieImage = $playlist->enable_logo_proxy
-                                    ? $this->proxyImageUrl($episode->info['movie_image'], self::posterProxyWidth())
+                                    ? $this->proxyImageUrl($episode->info['movie_image'], ImageProfile::Poster)
                                     : $episode->info['movie_image'];
                             }
                             if ($episode->info['cover_big'] ?? false) {
                                 $movieImage = $playlist->enable_logo_proxy
-                                    ? $this->proxyImageUrl($episode->info['cover_big'], self::posterProxyWidth())
+                                    ? $this->proxyImageUrl($episode->info['cover_big'], ImageProfile::Poster)
                                     : $episode->info['cover_big'];
                             }
 
-                            $episodeEdlUrl = $dvrGranted
+                            $episodeDvrRecording = $dvrGranted
                                 && $episode->dvrRecording
                                 && $this->dvrRecordingVisibleToCaller($episode->dvrRecording, $authMethod, $playlistAuth)
-                                ? $this->dvrEdlUrl($episode->dvrRecording, $username, $password)
+                                ? $episode->dvrRecording
+                                : null;
+                            $episodeEdlUrl = $episodeDvrRecording
+                                ? $this->dvrEdlUrl($episodeDvrRecording, $username, $password)
                                 : null;
 
-                            $episodeInfo = $episode->info ?? [];
+                            // Internal bookkeeping, not part of the wire format.
+                            $episodeInfo = Arr::except($episode->info ?? [], DvrLibraryFallback::KEY);
                             if (array_key_exists('rating', $episodeInfo)) {
                                 $episodeInfo['rating'] = TmdbRating::suppressIfLowVotes(
                                     $episodeInfo['rating'],
@@ -1463,11 +1431,10 @@ class XtreamApiController extends Controller
                                 'custom_sid' => $episode->custom_sid ?? '',
                                 'stream_id' => $episode->id,
                                 'direct_source' => '',
-                                // Omitted for ordinary episodes — see get_vod_info.
-                                ...($episodeEdlUrl !== null ? [
-                                    'dvr_uuid' => $episode->dvrRecording->uuid,
-                                    'edl_url' => $episodeEdlUrl,
-                                ] : []),
+                                // Omitted for ordinary episodes - see get_vod_info.
+                                ...($episode->dvr_recording_id ? ['dvr_recording' => true] : []),
+                                ...($episodeDvrRecording ? $this->dvrRecordedFields($episodeDvrRecording) : []),
+                                ...($episodeEdlUrl !== null ? ['edl_url' => $episodeEdlUrl] : []),
                             ];
                         }
                     }
@@ -1537,10 +1504,11 @@ class XtreamApiController extends Controller
 
                     foreach ($fallbackGroups as $group) {
                         // Avoid duplicate category_ids
+                        $fallbackId = XtreamCategoryService::customPlaylistFallbackCategoryId($group->id);
                         $existingIds = array_column($liveCategories, 'category_id');
-                        if (! in_array((string) $group->id, $existingIds)) {
+                        if (! in_array($fallbackId, $existingIds)) {
                             $liveCategories[] = [
-                                'category_id' => (string) $group->id,
+                                'category_id' => $fallbackId,
                                 'category_name' => $group->name,
                                 'parent_id' => 0,
                                 'sort_order' => $group->sort_order ?? 999999,
@@ -1634,10 +1602,11 @@ class XtreamApiController extends Controller
 
                     foreach ($fallbackGroups as $group) {
                         // Avoid duplicate category_ids
+                        $fallbackId = XtreamCategoryService::customPlaylistFallbackCategoryId($group->id);
                         $existingIds = array_column($vodCategories, 'category_id');
-                        if (! in_array((string) $group->id, $existingIds)) {
+                        if (! in_array($fallbackId, $existingIds)) {
                             $vodCategories[] = [
-                                'category_id' => (string) $group->id,
+                                'category_id' => $fallbackId,
                                 'category_name' => $group->name,
                                 'parent_id' => 0,
                                 'sort_order' => $group->sort_order ?? 999999,
@@ -1735,10 +1704,11 @@ class XtreamApiController extends Controller
 
                     foreach ($fallbackCategories as $category) {
                         // Avoid duplicate category_ids
+                        $fallbackId = XtreamCategoryService::customPlaylistFallbackCategoryId($category->id);
                         $existingIds = array_column($seriesCategories, 'category_id');
-                        if (! in_array((string) $category->id, $existingIds)) {
+                        if (! in_array($fallbackId, $existingIds)) {
                             $seriesCategories[] = [
-                                'category_id' => (string) $category->id,
+                                'category_id' => $fallbackId,
                                 'category_name' => $category->name,
                                 'parent_id' => 0,
                                 'sort_order' => $category->sort_order ?? 999999,
@@ -1816,7 +1786,25 @@ class XtreamApiController extends Controller
                 // one-time cached fetch. Skip the TMDB dispatch (unrelated to freshness, and
                 // shouldn't be re-triggered on every client request), and don't fail the
                 // request if the live call errors - fall back to the cached data instead.
-                $channel->fetchMetadata(refresh: true, skipTmdb: true);
+                // With on-demand TMDB enrichment on, an enriched title keeps its TMDB fields
+                // rather than having this provider refresh overwrite them.
+                $channel->fetchMetadata(
+                    refresh: true,
+                    skipTmdb: true,
+                    preferTmdb: (bool) app(GeneralSettings::class)->tmdb_auto_enrich_on_fetch,
+                );
+            }
+
+            // On-demand TMDB enrichment: global opt-in (Settings > Integrations > TMDB >
+            // "Auto-enrichment on fetch"), for installs that don't run the bulk "Fetch TMDB
+            // Metadata" action. processVodChannel() is self-gating on existing tmdb_id/
+            // cast_list/etc., so once a title is enriched this is a cheap no-op on every
+            // later view - a one-time cost per title, persisted to $channel.
+            if (app(GeneralSettings::class)->tmdb_auto_enrich_on_fetch) {
+                $tmdb = app(TmdbService::class);
+                if ($tmdb->isConfigured()) {
+                    app(FetchTmdbIds::class)->processVodChannel($tmdb, $channel, backfillEnrichment: true);
+                }
             }
 
             // Build info section - use channel's info field if available, otherwise build from channel data
@@ -1829,19 +1817,23 @@ class XtreamApiController extends Controller
                 $backdropPaths = json_decode($backdropPaths, true) ?? [];
             }
             $backdropPaths = array_filter($backdropPaths);
-            $clearLogo = $info['clearlogo'] ?? null;
+            $clearLogo = TmdbService::rasterLogoUrl($info['clearlogo'] ?? null);
             if ($playlist->enable_logo_proxy) {
-                $cover = $this->proxyImageUrl($cover, self::posterProxyWidth());
-                $movieImage = $this->proxyImageUrl($movieImage, self::posterProxyWidth());
-                $backdropPaths = array_map(fn ($path) => $this->proxyImageUrl($path, self::backdropProxyWidth()), $backdropPaths);
-                $clearLogo = $clearLogo ? $this->proxyImageUrl($clearLogo) : null;
+                $cover = $this->proxyImageUrl($cover, ImageProfile::Poster);
+                $movieImage = $this->proxyImageUrl($movieImage, ImageProfile::Poster);
+                $backdropPaths = array_map(fn ($path) => $this->proxyImageUrl($path, ImageProfile::Backdrop), $backdropPaths);
+                $clearLogo = $clearLogo ? $this->proxyImageUrl($clearLogo, ImageProfile::TitleLogo) : null;
             }
 
             // Fill in missing info fields with channel data
             $defaultInfo = [
                 'kinopoisk_url' => $info['kinopoisk_url'] ?? '',
                 'tmdb_id' => $channel->getTmdbId() ?? 0,
-                'name' => $info['name'] ?? $channel->name,
+                'imdb_id' => (string) ($channel->getImdbId() ?? ''),
+                // Same title_custom/title precedence get_vod_streams uses, so a renamed
+                // title is reflected here too - o_name intentionally stays untouched,
+                // it's the original provider name.
+                'name' => $channel->title_custom ?? $channel->title,
                 'o_name' => $info['o_name'] ?? $channel->name,
                 'cover_big' => $cover,
                 'movie_image' => $movieImage,
@@ -1853,8 +1845,10 @@ class XtreamApiController extends Controller
                 'cast' => $info['cast'] ?? '',
                 'description' => $info['description'] ?? '',
                 'plot' => $info['plot'] ?? '',
-                'age' => $info['age'] ?? '',
-                'mpaa_rating' => $info['mpaa_rating'] ?? '',
+                // Same blank-provider fallback as mpaa_rating, for clients that only read `age`.
+                'age' => ($info['age'] ?? '') ?: ($info['tmdb_certification'] ?? ''),
+                // A blank provider value falls back to TMDB's persisted certification.
+                'mpaa_rating' => $channel->getContentRating() ?? '',
                 'rating_count_kinopoisk' => $info['rating_count_kinopoisk'] ?? 0,
                 'country' => $info['country'] ?? '',
                 'genre' => $info['genre'] ?? '',
@@ -1877,20 +1871,21 @@ class XtreamApiController extends Controller
             ];
 
             // When this library item was integrated from a DVR recording, hand
-            // back the recording's commercial-skip EDL so playback from Movies
-            // gets the same comskip support as playback from the Recordings
-            // screen — same file, so the EDL offsets apply unchanged. Keys are
-            // omitted entirely for ordinary VOD, keeping those payloads
-            // byte-identical to before.
+            // back when and where it was recorded, and the recording's
+            // commercial-skip EDL so playback from Movies gets the same comskip
+            // support as playback from the Recordings screen (same file, so the
+            // EDL offsets apply unchanged). Keys are omitted entirely for
+            // ordinary VOD, keeping those payloads byte-identical to before.
             if ($channel->dvr_recording_id && $this->canAdvertiseDvrFeature($playlist, $authMethod, $playlistAuth)) {
-                $dvrRecording = $channel->dvrRecording()->with(['dvrSetting', 'recordingRule'])->first();
-                $dvrEdlUrl = $dvrRecording && $this->dvrRecordingVisibleToCaller($dvrRecording, $authMethod, $playlistAuth)
-                    ? $this->dvrEdlUrl($dvrRecording, $username, $password)
-                    : null;
+                $dvrRecording = $channel->dvrRecording()->with(['dvrSetting', 'recordingRule', 'channel'])->first();
 
-                if ($dvrEdlUrl !== null) {
-                    $defaultInfo['dvr_uuid'] = $dvrRecording->uuid;
-                    $defaultInfo['edl_url'] = $dvrEdlUrl;
+                if ($dvrRecording && $this->dvrRecordingVisibleToCaller($dvrRecording, $authMethod, $playlistAuth)) {
+                    $defaultInfo = [...$defaultInfo, ...$this->dvrRecordedFields($dvrRecording)];
+
+                    $dvrEdlUrl = $this->dvrEdlUrl($dvrRecording, $username, $password);
+                    if ($dvrEdlUrl !== null) {
+                        $defaultInfo['edl_url'] = $dvrEdlUrl;
+                    }
                 }
             }
 
@@ -1906,7 +1901,7 @@ class XtreamApiController extends Controller
                 $castList = $info['cast_list'];
                 if ($playlist->enable_logo_proxy) {
                     $castList = array_map(function ($member) {
-                        $member['photo'] = $this->proxyImageUrl($member['photo'] ?? null, self::photoProxyWidth());
+                        $member['photo'] = $this->proxyImageUrl($member['photo'] ?? null, ImageProfile::Photo);
 
                         return $member;
                     }, $castList);
@@ -1921,16 +1916,35 @@ class XtreamApiController extends Controller
                 $defaultInfo['clearlogo'] = $clearLogo;
             }
 
+            // Marks a movie added from a DVR recording, for every viewer (the
+            // recorded-at fields above need DVR access). Omitted for ordinary VOD.
+            if ($channel->dvr_recording_id) {
+                $defaultInfo['dvr_recording'] = true;
+            }
+
+            // "More like this" - persisted on channel->info['related_tmdb'] during TMDB
+            // enrichment, resolved here against the playlist's own VOD/series library.
+            // Absent on non-TMDB-enriched rows or when nothing in the library matches,
+            // so those responses stay byte-identical to today.
+            if (! empty($info['related_tmdb'])) {
+                $related = $this->resolveRelatedLibraryItems($info['related_tmdb'], $playlist, 'movie', $channel->id);
+                if (! empty($related)) {
+                    $defaultInfo['related'] = $related;
+                }
+            }
+
             // Build movie_data section - use channel's movie_data field if available, otherwise build from channel data
             $movieData = $channel->movie_data ?? [];
 
             $extension = $movieData['container_extension'] ?? $channel->container_extension ?? 'mp4';
             $defaultMovieData = [
                 'stream_id' => $channel->id,
-                'name' => $movieData['name'] ?? $channel->name,
-                'title' => $movieData['title'] ?? $channel->name,
+                // Same title_custom/title precedence get_vod_streams uses, so a renamed
+                // title is reflected here too.
+                'name' => $channel->title_custom ?? $channel->title,
+                'title' => $channel->title_custom ?? $channel->title,
                 'year' => app(VodFileNameService::class)->resolveMovieYearAsInt($channel),
-                'added' => $movieData['added'] ?? (string) ($channel->created_at ? $channel->created_at->timestamp : time()),
+                'added' => $movieData['added'] ?? (string) (($channel->source_added_at ?? $channel->created_at)?->timestamp ?? time()),
                 'category_id' => (string) ($channel->group_id ?? ''),
                 'category_ids' => ($channel->group_id ? [(int) $channel->group_id] : []),
                 'container_extension' => $extension,
@@ -1945,6 +1959,44 @@ class XtreamApiController extends Controller
                 'info' => $defaultInfo,
                 'movie_data' => $defaultMovieData,
             ]));
+        } elseif ($action === 'get_actor_filmography') {
+            $personId = $request->input('person_id');
+            $name = trim((string) $request->input('name', ''));
+
+            if ((! $personId || ! is_numeric($personId)) && $name === '') {
+                return response()->json(['error' => 'person_id or name parameter is required for get_actor_filmography action'], 400);
+            }
+
+            $service = app(TmdbService::class);
+            $personId = $personId && is_numeric($personId) ? (int) $personId : 0;
+
+            if ($personId <= 0) {
+                $personId = (int) ($service->searchPersonIdByName($name) ?? 0);
+            }
+
+            if ($personId <= 0) {
+                return response()->json(['error' => 'Actor not found'], 404);
+            }
+
+            $person = $service->getPersonDetails($personId);
+
+            if (! $person) {
+                return response()->json(['error' => 'Actor not found'], 404);
+            }
+
+            if ($playlist->enable_logo_proxy && ! empty($person['photo'])) {
+                $person['photo'] = $this->proxyImageUrl($person['photo'], ImageProfile::Photo);
+            }
+
+            $credits = $this->resolveFilmographyLibraryMeta(
+                $service->getPersonCombinedCredits($personId),
+                $playlist
+            );
+
+            return response()->json([
+                'person' => $person,
+                'credits' => $credits,
+            ]);
         } elseif ($action === 'get_short_epg') {
             // Handle network playlists - return EPG from network schedule
             if ($isNetworkPlaylist) {
@@ -1971,6 +2023,20 @@ class XtreamApiController extends Controller
                 return response()->json(['error' => 'Channel not found'], 404);
             }
 
+            // Get programmes for today and tomorrow to ensure we have enough data
+            $today = Carbon::now()->format('Y-m-d');
+            $tomorrow = Carbon::now()->addDay()->format('Y-m-d');
+
+            // A channel whose AED profile replaces its guide
+            $aed = $this->aedProgrammesFor(collect([$channel]), $playlist, Carbon::parse($today)->startOfDay(), Carbon::parse($tomorrow)->endOfDay())[$channel->id] ?? null;
+            if ($aed !== null) {
+                return response()->json(['epg_listings' => $this->shortEpgListings(
+                    $aed['programmes'], $channel, 'aed-'.$aed['profile_id'],
+                    (string) ($channel->epgChannel?->channel_id ?? $channel->id),
+                    $playlist, $limit, (bool) $proxyEnabled, $disableCatchup,
+                )]);
+            }
+
             if (! $channel->epgChannel) {
                 return response()->json(['epg_listings' => []]);
             }
@@ -1983,10 +2049,6 @@ class XtreamApiController extends Controller
                 return response()->json(['epg_listings' => []]);
             }
 
-            // Get programmes for today and tomorrow to ensure we have enough data
-            $today = Carbon::now()->format('Y-m-d');
-            $tomorrow = Carbon::now()->addDay()->format('Y-m-d');
-
             $todayProgrammes = $cacheService->getCachedProgrammes($epg, $today, [$channel->epgChannel->channel_id]);
             $tomorrowProgrammes = $cacheService->getCachedProgrammes($epg, $tomorrow, [$channel->epgChannel->channel_id]);
 
@@ -1998,46 +2060,24 @@ class XtreamApiController extends Controller
                 $allProgrammes = array_merge($allProgrammes, $tomorrowProgrammes[$channel->epgChannel->channel_id]);
             }
 
-            // Check if channel is currently playing
-            $isNowPlaying = $proxyEnabled ? M3uProxyService::isChannelActive($channel) : false;
-
-            // Filter programmes to current time and future, then limit
-            $now = Carbon::now();
-            $epgListings = [];
-            $count = 0;
-
-            foreach ($allProgrammes as $programme) {
-                if ($count >= $limit) {
-                    break;
-                }
-
-                $startTime = Carbon::parse($programme['start']);
-                $endTime = Carbon::parse($programme['stop']);
-
-                // Include current programme and future programmes
-                if ($endTime->gt($now)) {
-                    $isCurrentProgramme = $startTime->lte($now) && $endTime->gt($now);
-
-                    $epgListings[] = [
-                        'id' => (string) ($programme['id'] ?? $count),
-                        'epg_id' => (string) $epg->id,
-                        'title' => $programme['title'] ?? '',
-                        'subtitle' => $programme['subtitle'] ?? '',
-                        'lang' => $programme['lang'] ?? 'en',
-                        'start' => $startTime->format('Y-m-d H:i:s'),
-                        'end' => $endTime->format('Y-m-d H:i:s'),
-                        'description' => $programme['desc'] ?? '',
-                        'channel_id' => $channel->epgChannel->channel_id,
-                        'start_timestamp' => (string) $startTime->timestamp,
-                        'stop_timestamp' => (string) $endTime->timestamp,
-                        'now_playing' => ($isCurrentProgramme && $isNowPlaying) ? 1 : 0,
-                        'has_archive' => (! $disableCatchup && $channel->catchup && $endTime->lt($now)) ? 1 : 0,
-                    ];
-                    $count++;
-                }
+            // A positive shift moves programmes from earlier dates into today, so fetch those too
+            $tvgShift = (int) ($channel->tvg_shift ?? 0);
+            if ($tvgShift > 0) {
+                $earlierProgrammes = $cacheService->getCachedProgrammesRange(
+                    $epg,
+                    Carbon::now()->subHours($tvgShift)->format('Y-m-d'),
+                    Carbon::now()->subDay()->format('Y-m-d'),
+                    [$channel->epgChannel->channel_id]
+                );
+                $allProgrammes = array_merge($earlierProgrammes[$channel->epgChannel->channel_id] ?? [], $allProgrammes);
             }
 
-            return response()->json(['epg_listings' => $epgListings]);
+            $allProgrammes = EpgCacheService::shiftProgrammes($allProgrammes, $tvgShift);
+
+            return response()->json(['epg_listings' => $this->shortEpgListings(
+                $allProgrammes, $channel, (string) $epg->id, (string) $channel->epgChannel->channel_id,
+                $playlist, $limit, (bool) $proxyEnabled, $disableCatchup,
+            )]);
         } elseif ($action === 'get_simple_data_table') {
             // Handle network playlists - return EPG from network schedule
             if ($isNetworkPlaylist) {
@@ -2087,6 +2127,7 @@ class XtreamApiController extends Controller
                     $allProgrammes = array_merge($allProgrammes, $programmes[$channel->epgChannel->channel_id]);
                 }
             }
+            $allProgrammes = EpgCacheService::shiftProgrammes($allProgrammes, (int) ($channel->tvg_shift ?? 0));
 
             $epgListings = [];
             if (! empty($allProgrammes)) {
@@ -2112,7 +2153,7 @@ class XtreamApiController extends Controller
                         'stop_timestamp' => (string) $endTime->timestamp,
                         'now_playing' => ($isCurrentProgramme && $isNowPlaying) ? 1 : 0,
                         'has_archive' => (! $disableCatchup && $channel->catchup && $endTime->lt($now)) ? 1 : 0,
-                    ];
+                    ] + $this->epgProgrammeArtwork($programme, $playlist);
                 }
             }
 
@@ -2133,6 +2174,7 @@ class XtreamApiController extends Controller
 
             $date = $request->input('date', Carbon::now()->format('Y-m-d'));
             $proxyEnabled = $playlist->enable_proxy;
+            $includeDetails = $request->boolean('details');
 
             // Load all requested channels in one query
             $channels = $playlist->channels()
@@ -2142,10 +2184,13 @@ class XtreamApiController extends Controller
                 ->get()
                 ->keyBy('id');
 
+            $nextDate = Carbon::parse($date)->addDay()->format('Y-m-d');
+            $aedProgrammes = $this->aedProgrammesFor($channels, $playlist, Carbon::parse($date)->startOfDay(), Carbon::parse($nextDate)->endOfDay());
+
             // Group channels by EPG source so each JSONL file is read once
             $epgGroups = [];
             foreach ($channels as $channel) {
-                if (! $channel->epgChannel) {
+                if (! $channel->epgChannel || isset($aedProgrammes[$channel->id])) {
                     continue;
                 }
                 $epgId = $channel->epgChannel->epg_id;
@@ -2161,8 +2206,17 @@ class XtreamApiController extends Controller
 
             $cacheService = new EpgCacheService;
             $now = Carbon::now();
-            $nextDate = Carbon::parse($date)->addDay()->format('Y-m-d');
             $result = [];
+
+            // Channels whose AED profile replaces their guide
+            foreach ($aedProgrammes as $streamId => $aed) {
+                $channel = $channels[$streamId];
+                $result[(string) $streamId] = ['epg_listings' => $this->epgBatchListings(
+                    $aed['programmes'], $channel, $streamId, $date, $nextDate, 'aed-'.$aed['profile_id'],
+                    (string) ($channel->epgChannel?->channel_id ?? $streamId),
+                    $playlist, (bool) $proxyEnabled, $disableCatchup, $includeDetails, $now,
+                )];
+            }
 
             foreach ($epgGroups as $group) {
                 $epg = $group['epg'];
@@ -2180,119 +2234,44 @@ class XtreamApiController extends Controller
                     $programmes[$channelId] = array_merge($programmes[$channelId], $progs);
                 }
 
+                // A positive shift moves programmes from earlier dates into the requested day,
+                // so fetch those for the positively shifted channels only
+                $positiveShifts = [];
                 foreach ($group['channelMap'] as $streamId => $epgChannelId) {
-                    $channelProgrammes = $programmes[$epgChannelId] ?? [];
+                    $tvgShift = (int) ($channels[$streamId]->tvg_shift ?? 0);
+                    if ($tvgShift > 0) {
+                        $positiveShifts[$epgChannelId] = max($tvgShift, $positiveShifts[$epgChannelId] ?? 0);
+                    }
+                }
+                $earlierProgrammes = [];
+                if (! empty($positiveShifts)) {
+                    $earlierProgrammes = $cacheService->getCachedProgrammesRange(
+                        $epg,
+                        Carbon::parse($date)->subHours(max($positiveShifts))->format('Y-m-d'),
+                        Carbon::parse($date)->subDay()->format('Y-m-d'),
+                        array_keys($positiveShifts)
+                    );
+                }
+                $dayStart = Carbon::parse($date)->startOfDay();
+
+                foreach ($group['channelMap'] as $streamId => $epgChannelId) {
                     $channel = $channels[$streamId];
+                    $tvgShift = (int) ($channel->tvg_shift ?? 0);
+                    $channelProgrammes = EpgCacheService::shiftProgrammes($programmes[$epgChannelId] ?? [], $tvgShift);
 
-                    // Fill gaps in EPG
-                    if (empty($channelProgrammes)) {
-                        $start = Carbon::parse($date)->startOfDay();
-                        $end = Carbon::parse($nextDate)->endOfDay();
-
-                        $current = $start->copy();
-                        while ($current->lt($end)) {
-                            $chunkEnd = $current->copy()->addHour();
-                            if ($chunkEnd->gt($end)) {
-                                $chunkEnd = $end->copy();
-                            }
-
-                            $channelProgrammes[] = [
-                                'id' => 'dummy-'.md5($streamId.$current->timestamp),
-                                'title' => $channel->name ?? 'Unknown Channel',
-                                'desc' => 'No information available',
-                                'start' => $current->format('Y-m-d H:i:s'),
-                                'stop' => $chunkEnd->format('Y-m-d H:i:s'),
-                                'lang' => 'en',
-                            ];
-                            $current = $chunkEnd;
-                        }
-                    } else {
-                        usort($channelProgrammes, function ($a, $b) {
-                            return strcmp($a['start'], $b['start']);
-                        });
-
-                        $filled = [];
-                        $lastEnd = Carbon::parse($date)->startOfDay();
-                        $finalEnd = Carbon::parse($nextDate)->endOfDay();
-
-                        foreach ($channelProgrammes as $prog) {
-                            $start = Carbon::parse($prog['start']);
-                            $stop = Carbon::parse($prog['stop']);
-
-                            if ($start->gt($lastEnd) && $start->diffInMinutes($lastEnd) > 1) {
-                                $gapStart = $lastEnd->copy();
-                                while ($gapStart->lt($start)) {
-                                    $gapEnd = $gapStart->copy()->addHour();
-                                    if ($gapEnd->gt($start)) {
-                                        $gapEnd = $start->copy();
-                                    }
-
-                                    $filled[] = [
-                                        'id' => 'dummy-'.md5($streamId.$gapStart->timestamp),
-                                        'title' => $channel->name ?? 'Unknown Channel',
-                                        'desc' => 'No information available',
-                                        'start' => $gapStart->format('Y-m-d H:i:s'),
-                                        'stop' => $gapEnd->format('Y-m-d H:i:s'),
-                                        'lang' => 'en',
-                                    ];
-                                    $gapStart = $gapEnd;
-                                }
-                            }
-
-                            $filled[] = $prog;
-
-                            if ($stop->gt($lastEnd)) {
-                                $lastEnd = $stop;
-                            }
-                        }
-
-                        if ($finalEnd->gt($lastEnd) && $finalEnd->diffInMinutes($lastEnd) > 1) {
-                            $gapStart = $lastEnd->copy();
-                            while ($gapStart->lt($finalEnd)) {
-                                $gapEnd = $gapStart->copy()->addHour();
-                                if ($gapEnd->gt($finalEnd)) {
-                                    $gapEnd = $finalEnd->copy();
-                                }
-
-                                $filled[] = [
-                                    'id' => 'dummy-'.md5($streamId.$gapStart->timestamp),
-                                    'title' => $channel->name ?? 'Unknown Channel',
-                                    'desc' => 'No information available',
-                                    'start' => $gapStart->format('Y-m-d H:i:s'),
-                                    'stop' => $gapEnd->format('Y-m-d H:i:s'),
-                                    'lang' => 'en',
-                                ];
-                                $gapStart = $gapEnd;
-                            }
-                        }
-                        $channelProgrammes = $filled;
+                    // Keep only the earlier-dated programmes that now reach into the requested day
+                    if ($tvgShift > 0 && ! empty($earlierProgrammes[$epgChannelId])) {
+                        $shiftedIn = array_filter(
+                            EpgCacheService::shiftProgrammes($earlierProgrammes[$epgChannelId], $tvgShift),
+                            fn ($programme) => ! empty($programme['stop']) && Carbon::parse($programme['stop'])->gt($dayStart)
+                        );
+                        $channelProgrammes = array_merge(array_values($shiftedIn), $channelProgrammes);
                     }
 
-                    $isNowPlaying = $proxyEnabled ? M3uProxyService::isChannelActive($channel) : false;
-
-                    $epgListings = [];
-                    foreach ($channelProgrammes as $index => $programme) {
-                        $startTime = Carbon::parse($programme['start']);
-                        $endTime = Carbon::parse($programme['stop']);
-                        $isCurrentProgramme = $startTime->lte($now) && $endTime->gt($now);
-
-                        $epgListings[] = [
-                            'id' => (string) ($programme['id'] ?? $index),
-                            'epg_id' => (string) $epg->id,
-                            'title' => base64_encode($programme['title'] ?? ''),
-                            'subtitle' => base64_encode($programme['subtitle'] ?? ''),
-                            'description' => base64_encode($programme['desc'] ?? ''),
-                            'lang' => $programme['lang'] ?? 'en',
-                            'start' => $startTime->format('Y-m-d H:i:s'),
-                            'end' => $endTime->format('Y-m-d H:i:s'),
-                            'channel_id' => $epgChannelId,
-                            'start_timestamp' => (string) $startTime->timestamp,
-                            'stop_timestamp' => (string) $endTime->timestamp,
-                            'now_playing' => ($isCurrentProgramme && $isNowPlaying) ? 1 : 0,
-                            'has_archive' => (! $disableCatchup && $channel->catchup && $endTime->lt($now)) ? 1 : 0,
-                        ];
-                    }
-                    $result[(string) $streamId] = ['epg_listings' => $epgListings];
+                    $result[(string) $streamId] = ['epg_listings' => $this->epgBatchListings(
+                        $channelProgrammes, $channel, $streamId, $date, $nextDate, (string) $epg->id, $epgChannelId,
+                        $playlist, (bool) $proxyEnabled, $disableCatchup, $includeDetails, $now,
+                    )];
                 }
             }
 
@@ -2335,12 +2314,36 @@ class XtreamApiController extends Controller
             return $this->requestStatus($request, $playlist, $authMethod, $playlistAuth);
         } elseif ($action === 'request_dismiss') {
             return $this->dismissRequest($request, $playlist, $authMethod, $playlistAuth);
+        } elseif ($action === TvClientConfigService::ACTION) {
+            $tvClientConfig = app(TvClientConfigService::class);
+
+            return response()->json($tvClientConfig->payload(
+                $tvClientConfig->resolveProfile($playlist, $authMethod, $playlistAuth),
+                $tvClientConfig->resolveHomeScreen($playlist),
+                $tvClientConfig->rowKindsFrom($request->input('row_kinds')),
+            ));
         } elseif ($action === 'm3u_editor_register_publisher') {
             return $this->registerManagedLibraryPublisher($request, $playlist, $authMethod, $playlistAuth);
         } elseif ($action === 'm3u_editor_catalog') {
             return $this->managedLibraryCatalog($request, $playlist, $authMethod, $playlistAuth);
         } elseif ($action === 'm3u_editor_sync_result') {
             return $this->managedLibrarySyncResult($request, $playlist, $authMethod, $playlistAuth);
+        } elseif (in_array($action, self::SPORTS_ACTIONS, true)) {
+            // Every Sports action is gated on the same setting that advertises
+            // the `sports` feature, so a client never shown Sports can't use it.
+            if (! app(SportsService::class)->isEnabled()) {
+                return response()->json(['error' => 'Sports is not enabled'], 403);
+            }
+
+            return match ($action) {
+                'get_sports_fixtures' => $this->sportsFixtures($request),
+                'get_sports_channels' => $this->sportsChannels($request, $playlist),
+                'get_sports_fixture_details' => $this->sportsFixtureDetails($request),
+                'get_sports_teams' => $this->sportsTeams($request),
+                'get_sports_follows' => $this->sportsFollows($request, $playlist, $authMethod, $username, $password),
+                'toggle_sports_follow' => $this->toggleSportsFollow($request, $playlist, $authMethod, $username, $password),
+                'sync_sports_follows' => $this->syncSportsFollows($request, $playlist, $authMethod, $username, $password),
+            };
         } elseif (in_array($action, self::DVR_ACTIONS, true)) {
             $dvrPlaylist = $this->resolveDvrPlaylist($playlist);
 
@@ -2370,6 +2373,236 @@ class XtreamApiController extends Controller
         } else {
             return response()->json(['error' => 'Invalid action parameter'], 400);
         }
+    }
+
+    /**
+     * Games for the M3U TV Sports screen (`get_sports_fixtures`): every
+     * fixture of the requested competitions starting in [from, to), with
+     * live state and scores. Only served while Settings > Integrations >
+     * Sports API is enabled, which is also what advertises the `sports` feature.
+     *
+     * `leagues` is a comma-separated list of league ids from the auth
+     * payload's `m3u_editor.sports.leagues`; `from` and `to` are Unix
+     * timestamps (seconds). Spans past `max_range_days` are cut short.
+     */
+    private function sportsFixtures(Request $request): JsonResponse
+    {
+        $sports = app(SportsService::class);
+
+        $validator = Validator::make($request->all(), [
+            'leagues' => ['required', 'string', 'max:'.self::SPORTS_LEAGUES_MAX_LENGTH],
+            'from' => ['required', 'integer', 'min:0'],
+            'to' => ['required', 'integer', 'gt:from'],
+        ]);
+        if ($validator->fails()) {
+            return response()->json(['error' => 'Invalid parameters', 'fields' => $validator->errors()->keys()], 422);
+        }
+
+        $leagueIds = array_values(array_filter(array_map('trim', explode(',', (string) $request->input('leagues')))));
+
+        return response()->json([
+            'fixtures' => $sports->fixtures(
+                $leagueIds,
+                Carbon::createFromTimestampUTC((int) $request->input('from')),
+                Carbon::createFromTimestampUTC((int) $request->input('to')),
+            ),
+        ]);
+    }
+
+    /**
+     * The playlist's channels showing each game (`get_sports_channels`), keyed
+     * by `{league_id}:{fixture_id}`, strongest match first. Takes the same
+     * parameters as `get_sports_fixtures`, but matching reads the guide, so
+     * only one day at a time: clients ask for it after showing that day's games.
+     */
+    private function sportsChannels(Request $request, $playlist): JsonResponse
+    {
+        $validator = Validator::make($request->all(), [
+            'leagues' => ['required', 'string', 'max:'.self::SPORTS_LEAGUES_MAX_LENGTH],
+            'from' => ['required', 'integer', 'min:0'],
+            'to' => ['required', 'integer', 'gt:from', 'max:'.((int) $request->input('from') + self::SPORTS_CHANNELS_MAX_RANGE_SECONDS)],
+        ]);
+        if ($validator->fails()) {
+            return response()->json(['error' => 'Invalid parameters', 'fields' => $validator->errors()->keys()], 422);
+        }
+
+        $leagueIds = array_values(array_filter(array_map('trim', explode(',', (string) $request->input('leagues')))));
+
+        return response()->json([
+            'channels' => (object) app(SportsChannelMatcher::class)->channelsFor(
+                $playlist,
+                $leagueIds,
+                Carbon::createFromTimestampUTC((int) $request->input('from')),
+                Carbon::createFromTimestampUTC((int) $request->input('to')),
+            ),
+        ]);
+    }
+
+    /**
+     * One game's details (`get_sports_fixture_details`): line score, key
+     * events, team stats, leaders and game info, as far as the provider has
+     * them. `league` and `fixture` are the game's `league_id` and `id` from
+     * `get_sports_fixtures`; `details` is null when the provider has nothing.
+     */
+    private function sportsFixtureDetails(Request $request): JsonResponse
+    {
+        $validator = Validator::make($request->all(), [
+            'league' => ['required', 'string', 'max:100'],
+            'fixture' => ['required', 'string', 'max:64', 'regex:/^[A-Za-z0-9._-]+$/'],
+        ]);
+        if ($validator->fails()) {
+            return response()->json(['error' => 'Invalid parameters', 'fields' => $validator->errors()->keys()], 422);
+        }
+
+        return response()->json([
+            'details' => app(SportsService::class)->fixtureDetails(
+                (string) $request->input('league'),
+                (string) $request->input('fixture'),
+            ),
+        ]);
+    }
+
+    /**
+     * Every team of one competition (`get_sports_teams`), for the TV's team
+     * browser: `league` is a league id from `m3u_editor.sports.leagues`.
+     */
+    private function sportsTeams(Request $request): JsonResponse
+    {
+        $sports = app(SportsService::class);
+        $leagueId = (string) $request->input('league', '');
+        if ($sports->findLeague($leagueId) === null) {
+            return response()->json(['error' => 'Invalid parameters', 'fields' => ['league']], 422);
+        }
+
+        return response()->json(['teams' => $sports->teams($leagueId)]);
+    }
+
+    /**
+     * The viewer's followed teams (`get_sports_follows`), oldest first.
+     */
+    private function sportsFollows(Request $request, $playlist, string $authMethod, string $username, string $password): JsonResponse
+    {
+        $viewer = $this->resolveContextViewer($request, $playlist, $authMethod, $username, $password);
+        if (! $viewer) {
+            return response()->json(['error' => 'Viewer not found'], 404);
+        }
+
+        return response()->json(['follows' => $this->presentSportsFollows($viewer)]);
+    }
+
+    /**
+     * Follow or stop following one team (`toggle_sports_follow`). Idempotent;
+     * answers with the viewer's whole list.
+     */
+    private function toggleSportsFollow(Request $request, $playlist, string $authMethod, string $username, string $password): JsonResponse
+    {
+        $followed = $request->boolean('followed', true);
+        $validator = Validator::make($request->all(), [
+            'team_key' => ['required', 'string', 'max:120', 'regex:'.self::SPORTS_TEAM_KEY_PATTERN],
+            'name' => [$followed ? 'required' : 'nullable', 'string', 'max:255'],
+        ]);
+        $key = $this->parseSportsTeamKey((string) $request->input('team_key'));
+        if ($validator->fails() || $key === null) {
+            return response()->json(['error' => 'Invalid parameters', 'fields' => $validator->errors()->keys() ?: ['team_key']], 422);
+        }
+
+        $viewer = $this->resolveContextViewer($request, $playlist, $authMethod, $username, $password);
+        if (! $viewer) {
+            return response()->json(['error' => 'Viewer not found'], 404);
+        }
+
+        if ($followed) {
+            $this->storeSportsFollow($viewer, (string) $request->input('team_key'), $key, (string) $request->input('name'));
+        } else {
+            $viewer->sportsFollows()->where('team_key', $request->input('team_key'))->delete();
+        }
+
+        return response()->json(['follows' => $this->presentSportsFollows($viewer)]);
+    }
+
+    /**
+     * Union the posted follows into the viewer's (`sync_sports_follows`):
+     * how a device's follows from before syncing join the account. Never
+     * removes one; answers with the merged list.
+     */
+    private function syncSportsFollows(Request $request, $playlist, string $authMethod, string $username, string $password): JsonResponse
+    {
+        $items = $request->input('follows', []);
+        if (! is_array($items)) {
+            return response()->json(['error' => 'Invalid parameters', 'fields' => ['follows']], 422);
+        }
+
+        $viewer = $this->resolveContextViewer($request, $playlist, $authMethod, $username, $password);
+        if (! $viewer) {
+            return response()->json(['error' => 'Viewer not found'], 404);
+        }
+
+        foreach (array_slice($items, 0, 500) as $item) {
+            $teamKey = is_array($item) ? ($item['team_key'] ?? null) : null;
+            $name = is_array($item) ? ($item['name'] ?? null) : null;
+            if (! is_string($teamKey) || ! is_string($name) || $name === '' || mb_strlen($name) > 255) {
+                continue;
+            }
+            $key = $this->parseSportsTeamKey($teamKey);
+            if ($key !== null) {
+                $this->storeSportsFollow($viewer, $teamKey, $key, $name);
+            }
+        }
+
+        return response()->json(['follows' => $this->presentSportsFollows($viewer)]);
+    }
+
+    /**
+     * The league and team ids of a follow key, or null when it isn't one or
+     * names a league this server doesn't offer.
+     *
+     * @return array{league_id: string, team_id: string}|null
+     */
+    private function parseSportsTeamKey(string $teamKey): ?array
+    {
+        if (! preg_match(self::SPORTS_TEAM_KEY_PATTERN, $teamKey, $matches)
+            || app(SportsService::class)->findLeague($matches[1]) === null) {
+            return null;
+        }
+
+        return ['league_id' => $matches[1], 'team_id' => $matches[2]];
+    }
+
+    /**
+     * @param  array{league_id: string, team_id: string}  $key
+     */
+    private function storeSportsFollow(PlaylistViewer $viewer, string $teamKey, array $key, string $name): void
+    {
+        $viewer->sportsFollows()->updateOrCreate(
+            ['team_key' => $teamKey],
+            [...$key, 'name' => $name],
+        );
+    }
+
+    /**
+     * A viewer's follows as clients read them. Crests come from the cached
+     * team list through the logo proxy rather than being stored, so a follow
+     * never holds a stale proxy URL.
+     *
+     * @return list<array<string, mixed>>
+     */
+    private function presentSportsFollows(PlaylistViewer $viewer): array
+    {
+        $follows = $viewer->sportsFollows()->orderBy('followed_at')->orderBy('id')->get();
+        $sports = app(SportsService::class);
+        $logos = [];
+        foreach ($follows->pluck('league_id')->unique() as $leagueId) {
+            $logos[$leagueId] = array_column($sports->teams($leagueId), 'logo', 'id');
+        }
+
+        return $follows->map(fn ($follow): array => [
+            'team_key' => $follow->team_key,
+            'league_id' => $follow->league_id,
+            'team_id' => $follow->team_id,
+            'name' => $follow->name,
+            'logo' => $logos[$follow->league_id][$follow->team_id] ?? null,
+            'followed_at' => $follow->followed_at?->toIso8601ZuluString(),
+        ])->values()->all();
     }
 
     /**
@@ -2447,12 +2680,12 @@ class XtreamApiController extends Controller
             ->get();
 
         // Build a mapping of group name -> stable category ID
-        $categoryMap = $this->buildNetworkCategoryMap($networks);
+        $categoryMap = $this->buildNetworkCategoryMap($playlist, $networks);
 
         $liveStreams = [];
         foreach ($networks as $network) {
             $streamIcon = $network->logo ?: $baseUrl.'/placeholder.png';
-            $categoryId = $categoryMap[$network->effective_group_name] ?? 'networks';
+            $categoryId = $categoryMap[$network->effective_group_name] ?? 0;
 
             $liveStreams[] = [
                 'num' => $network->channel_number ?? $network->id,
@@ -2481,15 +2714,18 @@ class XtreamApiController extends Controller
      */
     private function getNetworkLiveCategories(Playlist $playlist): \Illuminate\Http\JsonResponse
     {
-        $networks = $playlist->networks()->where('enabled', true)->get();
+        $networks = $playlist->networks()
+            ->where('enabled', true)
+            ->orderBy('channel_number')
+            ->get();
 
         if ($networks->isEmpty()) {
             return response()->json([]);
         }
 
-        $categoryMap = $this->buildNetworkCategoryMap($networks);
+        $categoryMap = $this->buildNetworkCategoryMap($playlist, $networks);
 
-        $categories = collect($categoryMap)->map(fn (string $id, string $name) => [
+        $categories = collect($categoryMap)->map(fn (int $id, string $name) => [
             'category_id' => $id,
             'category_name' => $name,
             'parent_id' => 0,
@@ -2501,17 +2737,22 @@ class XtreamApiController extends Controller
     /**
      * Build a consistent mapping of network group name to category ID.
      *
+     * The IDs are the primary keys of the Group rows NetworkChannelSyncService
+     * projects for each network: numeric (so Xtream consumers like
+     * ProcessM3uImport can bind them against bigint source group columns,
+     * issue #1303) and stable across requests.
+     *
      * @param  Collection<int, Network>  $networks
-     * @return array<string, string>
+     * @return array<string, int>
      */
-    private function buildNetworkCategoryMap(Collection $networks): array
+    private function buildNetworkCategoryMap(Playlist $playlist, Collection $networks): array
     {
-        $index = 1;
+        $names = $networks->map(fn (Network $network) => $network->effective_group_name)->unique()->values();
+        $groupIds = $playlist->groups()->whereIn('name', $names)->pluck('id', 'name');
 
-        return $networks
-            ->map(fn (Network $network) => $network->effective_group_name)
-            ->unique()
-            ->mapWithKeys(fn (string $name) => [$name => 'network-group-'.($index++)])
+        return $names
+            ->filter(fn (string $name) => $groupIds->has($name))
+            ->mapWithKeys(fn (string $name) => [$name => (int) $groupIds[$name]])
             ->all();
     }
 
@@ -2630,6 +2871,350 @@ class XtreamApiController extends Controller
             'now_playing' => $isCurrentProgramme ? 1 : 0,
             'has_archive' => 0,
         ];
+    }
+
+    /**
+     * AED programmes for the [$channels] whose AED profile (their own, else
+     * their group's) replaces the guide: any profile with Override on, or any
+     * profile on a channel with no EPG mapped. These are the same channels
+     * xmltv.php and the JSON EPG API build from AED. Keyed by channel id, as
+     * cached programmes (UTC ISO times) plus the profile id; channels whose
+     * profile resolves no event map to an empty list.
+     *
+     * @param  Collection<int, Channel>  $channels
+     * @param  Playlist|CustomPlaylist|MergedPlaylist|PlaylistAlias  $playlist
+     * @return array<int, array{profile_id: int, programmes: list<array<string, mixed>>}>
+     */
+    private function aedProgrammesFor(Collection $channels, $playlist, Carbon $windowStart, Carbon $windowEnd): array
+    {
+        $groupProfileIds = Group::query()
+            ->whereIn('id', $channels->pluck('group_id')->filter()->unique()->values())
+            ->whereNotNull('aed_profile_id')
+            ->pluck('aed_profile_id', 'id');
+
+        $profileIdFor = fn (Channel $channel): ?int => $channel->aed_profile_id ?? $groupProfileIds[$channel->group_id] ?? null;
+        $profileIds = $channels->map($profileIdFor)->filter()->unique()->values();
+        if ($profileIds->isEmpty()) {
+            return [];
+        }
+
+        $profiles = AedProfile::query()
+            ->whereIn('id', $profileIds)
+            ->where('user_id', $playlist->user_id)
+            ->get()
+            ->keyBy('id');
+
+        $extractor = app(AedExtractorService::class);
+        $result = [];
+        foreach ($channels as $channel) {
+            $profile = $profiles->get($profileIdFor($channel));
+            if (! $profile || (! $profile->override && $channel->epgChannel)) {
+                continue;
+            }
+
+            $days = (int) ($profile->dummy_epg_days ?? $playlist->dummy_epg_days ?? 5);
+            $programmes = [];
+            foreach ($extractor->programmes($profile, (string) ($channel->title_custom ?? $channel->title), $windowStart, $windowEnd, $days) ?? [] as $programme) {
+                $programmes[] = [
+                    'id' => 'aed-'.md5($channel->id.'-'.$programme['start']->timestamp),
+                    'start' => $programme['start']->toISOString(),
+                    'stop' => $programme['stop']->toISOString(),
+                    'title' => $programme['title'],
+                    'desc' => $programme['desc'] ?? $programme['title'],
+                    'icon' => $programme['icon'],
+                    'category' => $programme['category'],
+                    'lang' => 'en',
+                ];
+            }
+            $result[$channel->id] = ['profile_id' => $profile->id, 'programmes' => $programmes];
+        }
+
+        return $result;
+    }
+
+    /**
+     * One channel's `get_short_epg` listings: the programme on now and the
+     * ones after it, at most [$limit].
+     *
+     * @param  list<array<string, mixed>>  $programmes
+     * @param  Playlist|CustomPlaylist|MergedPlaylist|PlaylistAlias  $playlist
+     * @return list<array<string, mixed>>
+     */
+    private function shortEpgListings(
+        array $programmes,
+        Channel $channel,
+        string $epgId,
+        string $epgChannelId,
+        $playlist,
+        int $limit,
+        bool $proxyEnabled,
+        bool $disableCatchup,
+    ): array {
+        // Check if channel is currently playing
+        $isNowPlaying = $proxyEnabled ? M3uProxyService::isChannelActive($channel) : false;
+
+        // Filter programmes to current time and future, then limit
+        $now = Carbon::now();
+        $epgListings = [];
+        $count = 0;
+
+        foreach ($programmes as $programme) {
+            if ($count >= $limit) {
+                break;
+            }
+
+            $startTime = Carbon::parse($programme['start']);
+            $endTime = Carbon::parse($programme['stop']);
+
+            // Include current programme and future programmes
+            if ($endTime->gt($now)) {
+                $isCurrentProgramme = $startTime->lte($now) && $endTime->gt($now);
+
+                $epgListings[] = [
+                    'id' => (string) ($programme['id'] ?? $count),
+                    'epg_id' => $epgId,
+                    'title' => $programme['title'] ?? '',
+                    'subtitle' => $programme['subtitle'] ?? '',
+                    'lang' => $programme['lang'] ?? 'en',
+                    'start' => $startTime->format('Y-m-d H:i:s'),
+                    'end' => $endTime->format('Y-m-d H:i:s'),
+                    'description' => $programme['desc'] ?? '',
+                    'channel_id' => $epgChannelId,
+                    'start_timestamp' => (string) $startTime->timestamp,
+                    'stop_timestamp' => (string) $endTime->timestamp,
+                    'now_playing' => ($isCurrentProgramme && $isNowPlaying) ? 1 : 0,
+                    'has_archive' => (! $disableCatchup && $channel->catchup && $endTime->lt($now)) ? 1 : 0,
+                ] + $this->epgProgrammeArtwork($programme, $playlist);
+                $count++;
+            }
+        }
+
+        return $epgListings;
+    }
+
+    /**
+     * One channel's `get_epg_batch` listings: [$channelProgrammes] sorted, every
+     * gap from the start of [$date] to the end of [$nextDate] filled with
+     * hour-long "No information available" slots (the whole range when there
+     * are none), then shaped for the wire.
+     *
+     * @param  list<array<string, mixed>>  $channelProgrammes
+     * @param  Playlist|CustomPlaylist|MergedPlaylist|PlaylistAlias  $playlist
+     * @return list<array<string, mixed>>
+     */
+    private function epgBatchListings(
+        array $channelProgrammes,
+        Channel $channel,
+        int $streamId,
+        string $date,
+        string $nextDate,
+        string $epgId,
+        string $epgChannelId,
+        $playlist,
+        bool $proxyEnabled,
+        bool $disableCatchup,
+        bool $includeDetails,
+        Carbon $now,
+    ): array {
+        // Fill gaps in EPG
+        if (empty($channelProgrammes)) {
+            $start = Carbon::parse($date)->startOfDay();
+            $end = Carbon::parse($nextDate)->endOfDay();
+
+            $current = $start->copy();
+            while ($current->lt($end)) {
+                $chunkEnd = $current->copy()->addHour();
+                if ($chunkEnd->gt($end)) {
+                    $chunkEnd = $end->copy();
+                }
+
+                $channelProgrammes[] = [
+                    'id' => 'dummy-'.md5($streamId.$current->timestamp),
+                    'title' => $channel->name ?? 'Unknown Channel',
+                    'desc' => 'No information available',
+                    'start' => $current->format('Y-m-d H:i:s'),
+                    'stop' => $chunkEnd->format('Y-m-d H:i:s'),
+                    'lang' => 'en',
+                ];
+                $current = $chunkEnd;
+            }
+        } else {
+            usort($channelProgrammes, function ($a, $b) {
+                return strcmp($a['start'], $b['start']);
+            });
+
+            $filled = [];
+            $lastEnd = Carbon::parse($date)->startOfDay();
+            $finalEnd = Carbon::parse($nextDate)->endOfDay();
+
+            foreach ($channelProgrammes as $prog) {
+                $start = Carbon::parse($prog['start']);
+                $stop = Carbon::parse($prog['stop']);
+
+                if ($start->gt($lastEnd) && $start->diffInMinutes($lastEnd) > 1) {
+                    $gapStart = $lastEnd->copy();
+                    while ($gapStart->lt($start)) {
+                        $gapEnd = $gapStart->copy()->addHour();
+                        if ($gapEnd->gt($start)) {
+                            $gapEnd = $start->copy();
+                        }
+
+                        $filled[] = [
+                            'id' => 'dummy-'.md5($streamId.$gapStart->timestamp),
+                            'title' => $channel->name ?? 'Unknown Channel',
+                            'desc' => 'No information available',
+                            'start' => $gapStart->format('Y-m-d H:i:s'),
+                            'stop' => $gapEnd->format('Y-m-d H:i:s'),
+                            'lang' => 'en',
+                        ];
+                        $gapStart = $gapEnd;
+                    }
+                }
+
+                $filled[] = $prog;
+
+                if ($stop->gt($lastEnd)) {
+                    $lastEnd = $stop;
+                }
+            }
+
+            if ($finalEnd->gt($lastEnd) && $finalEnd->diffInMinutes($lastEnd) > 1) {
+                $gapStart = $lastEnd->copy();
+                while ($gapStart->lt($finalEnd)) {
+                    $gapEnd = $gapStart->copy()->addHour();
+                    if ($gapEnd->gt($finalEnd)) {
+                        $gapEnd = $finalEnd->copy();
+                    }
+
+                    $filled[] = [
+                        'id' => 'dummy-'.md5($streamId.$gapStart->timestamp),
+                        'title' => $channel->name ?? 'Unknown Channel',
+                        'desc' => 'No information available',
+                        'start' => $gapStart->format('Y-m-d H:i:s'),
+                        'stop' => $gapEnd->format('Y-m-d H:i:s'),
+                        'lang' => 'en',
+                    ];
+                    $gapStart = $gapEnd;
+                }
+            }
+            $channelProgrammes = $filled;
+        }
+
+        $isNowPlaying = $proxyEnabled ? M3uProxyService::isChannelActive($channel) : false;
+
+        $epgListings = [];
+        foreach ($channelProgrammes as $index => $programme) {
+            $startTime = Carbon::parse($programme['start']);
+            $endTime = Carbon::parse($programme['stop']);
+            $isCurrentProgramme = $startTime->lte($now) && $endTime->gt($now);
+
+            $listing = [
+                'id' => (string) ($programme['id'] ?? $index),
+                'epg_id' => $epgId,
+                'title' => base64_encode($programme['title'] ?? ''),
+                'subtitle' => base64_encode($programme['subtitle'] ?? ''),
+                'description' => base64_encode($programme['desc'] ?? ''),
+                'lang' => $programme['lang'] ?? 'en',
+                'start' => $startTime->format('Y-m-d H:i:s'),
+                'end' => $endTime->format('Y-m-d H:i:s'),
+                'channel_id' => $epgChannelId,
+                'start_timestamp' => (string) $startTime->timestamp,
+                'stop_timestamp' => (string) $endTime->timestamp,
+                'now_playing' => ($isCurrentProgramme && $isNowPlaying) ? 1 : 0,
+                'has_archive' => (! $disableCatchup && $channel->catchup && $endTime->lt($now)) ? 1 : 0,
+            ];
+            if ($includeDetails) {
+                $listing += $this->epgProgrammeDetails($programme, $playlist);
+            }
+            $epgListings[] = $listing;
+        }
+
+        return $epgListings;
+    }
+
+    /**
+     * Extended programme metadata for `get_epg_batch` when the client passes
+     * `details=1` (m3u-tv's guide preview). Values the source doesn't carry
+     * are omitted rather than sent empty, keeping the batch payload small.
+     *
+     * @param  array<string, mixed>  $programme
+     * @param  Playlist|CustomPlaylist|MergedPlaylist|PlaylistAlias  $playlist
+     * @return array{poster_url?: string, poster_width?: int, poster_height?: int, backdrop_url?: string, still_url?: string, still_width?: int, still_height?: int, icon?: string, category?: string, rating?: string, season?: int, episode?: int, is_new?: int, premiere?: int, previously_shown?: int, year?: int}
+     */
+    private function epgProgrammeDetails(array $programme, $playlist): array
+    {
+        $details = $this->epgProgrammeArtwork($programme, $playlist);
+
+        $icon = trim((string) (EpgProgrammeArtwork::wide($programme['images'] ?? null)['url'] ?? $programme['icon'] ?? ''));
+        if ($icon !== '' && filter_var($icon, FILTER_VALIDATE_URL)) {
+            $details['icon'] = $this->epgProgrammeImageUrl($icon, $playlist);
+        }
+
+        foreach (['category', 'rating'] as $key) {
+            $value = trim((string) ($programme[$key] ?? ''));
+            if ($value !== '') {
+                $details[$key] = $value;
+            }
+        }
+
+        [$season, $episode] = EpisodeNumberParser::fromProgramme($programme);
+        if ($season !== null) {
+            $details['season'] = $season;
+        }
+        if ($episode !== null) {
+            $details['episode'] = $episode;
+        }
+
+        foreach (['new' => 'is_new', 'premiere' => 'premiere', 'previously_shown' => 'previously_shown'] as $source => $key) {
+            if (! empty($programme[$source])) {
+                $details[$key] = 1;
+            }
+        }
+
+        if (! empty($programme['production_year'])) {
+            $details['year'] = (int) $programme['production_year'];
+        }
+
+        return $details;
+    }
+
+    /**
+     * Role-specific programme artwork for Xtream EPG listings: a portrait
+     * poster, landscape backdrop and declared still, each only when the cached
+     * images actually contain one (see {@see EpgProgrammeArtwork}). Dimensions
+     * come from the selected image, never from its role or orientation.
+     *
+     * @param  array<string, mixed>  $programme
+     * @param  Playlist|CustomPlaylist|MergedPlaylist|PlaylistAlias  $playlist
+     * @return array{poster_url?: string, poster_width?: int, poster_height?: int, backdrop_url?: string, still_url?: string, still_width?: int, still_height?: int}
+     */
+    private function epgProgrammeArtwork(array $programme, $playlist): array
+    {
+        $artwork = [];
+        $images = $programme['images'] ?? null;
+        if ($poster = EpgProgrammeArtwork::poster($images, $programme['icon'] ?? null)) {
+            $artwork['poster_url'] = $this->epgProgrammeImageUrl(trim($poster['url']), $playlist);
+            $artwork['poster_width'] = (int) ($poster['width'] ?? 0);
+            $artwork['poster_height'] = (int) ($poster['height'] ?? 0);
+        }
+        if ($backdrop = EpgProgrammeArtwork::backdrop($images)) {
+            $artwork['backdrop_url'] = $this->epgProgrammeImageUrl(trim($backdrop['url']), $playlist);
+        }
+        if ($still = EpgProgrammeArtwork::still($images)) {
+            $artwork['still_url'] = $this->epgProgrammeImageUrl(trim($still['url']), $playlist);
+            $artwork['still_width'] = (int) ($still['width'] ?? 0);
+            $artwork['still_height'] = (int) ($still['height'] ?? 0);
+        }
+
+        return $artwork;
+    }
+
+    /** @param  Playlist|CustomPlaylist|MergedPlaylist|PlaylistAlias  $playlist */
+    private function epgProgrammeImageUrl(string $url, $playlist): string
+    {
+        return $playlist->enable_logo_proxy && ! str_starts_with($url, url('/'))
+            ? LogoProxyController::generateProxyUrl($url)
+            : $url;
     }
 
     /**
@@ -2913,6 +3498,18 @@ class XtreamApiController extends Controller
                     'completed' => $completed,
                 ])
             );
+
+            // Capture the stable catalog identity (same as the /api/watch-progress
+            // write path) so WatchProgressLinker can relink this row if stream_id
+            // later goes stale (e.g. a media-server library flush), instead of
+            // leaving a fresh row permanently unrecoverable.
+            app(WatchProgressLinker::class)->backfillTmdbId($progress);
+
+            app(WatchHistoryScrobbler::class)->queue(
+                $progress,
+                $viewer->playlist_auth_id,
+                WatchHistoryScrobbler::parseClientProviders($request->input('client_scrobblers')),
+            );
         }
 
         return response()->json($progress);
@@ -2972,9 +3569,30 @@ class XtreamApiController extends Controller
             $query->where('content_type', $type);
         }
 
-        $results = $query->limit($limit)->get();
+        // Fetch a bounded candidate window larger than $limit, not just $limit rows:
+        // a manual/unlinked entry that doesn't resolve to a catalog item is dropped
+        // below, and dropping it must not shrink the final page - an older but still
+        // resolvable entry should fill the slot instead. The cap keeps this a bounded
+        // query rather than the viewer's entire history.
+        $candidateLimit = min(max($limit * 5, 100), 500);
 
-        $enriched = $results->map(function (ViewerWatchProgress $progress): array {
+        $results = $query->limit($candidateLimit)->get();
+
+        $linker = app(WatchProgressLinker::class);
+        // Not an arrow function: each() stops at the first false, and ensureLinked() returns
+        // false for an unrecoverable row, which would leave every older row unlinked.
+        $results->each(function (ViewerWatchProgress $progress) use ($linker, $playlist): void {
+            $linker->ensureLinked($progress, $playlist);
+        });
+
+        $enriched = $results->map(function (ViewerWatchProgress $progress): ?array {
+            // vod/episode rows whose stream_id no longer resolves (and couldn't be
+            // relinked via tmdb_id above) point at deleted content - drop them
+            // instead of surfacing a dead card the client can't do anything with.
+            if (! $this->isResolvableWatchProgressRow($progress)) {
+                return null;
+            }
+
             $data = $progress->toArray();
 
             if ($progress->content_type === 'episode') {
@@ -2993,7 +3611,7 @@ class XtreamApiController extends Controller
                     $backdrop = $this->extractFirstUrl($backdropPath);
                 }
                 if ($backdrop && ($playlist->enable_logo_proxy ?? false)) {
-                    $backdrop = $this->proxyImageUrl($backdrop, self::backdropProxyWidth());
+                    $backdrop = $this->proxyImageUrl($backdrop, ImageProfile::Backdrop);
                 }
 
                 $data['title'] = $series?->name ?? $episode?->title ?? null;
@@ -3014,7 +3632,7 @@ class XtreamApiController extends Controller
                 }
                 $backdropPaths = array_filter($backdropPaths);
                 if ($playlist->enable_logo_proxy ?? false) {
-                    $backdropPaths = array_map(fn ($path) => $this->proxyImageUrl($path, self::backdropProxyWidth()), $backdropPaths);
+                    $backdropPaths = array_map(fn ($path) => $this->proxyImageUrl($path, ImageProfile::Backdrop), $backdropPaths);
                 }
 
                 $data['title'] = $channel?->title ?? $channel?->name ?? null;
@@ -3062,13 +3680,40 @@ class XtreamApiController extends Controller
             unset($data['channel'], $data['episode']);
 
             return $data;
-        });
+        })->filter()->values()->take($limit);
 
         if ($includeUpNext) {
-            $enriched = $this->appendUpNextEntries($enriched, $results, $viewer, $playlist, $limit);
+            // Scope the up-next source rows to the same recency window that actually
+            // made the final page (the first $limit resolvable rows), not the whole
+            // wider $candidateLimit fetch above - otherwise widening that fetch to
+            // work around unresolved entries would also widen which series are
+            // eligible for an up-next suggestion.
+            $resultsForUpNext = $results
+                ->filter(fn (ViewerWatchProgress $progress): bool => $this->isResolvableWatchProgressRow($progress))
+                ->values()
+                ->take($limit);
+
+            $enriched = $this->appendUpNextEntries($enriched, $resultsForUpNext, $viewer, $playlist, $limit);
         }
 
         return response()->json($enriched->values());
+    }
+
+    /**
+     * Whether a watch-progress row still resolves to a real catalog item. A vod/episode
+     * row whose stream_id no longer resolves (and couldn't be relinked via tmdb_id)
+     * points at deleted content and should be treated as absent from the viewer's history.
+     */
+    private function isResolvableWatchProgressRow(ViewerWatchProgress $progress): bool
+    {
+        if ($progress->content_type === 'vod' && ! $progress->channel) {
+            return false;
+        }
+        if ($progress->content_type === 'episode' && ! $progress->episode) {
+            return false;
+        }
+
+        return true;
     }
 
     /**
@@ -3140,7 +3785,7 @@ class XtreamApiController extends Controller
             $backdrop = $this->extractFirstUrl($series?->backdrop_path ?? null);
         }
         if ($backdrop && ($playlist->enable_logo_proxy ?? false)) {
-            $backdrop = $this->proxyImageUrl($backdrop, self::backdropProxyWidth());
+            $backdrop = $this->proxyImageUrl($backdrop, ImageProfile::Backdrop);
         }
 
         return [
@@ -3398,39 +4043,15 @@ class XtreamApiController extends Controller
      * Wrap an image URL in the logo proxy, unless it's already an app-hosted URL
      * (e.g. a media server image proxied at sync time), in which case it's returned
      * untouched to avoid double-proxying it through the logo proxy's own fetch.
+     * [$profile] makes the proxy serve a copy sized for that role.
      */
-    /**
-     * Role-based downscale widths baked into proxied artwork URLs so clients
-     * pull a right-sized file. Null (resize disabled) leaves URLs unchanged.
-     */
-    private static function posterProxyWidth(): ?int
-    {
-        return config('proxy.image_resize_enabled', true)
-            ? (int) config('proxy.image_resize_poster_width', 600)
-            : null;
-    }
-
-    private static function backdropProxyWidth(): ?int
-    {
-        return config('proxy.image_resize_enabled', true)
-            ? (int) config('proxy.image_resize_backdrop_width', 1280)
-            : null;
-    }
-
-    private static function photoProxyWidth(): ?int
-    {
-        return config('proxy.image_resize_enabled', true)
-            ? (int) config('proxy.image_resize_photo_width', 300)
-            : null;
-    }
-
-    private function proxyImageUrl(?string $url, ?int $width = null): ?string
+    public static function proxyImageUrl(?string $url, ?ImageProfile $profile = null): ?string
     {
         if (! $url || ! filter_var($url, FILTER_VALIDATE_URL) || str_starts_with($url, url('/'))) {
             return $url;
         }
 
-        return LogoProxyController::generateProxyUrl($url, width: $width);
+        return LogoProxyController::generateProxyUrl($url, profile: $profile);
     }
 
     /**
@@ -3481,6 +4102,10 @@ class XtreamApiController extends Controller
 
         if ($this->canAdvertiseProxyFeature($playlist, $authMethod, $playlistAuth)) {
             $features[] = 'proxy';
+        }
+
+        if (app(SportsService::class)->isEnabled()) {
+            $features[] = 'sports';
         }
 
         return $features;
@@ -3803,7 +4428,7 @@ class XtreamApiController extends Controller
      */
     private function resolveAIOStreamsData($playlist, array $features): array
     {
-        if (! in_array('aiostreams', $features)) {
+        if (! config('services.aiostreams.enabled', true) || ! in_array('aiostreams', $features)) {
             return [];
         }
 
@@ -3845,7 +4470,7 @@ class XtreamApiController extends Controller
         $selectedSet = array_flip($integration->aiostreams_selected_catalog_ids ?? []);
 
         return collect($all)
-            ->filter(fn (array $catalog) => isset($selectedSet[$catalog['id'].'_'.$catalog['type']]))
+            ->filter(fn (array $catalog) => isset($selectedSet[MediaServerIntegration::aiostreamsCatalogKey($catalog)]))
             ->values()
             ->all();
     }
@@ -3853,6 +4478,159 @@ class XtreamApiController extends Controller
     private function canAdvertiseDvrFeature($playlist, string $authMethod, ?PlaylistAuth $playlistAuth): bool
     {
         return $this->dvrCapabilityGranted($this->resolveDvrPlaylist($playlist), $authMethod, $playlistAuth);
+    }
+
+    /**
+     * Resolve TMDB "more like this" candidates - persisted at enrichment time
+     * on `info['related_tmdb']` / `series.metadata['related_tmdb']` by
+     * FetchTmdbIds / AppliesTmdbSelection - down to the subset that actually
+     * exists in this playlist's own VOD/series library, matched by `tmdb_id`.
+     * Recommendations for titles outside the library are dropped rather than
+     * shown, so every related card the client renders is guaranteed
+     * playable; this also means the row updates automatically as the library
+     * grows, without ever needing to re-run TMDB enrichment.
+     *
+     * @param  array<int, array{tmdb_id?: int, media_type?: string}>  $relatedTmdb
+     * @param  Playlist|PlaylistAlias  $playlist
+     * @return array<int, array{type: string, id: int, name: string, cover: ?string, tmdb_id: int}>
+     */
+    private function resolveRelatedLibraryItems(array $relatedTmdb, $playlist, string $excludeType, int $excludeId): array
+    {
+        $movieTmdbIds = [];
+        $seriesTmdbIds = [];
+
+        foreach ($relatedTmdb as $candidate) {
+            $tmdbId = (int) ($candidate['tmdb_id'] ?? 0);
+            if (! $tmdbId) {
+                continue;
+            }
+
+            if (($candidate['media_type'] ?? null) === 'tv') {
+                $seriesTmdbIds[$tmdbId] = true;
+            } else {
+                $movieTmdbIds[$tmdbId] = true;
+            }
+        }
+
+        $channelsByTmdbId = collect();
+        if (! empty($movieTmdbIds)) {
+            $channelsByTmdbId = PlaylistGenerateController::getChannelQuery($playlist, isVod: true)
+                ->whereIn('channels.tmdb_id', array_keys($movieTmdbIds))
+                ->get(['id', 'tmdb_id', 'title_custom', 'title', 'name', 'logo', 'logo_internal'])
+                ->keyBy('tmdb_id');
+        }
+
+        $seriesByTmdbId = collect();
+        if (! empty($seriesTmdbIds)) {
+            // Table-qualified: for an alias, series() joins playlists, which also has id.
+            $seriesByTmdbId = $playlist->series()
+                ->where('series.enabled', true)
+                ->whereIn('series.tmdb_id', array_keys($seriesTmdbIds))
+                ->get(['series.id', 'series.tmdb_id', 'series.name', 'series.cover'])
+                ->keyBy('tmdb_id');
+        }
+
+        $related = [];
+
+        foreach ($relatedTmdb as $candidate) {
+            if (count($related) >= 12) {
+                break;
+            }
+
+            $tmdbId = (int) ($candidate['tmdb_id'] ?? 0);
+            if (! $tmdbId) {
+                continue;
+            }
+
+            $isSeries = ($candidate['media_type'] ?? null) === 'tv';
+            $type = $isSeries ? 'series' : 'movie';
+
+            $match = $isSeries ? $seriesByTmdbId->get($tmdbId) : $channelsByTmdbId->get($tmdbId);
+            if (! $match || ($type === $excludeType && (int) $match->id === $excludeId)) {
+                continue;
+            }
+
+            $cover = $isSeries ? $match->cover : ($match->logo ?: $match->logo_internal);
+            if ($playlist->enable_logo_proxy && $cover) {
+                $cover = $this->proxyImageUrl($cover, ImageProfile::Poster);
+            }
+
+            $related[] = [
+                'type' => $type,
+                'id' => (int) $match->id,
+                'name' => $isSeries ? $match->name : ($match->title_custom ?? $match->title ?? $match->name),
+                'cover' => $cover,
+                'tmdb_id' => $tmdbId,
+            ];
+        }
+
+        return $related;
+    }
+
+    /**
+     * Annotate an actor's TMDB combined credits with whether each one exists
+     * as a Series/VOD channel in the given playlist's library, and that local
+     * record's id, so the client can deep-link straight to it. Mirrors
+     * resolveRelatedLibraryItems()'s batched whereIn lookup - the credit list
+     * is small and bounded (TMDB's own response), so this stays cheap without
+     * needing a cursor over the whole library.
+     *
+     * @param  array<int, array<string, mixed>>  $credits
+     * @param  Playlist|MergedPlaylist  $playlist  Untyped to match resolveRelatedLibraryItems() -
+     *                                             authenticate() can hand back either, and both expose compatible
+     *                                             series()/channels() relations.
+     * @return array<int, array<string, mixed>>
+     */
+    private function resolveFilmographyLibraryMeta(array $credits, $playlist): array
+    {
+        $movieTmdbIds = [];
+        $seriesTmdbIds = [];
+
+        foreach ($credits as $credit) {
+            $tmdbId = (int) ($credit['tmdb_id'] ?? 0);
+            if (! $tmdbId) {
+                continue;
+            }
+
+            if (($credit['media_type'] ?? null) === 'tv') {
+                $seriesTmdbIds[$tmdbId] = true;
+            } else {
+                $movieTmdbIds[$tmdbId] = true;
+            }
+        }
+
+        $channelIdsByTmdbId = collect();
+        if (! empty($movieTmdbIds)) {
+            $channelIdsByTmdbId = PlaylistGenerateController::getChannelQuery($playlist, isVod: true)
+                ->whereIn('channels.tmdb_id', array_keys($movieTmdbIds))
+                ->get(['id', 'tmdb_id'])
+                ->keyBy('tmdb_id');
+        }
+
+        $seriesIdsByTmdbId = collect();
+        if (! empty($seriesTmdbIds)) {
+            // Table-qualified: for an alias, series() joins playlists, which also has id.
+            $seriesIdsByTmdbId = $playlist->series()
+                ->where('series.enabled', true)
+                ->whereIn('series.tmdb_id', array_keys($seriesTmdbIds))
+                ->get(['series.id', 'series.tmdb_id'])
+                ->keyBy('tmdb_id');
+        }
+
+        return array_map(function (array $credit) use ($channelIdsByTmdbId, $seriesIdsByTmdbId, $playlist): array {
+            $tmdbId = (int) ($credit['tmdb_id'] ?? 0);
+            $isSeries = ($credit['media_type'] ?? null) === 'tv';
+            $match = $tmdbId ? ($isSeries ? $seriesIdsByTmdbId->get($tmdbId) : $channelIdsByTmdbId->get($tmdbId)) : null;
+
+            if ($playlist->enable_logo_proxy && ! empty($credit['poster_url'])) {
+                $credit['poster_url'] = $this->proxyImageUrl($credit['poster_url'], ImageProfile::Poster);
+            }
+
+            $credit['in_library'] = (bool) $match;
+            $credit['local_id'] = $match ? (int) $match->id : null;
+
+            return $credit;
+        }, $credits);
     }
 
     /**
@@ -3873,18 +4651,20 @@ class XtreamApiController extends Controller
     }
 
     /**
-     * Single source of truth for whether DVR is usable at all: global config,
-     * the effective playlist's DvrSetting, and (for guest credentials) the
-     * PlaylistAuth's own dvr_enabled flag. Both feature advertisement and every
-     * direct DVR action must agree with this result.
+     * Single source of truth for whether DVR is usable at all - see
+     * DvrAccessScope::grantedForSettingIds().
      */
     private function dvrCapabilityGranted(
         Playlist|CustomPlaylist|MergedPlaylist|null $dvrPlaylist,
         string $authMethod,
         ?PlaylistAuth $playlistAuth
     ): bool {
-        return DvrCapabilityGate::granted(
-            $dvrPlaylist?->dvrSetting,
+        if (! $dvrPlaylist) {
+            return false;
+        }
+
+        return DvrAccessScope::grantedForSettingIds(
+            DvrAccessScope::settingIdsForPlaylist($dvrPlaylist),
             $playlistAuth,
             $authMethod === 'playlist_auth'
         );
@@ -3893,6 +4673,19 @@ class XtreamApiController extends Controller
     private function resolveDvrPlaylist($playlist): Playlist|CustomPlaylist|MergedPlaylist|null
     {
         return $this->resolveEffectivePlaylist($playlist);
+    }
+
+    /**
+     * @return array<int, int>
+     */
+    private function resolveDvrSettingIds($playlist): array
+    {
+        return DvrAccessScope::settingIdsForPlaylist($playlist);
+    }
+
+    private function resolveDvrSettingForWrite($playlist, ?int $channelId = null): ?DvrSetting
+    {
+        return DvrAccessScope::settingForWriteOnPlaylist($playlist, $channelId);
     }
 
     /**
@@ -3993,8 +4786,12 @@ class XtreamApiController extends Controller
 
         $query = DvrRecording::whereIn('dvr_setting_id', $dvrSettingIds)
             ->when($playlistAuth, fn ($q) => $q->where('playlist_auth_id', $playlistAuth->id))
-            ->with(['channel', 'dvrSetting', 'recordingRule'])
-            ->orderByDesc('scheduled_start');
+            ->with(['channel.epgChannel', 'dvrSetting', 'recordingRule', 'vodChannel', 'vodEpisode.series'])
+            ->orderByDesc('scheduled_start')
+            // Tie-breaker so limit/offset pages stay stable when recordings
+            // share a start time (a series rule can schedule several airings
+            // at once); without it a row can repeat or be skipped across pages.
+            ->orderByDesc('id');
 
         if ($status) {
             $statusEnum = DvrRecordingStatus::tryFrom($status);
@@ -4028,7 +4825,7 @@ class XtreamApiController extends Controller
         $recording = DvrRecording::whereIn('dvr_setting_id', $dvrSettingIds)
             ->where('uuid', $uuid)
             ->when($playlistAuth, fn ($q) => $q->where('playlist_auth_id', $playlistAuth->id))
-            ->with(['channel', 'dvrSetting', 'recordingRule'])
+            ->with(['channel.epgChannel', 'dvrSetting', 'recordingRule', 'vodChannel', 'vodEpisode.series'])
             ->first();
 
         if (! $recording) {
@@ -4065,9 +4862,9 @@ class XtreamApiController extends Controller
             ]);
         }
 
-        $dvrSetting = $playlist->dvrSetting;
+        $dvrSettingIds = $this->resolveDvrSettingIds($playlist);
 
-        if (! $dvrSetting) {
+        if ($dvrSettingIds === []) {
             return response()->json([
                 'used_bytes' => 0,
                 'quota_bytes' => null,
@@ -4077,16 +4874,22 @@ class XtreamApiController extends Controller
             ]);
         }
 
-        $usedBytes = $dvrSetting->storage_used_bytes;
-        $quotaBytes = $dvrSetting->global_disk_quota_gb > 0
-            ? $dvrSetting->global_disk_quota_gb * 1024 ** 3
-            : null;
+        $dvrSettings = DvrSetting::whereIn('id', $dvrSettingIds)->get();
+
+        $usedBytes = (int) $dvrSettings->sum('storage_used_bytes');
+        // Any contributing setting with no quota (null/0 = unlimited) makes the
+        // aggregate unlimited too — summing would silently drop that source's
+        // unbounded quota down to 0 instead of propagating "unlimited".
+        $quotaBytes = $dvrSettings->contains(fn (DvrSetting $s) => ! ($s->global_disk_quota_gb > 0))
+            ? null
+            : $dvrSettings->sum(fn (DvrSetting $s) => $s->global_disk_quota_gb * 1024 ** 3);
+        $recordingCount = DvrRecording::whereIn('dvr_setting_id', $dvrSettingIds)->count();
 
         return response()->json([
             'used_bytes' => $usedBytes,
             'quota_bytes' => $quotaBytes,
             'percent_used' => $quotaBytes ? min(100, round($usedBytes / $quotaBytes * 100, 1)) : null,
-            'recording_count' => $dvrSetting->recordings()->count(),
+            'recording_count' => $recordingCount,
             'scope' => 'account',
         ]);
     }
@@ -4096,13 +4899,13 @@ class XtreamApiController extends Controller
      */
     private function listDvrSeriesRules(Request $request, $playlist, ?PlaylistAuth $playlistAuth): \Illuminate\Http\JsonResponse
     {
-        $dvrSetting = $playlist->dvrSetting;
+        $dvrSettingIds = $this->resolveDvrSettingIds($playlist);
 
-        if (! $dvrSetting) {
+        if ($dvrSettingIds === []) {
             return response()->json([]);
         }
 
-        $rules = DvrRecordingRule::where('dvr_setting_id', $dvrSetting->id)
+        $rules = DvrRecordingRule::whereIn('dvr_setting_id', $dvrSettingIds)
             ->where('type', DvrRuleType::Series)
             ->where('enabled', true)
             ->when($playlistAuth, fn ($q) => $q->where('playlist_auth_id', $playlistAuth->id))
@@ -4125,13 +4928,13 @@ class XtreamApiController extends Controller
             return response()->json(['error' => 'rule_id parameter is required'], 400);
         }
 
-        $dvrSetting = $playlist->dvrSetting;
+        $dvrSettingIds = $this->resolveDvrSettingIds($playlist);
 
-        if (! $dvrSetting) {
+        if ($dvrSettingIds === []) {
             return response()->json(['error' => 'DVR not configured for this playlist'], 404);
         }
 
-        $rule = DvrRecordingRule::where('dvr_setting_id', $dvrSetting->id)
+        $rule = DvrRecordingRule::whereIn('dvr_setting_id', $dvrSettingIds)
             ->where('id', $ruleId)
             ->where('type', DvrRuleType::Series)
             ->when($playlistAuth, fn ($q) => $q->where('playlist_auth_id', $playlistAuth->id))
@@ -4161,51 +4964,29 @@ class XtreamApiController extends Controller
             return response()->json(['error' => 'q parameter is required (minimum 2 characters)'], 400);
         }
 
-        $dvrSetting = $playlist->dvrSetting;
+        $dvrSettingIds = $this->resolveDvrSettingIds($playlist);
 
-        if (! $dvrSetting?->enabled) {
+        if ($dvrSettingIds === [] || ! DvrSetting::whereIn('id', $dvrSettingIds)->where('enabled', true)->exists()) {
             return response()->json(['error' => 'DVR is not enabled for this playlist'], 422);
         }
 
-        // Pre-fetch the set of existing Series rules for this DVR setting (scoped by
+        // Pre-fetch the set of existing Series rules for these DVR settings (scoped by
         // playlist_auth when applicable) keyed by their auto-derived normalized_title,
         // so each result can advertise `has_series_rule` + `series_rule_id` without
         // a per-group query. Uses the same SeriesKey::normalize normalization as the
         // grouping below — which matches DvrRecordingRule::saving's column population —
         // so a normalized-title lookup here is consistent with what a future rule
         // created from this result would store.
-        $seriesRuleTitles = DvrRecordingRule::where('dvr_setting_id', $dvrSetting->id)
+        $seriesRuleTitles = DvrRecordingRule::whereIn('dvr_setting_id', $dvrSettingIds)
             ->where('type', DvrRuleType::Series)
             ->when($playlistAuth, fn ($q) => $q->where('playlist_auth_id', $playlistAuth->id))
             ->pluck('id', 'normalized_title');
 
-        // Collect the set of EPG channel_id strings this playlist's channels are mapped to.
-        $playlistChannels = $playlist->channels()
-            ->whereNotNull('epg_channel_id')
-            ->with('epgChannel')
-            ->get();
-
-        $epgChannelIds = $playlistChannels
-            ->map(fn (Channel $ch) => $ch->epgChannel?->channel_id)
-            ->filter()
-            ->unique()
-            ->values();
-
-        if ($epgChannelIds->isEmpty()) {
-            return response()->json([]);
-        }
-
-        // Build lookup: epg_channel_id string → [channel_id, channel_name] from the playlist.
-        $channelLookup = [];
-        foreach ($playlistChannels as $ch) {
-            $epgChanId = $ch->epgChannel?->channel_id;
-            if ($epgChanId && ! isset($channelLookup[$epgChanId])) {
-                $channelLookup[$epgChanId] = [
-                    'channel_id' => $ch->id,
-                    'channel_name' => $ch->title ?: ($ch->name ?? ''),
-                ];
-            }
-        }
+        // The EPG channels this playlist's channels are mapped to, as a subquery -
+        // playlists can have hundreds of thousands of channels.
+        $mappedEpgChannels = $playlist->channels()->getQuery()
+            ->whereNotNull('channels.epg_channel_id')
+            ->select('channels.epg_channel_id');
 
         // Fetch matching programmes across all mapped EPG channels, including those
         // that just finished (up to 24 hours ago) for discoverability. Programmes
@@ -4214,7 +4995,10 @@ class XtreamApiController extends Controller
         // airing_now below doesn't silently drop them.
         $now = Carbon::now();
         $cutoff = $now->copy()->subHours(24);
-        $programmes = EpgProgramme::whereIn('epg_channel_id', $epgChannelIds->toArray())
+        // Matched on each mapping's (epg_id, XMLTV id) pair: XMLTV ids are only
+        // unique within one EPG, so another EPG reusing the same id must not add
+        // its programmes here (#1827).
+        $programmes = EpgProgramme::onEpgChannels($mappedEpgChannels)
             ->where(function ($query) use ($cutoff, $now) {
                 $query->where('start_time', '>=', $cutoff)
                     ->orWhere('end_time', '>', $now);
@@ -4222,6 +5006,8 @@ class XtreamApiController extends Controller
             ->whereRaw('LOWER(title) LIKE LOWER(?)', ['%'.$q.'%'])
             ->limit(500)
             ->get();
+
+        $channelLookup = $this->searchEpgShowsChannelLookup($playlist, $programmes);
 
         // Group by SeriesKey-normalized title — this must match the normalization
         // in DvrRecordingRule::saving so rules created from these results will
@@ -4243,7 +5029,7 @@ class XtreamApiController extends Controller
             }
 
             $groups[$norm]['programmes'][] = $p;
-            $resolved = $channelLookup[$p->epg_channel_id] ?? null;
+            $resolved = $channelLookup[$this->epgChannelKey($p->epg_id, $p->epg_channel_id)] ?? null;
             if ($resolved) {
                 $groups[$norm]['channel_ids'][$resolved['channel_id']] = $resolved;
             }
@@ -4303,7 +5089,8 @@ class XtreamApiController extends Controller
                     continue;
                 }
 
-                $channelKey = $channelLookup[$p->epg_channel_id]['channel_id'] ?? $p->epg_channel_id;
+                $epgChannelKey = $this->epgChannelKey($p->epg_id, $p->epg_channel_id);
+                $channelKey = $channelLookup[$epgChannelKey]['channel_id'] ?? $epgChannelKey;
                 if (! isset($airingNowByChannel[$channelKey])) {
                     $airingNowByChannel[$channelKey] = $p;
                 }
@@ -4350,17 +5137,76 @@ class XtreamApiController extends Controller
     }
 
     /**
+     * The playlist channel behind each programme in a `search_epg_shows` result,
+     * keyed by "epg_id|XMLTV id" so channels mapped to different EPGs that reuse
+     * the same XMLTV id stay apart. Enabled channels win over disabled duplicates.
+     * Only the channels mapped to the programmes' EPG channels are read, never
+     * the whole playlist.
+     *
+     * @param  Collection<int, EpgProgramme>  $programmes
+     * @return array<string, array{channel_id: int, channel_name: string}>
+     */
+    private function searchEpgShowsChannelLookup(Model $playlist, Collection $programmes): array
+    {
+        if ($programmes->isEmpty()) {
+            return [];
+        }
+
+        // Match the exact (epg_id, XMLTV id) pairs in the results, not the cross
+        // product of two independent lists, so no unrelated mappings are fetched.
+        $xmltvIdsByEpg = $programmes
+            ->groupBy('epg_id')
+            ->map(fn (Collection $epgProgrammes) => $epgProgrammes->pluck('epg_channel_id')->unique()->values()->all());
+
+        $mappedChannels = $playlist->channels()->getQuery()
+            ->join('epg_channels', 'epg_channels.id', '=', 'channels.epg_channel_id')
+            ->where(function ($pairs) use ($xmltvIdsByEpg): void {
+                foreach ($xmltvIdsByEpg as $epgId => $xmltvIds) {
+                    $pairs->orWhere(fn ($pair) => $pair
+                        ->where('epg_channels.epg_id', $epgId)
+                        ->whereIn('epg_channels.channel_id', $xmltvIds));
+                }
+            })
+            ->orderByDesc('channels.enabled')
+            ->orderBy('channels.id')
+            ->toBase()
+            ->get(['channels.id', 'channels.title', 'channels.name', 'epg_channels.epg_id', 'epg_channels.channel_id as xmltv_id']);
+
+        $channelLookup = [];
+        foreach ($mappedChannels as $channel) {
+            $key = $this->epgChannelKey($channel->epg_id, $channel->xmltv_id);
+            if (! isset($channelLookup[$key])) {
+                $channelLookup[$key] = [
+                    'channel_id' => $channel->id,
+                    'channel_name' => $channel->title ?: ($channel->name ?? ''),
+                ];
+            }
+        }
+
+        return $channelLookup;
+    }
+
+    /**
+     * The "epg_id|XMLTV id" key used by searchEpgShowsChannelLookup(). XMLTV ids
+     * are only unique within one EPG, so the EPG id is part of the key.
+     */
+    private function epgChannelKey(int|string $epgId, string $xmltvId): string
+    {
+        return $epgId.'|'.$xmltvId;
+    }
+
+    /**
      * Build the per-episode payload used by both `recent_episodes[]` and `airing_now[]`
      * in `search_epg_shows`. The shapes must stay identical so the TV client can parse
      * either list with its existing `EpgShowEpisode.fromXtream` factory without needing
      * a second model.
      *
-     * @param  array<string, array{channel_id: int, channel_name: string}>  $channelLookup
+     * @param  array<string, array{channel_id: int, channel_name: string}>  $channelLookup  Keyed by "epg_id|XMLTV id"
      * @return array{channel_id: int|null, channel_name: string|null, title: string, subtitle: ?string, start_time: string, end_time: ?string, season: mixed, episode: mixed, description: ?string}
      */
     private function formatEpisodePayload(EpgProgramme $p, array $channelLookup): array
     {
-        $resolved = $channelLookup[$p->epg_channel_id] ?? null;
+        $resolved = $channelLookup[$this->epgChannelKey($p->epg_id, $p->epg_channel_id)] ?? null;
 
         return [
             'channel_id' => $resolved['channel_id'] ?? null,
@@ -4373,6 +5219,17 @@ class XtreamApiController extends Controller
             'episode' => $p->episode,
             'description' => $p->description,
         ];
+    }
+
+    /**
+     * 422 for an invalid schedule_dvr request. Keeps the legacy `error` string and adds a stable `code`.
+     */
+    private function scheduleDvrRejection(string $code, string $message): JsonResponse
+    {
+        return response()->json([
+            'error' => $message,
+            'code' => $code,
+        ], 422);
     }
 
     /**
@@ -4446,10 +5303,38 @@ class XtreamApiController extends Controller
             return response()->json(['error' => 'Channel not found'], 404);
         }
 
+        try {
+            $requestedStart = Carbon::parse((string) $startTime);
+            $requestedEnd = Carbon::parse((string) $endTime);
+        } catch (\Throwable) {
+            return $this->scheduleDvrRejection('invalid_datetime', 'start_time and end_time must be ISO 8601 date-times');
+        }
+
+        if ($requestedEnd->lte($requestedStart)) {
+            return $this->scheduleDvrRejection('invalid_time_window', 'end_time must be after start_time');
+        }
+
+        // A start in the past is fine (recording something already airing); an end in the past is not.
+        if ($requestedEnd->lte(now())) {
+            return $this->scheduleDvrRejection('window_in_past', 'The requested recording window has already ended');
+        }
+
+        if ($requestedStart->diffInSeconds($requestedEnd) > self::SCHEDULE_DVR_MAX_DURATION_SECONDS) {
+            return $this->scheduleDvrRejection('duration_too_long', 'Recordings can be at most 24 hours long');
+        }
+
+        foreach (['start_early_seconds', 'end_late_seconds'] as $paddingField) {
+            $padding = $request->input($paddingField);
+            if ($padding !== null && filter_var($padding, FILTER_VALIDATE_INT, ['options' => ['min_range' => -DvrPaddingFields::MAX_SECONDS, 'max_range' => DvrPaddingFields::MAX_SECONDS]]) === false) {
+                return $this->scheduleDvrRejection('invalid_padding', "{$paddingField} must be a whole number of seconds between -".DvrPaddingFields::MAX_SECONDS.' and '.DvrPaddingFields::MAX_SECONDS);
+            }
+        }
+
         // Resolve the DVR setting through the channel first so recordings
         // scheduled via merged/custom playlists route to the real source
         // playlist's DVR setting.
         $dvrSetting = $this->resolveDvrSetting($playlist, $channelId);
+        $dvrSetting = $dvrSetting?->enabled ? $dvrSetting : null;
 
         if (! $dvrSetting) {
             return response()->json(['error' => 'DVR is not enabled for this playlist'], 422);
@@ -4543,6 +5428,30 @@ class XtreamApiController extends Controller
         // app.timezone's wall-clock before Eloquent formats them for storage, or the
         // round-trip re-read will reconstruct the wrong absolute instant.
         $appTz = config('app.timezone', 'UTC');
+        $manualStart = $requestedStart->copy()->setTimezone($appTz);
+        $manualEnd = $requestedEnd->copy()->setTimezone($appTz);
+
+        // Duplicate guard: same dvr_setting, same channel, same auth, overlapping
+        // manual_start/manual_end window. Mirrors createDvrSeriesRule's pattern
+        // below so a double-tap or two devices scheduling the same airing return
+        // 409 + the existing rule's id instead of creating a second manual rule.
+        $existing = DvrRecordingRule::where('dvr_setting_id', $dvrSetting->id)
+            ->where('type', DvrRuleType::Manual)
+            ->where('enabled', true)
+            ->where('channel_id', $channelId)
+            ->where('manual_start', '<', UtcDateTime::forQuery($manualEnd))
+            ->where('manual_end', '>', UtcDateTime::forQuery($manualStart))
+            ->when($playlistAuth, fn ($q) => $q->where('playlist_auth_id', $playlistAuth->id))
+            ->first();
+
+        if ($existing) {
+            return response()->json([
+                'error' => 'A recording for this airing already exists',
+                'rule_id' => $existing->id,
+                'duplicate' => true,
+            ], 409);
+        }
+
         $rule = DvrRecordingRule::create([
             'user_id' => $dvrSetting->user_id,
             'dvr_setting_id' => $dvrSetting->id,
@@ -4551,10 +5460,10 @@ class XtreamApiController extends Controller
             'channel_id' => $channelId,
             'series_title' => $title,
             'match_mode' => DvrMatchMode::Exact,
-            'manual_start' => Carbon::parse($startTime)->setTimezone($appTz),
-            'manual_end' => Carbon::parse($endTime)->setTimezone($appTz),
-            'start_early_seconds' => (int) $request->input('start_early_seconds', $dvrSetting->default_start_early_seconds ?? 0),
-            'end_late_seconds' => (int) $request->input('end_late_seconds', $dvrSetting->default_end_late_seconds ?? 0),
+            'manual_start' => $manualStart,
+            'manual_end' => $manualEnd,
+            'start_early_seconds' => DvrPaddingFields::clampSeconds((int) $request->input('start_early_seconds', $dvrSetting->default_start_early_seconds ?? 0)),
+            'end_late_seconds' => DvrPaddingFields::clampSeconds((int) $request->input('end_late_seconds', $dvrSetting->default_end_late_seconds ?? 0)),
             'enabled' => true,
         ]);
 
@@ -4603,7 +5512,8 @@ class XtreamApiController extends Controller
             return response()->json(['error' => 'title is required'], 400);
         }
 
-        $dvrSetting = $playlist->dvrSetting?->enabled ? $playlist->dvrSetting : null;
+        $dvrSetting = $this->resolveDvrSettingForWrite($playlist, $channelId);
+        $dvrSetting = $dvrSetting?->enabled ? $dvrSetting : null;
 
         if (! $dvrSetting) {
             return response()->json(['error' => 'DVR is not enabled for this playlist'], 422);
@@ -4678,11 +5588,11 @@ class XtreamApiController extends Controller
 
         $rawStartEarly = $request->input('start_early_seconds');
         if ($rawStartEarly !== null && $rawStartEarly !== '') {
-            $createAttrs['start_early_seconds'] = (int) $rawStartEarly;
+            $createAttrs['start_early_seconds'] = DvrPaddingFields::clampSeconds((int) $rawStartEarly);
         }
         $rawEndLate = $request->input('end_late_seconds');
         if ($rawEndLate !== null && $rawEndLate !== '') {
-            $createAttrs['end_late_seconds'] = (int) $rawEndLate;
+            $createAttrs['end_late_seconds'] = DvrPaddingFields::clampSeconds((int) $rawEndLate);
         }
 
         $rule = DvrRecordingRule::create($createAttrs);
@@ -4711,13 +5621,13 @@ class XtreamApiController extends Controller
             return response()->json(['error' => 'rule_id parameter is required'], 400);
         }
 
-        $dvrSetting = $playlist->dvrSetting;
+        $dvrSettingIds = $this->resolveDvrSettingIds($playlist);
 
-        if (! $dvrSetting) {
+        if ($dvrSettingIds === []) {
             return response()->json(['error' => 'DVR not configured for this playlist'], 404);
         }
 
-        $rule = DvrRecordingRule::where('dvr_setting_id', $dvrSetting->id)
+        $rule = DvrRecordingRule::whereIn('dvr_setting_id', $dvrSettingIds)
             ->where('id', $ruleId)
             ->where('type', DvrRuleType::Series)
             ->when($playlistAuth, fn ($q) => $q->where('playlist_auth_id', $playlistAuth->id))
@@ -4775,12 +5685,12 @@ class XtreamApiController extends Controller
 
         $rawStartEarly = $request->input('start_early_seconds');
         if ($rawStartEarly !== null && $rawStartEarly !== '') {
-            $rule->start_early_seconds = (int) $rawStartEarly;
+            $rule->start_early_seconds = DvrPaddingFields::clampSeconds((int) $rawStartEarly);
         }
 
         $rawEndLate = $request->input('end_late_seconds');
         if ($rawEndLate !== null && $rawEndLate !== '') {
-            $rule->end_late_seconds = (int) $rawEndLate;
+            $rule->end_late_seconds = DvrPaddingFields::clampSeconds((int) $rawEndLate);
         }
 
         $rule->save();
@@ -4876,6 +5786,22 @@ class XtreamApiController extends Controller
     }
 
     /**
+     * The DVR recording behind a library item, for clients to show alongside
+     * it: its uuid (to manage it, e.g. delete_dvr_recording), and when and
+     * from which channel it was recorded. Absent fields are left out.
+     *
+     * @return array{dvr_uuid: string, dvr_recorded_at?: string, dvr_channel_name?: string}
+     */
+    private function dvrRecordedFields(DvrRecording $recording): array
+    {
+        return array_filter([
+            'dvr_uuid' => $recording->uuid,
+            'dvr_recorded_at' => $recording->recordedAt()?->toIso8601String(),
+            'dvr_channel_name' => $recording->sourceChannelName(),
+        ], fn (?string $value): bool => $value !== null && $value !== '');
+    }
+
+    /**
      * Build the commercial-skip (EDL) URL for a completed recording, or null
      * when comskip did not run for it.
      *
@@ -4887,13 +5813,26 @@ class XtreamApiController extends Controller
      * setting advertises an EDL that was never produced (rule off, setting on)
      * and hides one that was (rule on, setting off).
      */
+    /**
+     * An image path from a DVR recording as an absolute URL: stored URLs pass
+     * through, relative paths (generated DVR art) get the Xtream base URL.
+     */
+    private function dvrImageUrl(?string $path, string $baseUrl): ?string
+    {
+        if (empty($path)) {
+            return null;
+        }
+
+        return filter_var($path, FILTER_VALIDATE_URL) ? $path : $baseUrl.'/'.ltrim($path, '/');
+    }
+
     private function dvrEdlUrl(DvrRecording $recording, string $username, string $password): ?string
     {
         if ($recording->status !== DvrRecordingStatus::Completed || ! $recording->shouldRunComskip()) {
             return null;
         }
 
-        $baseUrl = config('app.url');
+        $baseUrl = ProxyFacade::getBaseUrl();
 
         return "{$baseUrl}/dvr/{$username}/{$password}/{$recording->uuid}/edl";
     }
@@ -4910,7 +5849,9 @@ class XtreamApiController extends Controller
             ? ($recording->dvrSetting?->dvr_output_format ?? 'mp4')
             : 'mp4';
 
-        $baseUrl = config('app.url');
+        // Same base URL as every other Xtream stream URL (URL override, or
+        // APP_URL plus APP_PORT), so clients reach the app on the right port.
+        $baseUrl = ProxyFacade::getBaseUrl();
 
         $streamUrl = $isCompleted
             ? "{$baseUrl}/dvr/{$username}/{$password}/{$recording->uuid}.{$format}"
@@ -4930,6 +5871,8 @@ class XtreamApiController extends Controller
             'status' => $recording->status->value,
             'channel_name' => $recording->channel?->title ?? $recording->channel?->name,
             'channel_id' => $recording->channel_id,
+            'channel_icon' => $this->dvrImageUrl($recording->channel_icon, $baseUrl),
+            'poster' => $this->dvrImageUrl($recording->libraryPoster(), $baseUrl),
             'scheduled_start' => $recording->scheduled_start?->toIso8601String(),
             'scheduled_end' => $recording->scheduled_end?->toIso8601String(),
             'actual_start' => $recording->actual_start?->toIso8601String(),
@@ -5326,10 +6269,10 @@ class XtreamApiController extends Controller
      */
     private function authenticate(Request $request)
     {
-        $username = $request->input('username');
-        $password = $request->input('password');
-
-        return PlaylistFacade::authenticate($username, $password);
+        return app(XtreamLoginAuthenticator::class)->authenticate(
+            $request->input('username'),
+            $request->input('password'),
+        );
     }
 
     private function formatRuntimeFromSeconds(?int $seconds): ?string

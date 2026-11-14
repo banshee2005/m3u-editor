@@ -7,6 +7,7 @@ use App\Interfaces\MediaServer;
 use App\Models\MediaServerIntegration;
 use App\Settings\GeneralSettings;
 use App\Traits\DoesNotSupportLibraryCreation;
+use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Http\Request;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Cache;
@@ -82,9 +83,14 @@ class AIOStreamsService implements MediaServer
 
         $this->waitForRateLimit();
 
-        $response = Http::timeout(15)
-            ->retry(2, 1000)
-            ->get($this->integration->manifest_url);
+        try {
+            $response = Http::timeout(15)
+                ->retry(2, 1000, throw: false)
+                ->get($this->integration->manifest_url);
+        } catch (ConnectionException) {
+            // The transport message quotes the manifest URL, which embeds the addon's credentials.
+            throw new MediaServerException('Could not connect to the manifest URL.');
+        }
 
         if (! $response->successful()) {
             throw new MediaServerException("Failed to fetch manifest: HTTP {$response->status()}");
@@ -114,9 +120,12 @@ class AIOStreamsService implements MediaServer
 
         // Prune any selected catalog IDs that no longer exist in the manifest.
         if (! $this->integration->aiostreams_enable_all_catalogs) {
-            $validIds = collect($catalogs)->pluck('id')->flip()->all();
+            $validKeys = collect($catalogs)
+                ->map(MediaServerIntegration::aiostreamsCatalogKey(...))
+                ->flip()
+                ->all();
             $pruned = collect($this->integration->aiostreams_selected_catalog_ids ?? [])
-                ->filter(fn (string $id) => isset($validIds[$id]))
+                ->filter(fn (string $key) => isset($validKeys[$key]))
                 ->values()
                 ->all();
             $this->integration->aiostreams_selected_catalog_ids = $pruned;
@@ -229,11 +238,116 @@ class AIOStreamsService implements MediaServer
     {
         $data = $this->fetchMetaRaw($type, $id);
 
-        if ($data === null) {
+        if ($data !== null) {
+            return $this->enrichMetaWithTmdb($data, $type, $id);
+        }
+
+        // A `tmdb:{id}` id (the form "related" cards navigate with, see
+        // shapeTmdbRecommendations()) often can't be resolved by the addon
+        // proxy above - most real-world manifests are IMDB-only
+        // (Cinemeta-backed), and the public Stremio-addon fallback's tmdb slot
+        // is blank unless STREMIO_TMDB_ADDON_URL is configured. Since these
+        // ids only ever originate from our own TMDB enrichment in the first
+        // place, fall back to resolving straight from TMDB - still gated by
+        // the same enrichment opt-out as everywhere else in this class.
+        if (str_starts_with($id, 'tmdb:') && ($this->integration->aiostreams_tmdb_enrich ?? true)) {
+            return $this->fetchMetaFromTmdbDirect($type, $id);
+        }
+
+        return null;
+    }
+
+    /**
+     * Build a Stremio-shaped meta object directly from TMDB for a `tmdb:{id}`
+     * item, bypassing the AIOStreams addon-proxy entirely. Reuses the same
+     * cached `getMovieDetails`/`getTvSeriesDetails` payload enrichMetaWithTmdb()
+     * pulls from, so this stays a cache hit for anything the user already
+     * opened via the normal flow.
+     *
+     * @return array{meta: array<string, mixed>}|null
+     */
+    protected function fetchMetaFromTmdbDirect(string $type, string $id): ?array
+    {
+        if (! preg_match('/^tmdb:(\d+)/', $id, $matches)) {
             return null;
         }
 
-        return $this->enrichMetaWithTmdb($data, $type, $id);
+        $tmdb = app(TmdbService::class);
+        if (! $tmdb->isConfigured()) {
+            return null;
+        }
+
+        $tmdbId = (int) $matches[1];
+        $isSeries = $type === 'series';
+
+        $details = Cache::remember(
+            "aiostreams.tmdb.details.{$type}.{$tmdbId}",
+            now()->addWeek(),
+            fn () => $isSeries ? $tmdb->getTvSeriesDetails($tmdbId) : $tmdb->getMovieDetails($tmdbId)
+        );
+
+        if (! is_array($details)) {
+            return null;
+        }
+
+        $releaseDate = $details['first_air_date'] ?? $details['release_date'] ?? null;
+        $genres = is_string($details['genres'] ?? null)
+            ? array_values(array_filter(array_map('trim', explode(',', $details['genres']))))
+            : [];
+
+        $meta = array_filter([
+            'id' => $id,
+            'type' => $type,
+            'name' => $details['name'] ?? $details['title'] ?? '',
+            'poster' => $details['poster_url'] ?? null,
+            'background' => $details['backdrop_url'] ?? null,
+            'description' => $details['overview'] ?? null,
+            'year' => $releaseDate ? substr($releaseDate, 0, 4) : null,
+            'imdbRating' => isset($details['vote_average']) ? (string) round((float) $details['vote_average'], 1) : null,
+            'genres' => $genres,
+            'clearlogo' => $details['logo_url'] ?? null,
+            'director' => $details['director'] ?? null,
+            'runtime' => $details['runtime'] ?? null,
+            'cast_list' => $details['cast_list'] ?? null,
+            // Debrid stream addons only resolve IMDb ids, not TMDB ids - this
+            // is what AIOStreamsProxyController::stream() reads to map a
+            // `tmdb:` id to an IMDb one before requesting streams, so "Get
+            // Streams" on a related item can actually find sources.
+            'imdb_id' => $details['imdb_id'] ?? null,
+        ], fn ($value) => $value !== null && $value !== [] && $value !== '');
+
+        if ($isSeries) {
+            $seasons = $this->fetchTmdbSeasons($tmdb, $tmdbId, $details);
+
+            $shaped = $this->shapeTmdbSeasons($seasons);
+            if (! empty($shaped)) {
+                $meta['seasons'] = $shaped;
+            }
+
+            // TMDB seasons carry no per-episode list, so without `videos` a
+            // series opened from a `tmdb:` catalog (AIOStreams' own TMDB
+            // trending/top/search catalogs emit these) shows seasons but no
+            // episodes. Borrow the episode list from the Stremio meta for the
+            // IMDb id instead - its `tt...:season:episode` video ids go
+            // straight to the stream route with no tmdb -> imdb remap.
+            // TMDB has no series-level runtime either, so take the Stremio
+            // meta's (e.g. "22 min") from the same response.
+            $imdbMeta = ! empty($meta['imdb_id'])
+                ? ($this->fetchMetaRaw($type, $meta['imdb_id'])['meta'] ?? null)
+                : null;
+            if (is_array($imdbMeta['videos'] ?? null) && ! empty($imdbMeta['videos'])) {
+                $meta['videos'] = $this->applyTmdbEpisodeStats($imdbMeta['videos'], $seasons);
+            }
+            if (! empty($imdbMeta['runtime'])) {
+                $meta['runtime'] = $imdbMeta['runtime'];
+            }
+        }
+
+        if (! empty($details['recommendations'])) {
+            $meta['related'] = $this->shapeTmdbRecommendations($details['recommendations']);
+        }
+
+        return ['meta' => $meta];
     }
 
     /**
@@ -468,21 +582,104 @@ class AIOStreamsService implements MediaServer
         }
 
         if ($isSeries) {
-            $seasons = Cache::remember(
-                "aiostreams.tmdb.seasons.{$tmdbId}",
-                now()->addWeek(),
-                fn () => $tmdb->getAllSeasons($tmdbId)
-            );
+            $seasons = $this->fetchTmdbSeasons($tmdb, $tmdbId, $details);
 
-            $shaped = $this->shapeTmdbSeasons(is_array($seasons) ? $seasons : []);
+            $shaped = $this->shapeTmdbSeasons($seasons);
             if (! empty($shaped)) {
                 $meta['seasons'] = $shaped;
             }
+
+            if (is_array($meta['videos'] ?? null)) {
+                $meta['videos'] = $this->applyTmdbEpisodeStats($meta['videos'], $seasons);
+            }
+        }
+
+        if (! empty($details['recommendations']) && empty($meta['related'])) {
+            $meta['related'] = $this->shapeTmdbRecommendations($details['recommendations']);
         }
 
         $data['meta'] = $meta;
 
         return $data;
+    }
+
+    /**
+     * TMDB season rows for a series, each carrying its `episodes` for up to
+     * the first 20 seasons (TMDB's append_to_response cap) - fetched in the
+     * one request the season metadata already needed, not one per season.
+     *
+     * @param  array<string, mixed>  $details  Cached getTvSeriesDetails() payload
+     * @return array<int, array<string, mixed>>
+     */
+    protected function fetchTmdbSeasons(TmdbService $tmdb, int $tmdbId, array $details): array
+    {
+        // Regular seasons first so long-running shows spend the append budget
+        // on real seasons, then Specials (season 0) if there is room left.
+        $seasonCount = (int) ($details['number_of_seasons'] ?? 0);
+        $seasonNumbers = [...range(1, max($seasonCount, 1)), 0];
+
+        $seasons = Cache::remember(
+            "aiostreams.tmdb.seasons.episodes.{$tmdbId}",
+            now()->addWeek(),
+            fn () => $tmdb->getAllSeasons($tmdbId, $seasonNumbers)
+        );
+
+        return is_array($seasons) ? $seasons : [];
+    }
+
+    /**
+     * Stamp TMDB per-episode `runtime` (minutes) and `rating` onto Stremio
+     * `videos`, which carry neither. Matches on the video's `moviedb_id`
+     * (the TMDB episode id Cinemeta includes) so differing season/episode
+     * numbering between the two sources can't mislabel an episode, falling
+     * back to season + episode number only when that id is absent. Values the
+     * video already has are never overwritten.
+     *
+     * @param  array<int, mixed>  $videos
+     * @param  array<int, array<string, mixed>>  $seasons  fetchTmdbSeasons() rows
+     * @return array<int, mixed>
+     */
+    protected function applyTmdbEpisodeStats(array $videos, array $seasons): array
+    {
+        $byId = [];
+        $byNumber = [];
+
+        foreach ($seasons as $season) {
+            foreach ($season['episodes'] ?? [] as $episode) {
+                $stats = array_filter([
+                    'runtime' => ! empty($episode['runtime']) ? (int) $episode['runtime'] : null,
+                    // TMDB reports 0 for unrated episodes - treat as missing.
+                    'rating' => ! empty($episode['vote_average']) ? round((float) $episode['vote_average'], 1) : null,
+                ], fn ($value) => $value !== null);
+
+                if (empty($stats)) {
+                    continue;
+                }
+
+                if (isset($episode['id'])) {
+                    $byId[(int) $episode['id']] = $stats;
+                }
+                if (isset($episode['season_number'], $episode['episode_number'])) {
+                    $byNumber[(int) $episode['season_number'].':'.(int) $episode['episode_number']] = $stats;
+                }
+            }
+        }
+
+        if (empty($byId) && empty($byNumber)) {
+            return $videos;
+        }
+
+        return array_map(function ($video) use ($byId, $byNumber) {
+            if (! is_array($video)) {
+                return $video;
+            }
+
+            $stats = isset($video['moviedb_id'])
+                ? ($byId[(int) $video['moviedb_id']] ?? null)
+                : ($byNumber[(int) ($video['season'] ?? 0).':'.(int) ($video['episode'] ?? 0)] ?? null);
+
+            return $stats ? $video + $stats : $video;
+        }, $videos);
     }
 
     /**
@@ -517,6 +714,30 @@ class AIOStreamsService implements MediaServer
         }
 
         return $out;
+    }
+
+    /**
+     * Reshape TmdbService::getMovieDetails()/getTvSeriesDetails() `recommendations`
+     * into Stremio-style related items. Uses the `tmdb:{id}` id form the
+     * catalog browse already understands (see extractMovieDbIds()) so tapping
+     * a related card re-enters this same getMeta()/enrichMetaWithTmdb() path -
+     * no extra TMDB lookup needed to resolve an imdb id first.
+     *
+     * @param  array<int, array{tmdb_id: int, title: string, poster_url: ?string, media_type: string}>  $recommendations
+     * @return array<int, array{id: string, type: string, name: string, poster: ?string}>
+     */
+    protected function shapeTmdbRecommendations(array $recommendations): array
+    {
+        return collect($recommendations)
+            ->filter(fn ($rec) => ! empty($rec['tmdb_id']))
+            ->map(fn ($rec) => array_filter([
+                'id' => 'tmdb:'.$rec['tmdb_id'],
+                'type' => ($rec['media_type'] ?? null) === 'tv' ? 'series' : 'movie',
+                'name' => $rec['title'] ?? '',
+                'poster' => $rec['poster_url'] ?? null,
+            ], fn ($value) => $value !== null && $value !== ''))
+            ->values()
+            ->all();
     }
 
     /**
@@ -625,7 +846,7 @@ class AIOStreamsService implements MediaServer
         return '';
     }
 
-    public function getDirectImageUrl(string $itemId, string $imageType = 'Primary'): string
+    public function getDirectImageUrl(string $itemId, string $imageType = 'Primary', ?int $maxWidth = null): string
     {
         return '';
     }

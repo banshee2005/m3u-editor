@@ -10,7 +10,7 @@
  * - The M3U output emits group-titles in the custom order
  * - PlaylistAliasResource sort helpers reconcile selection/order and resolve the
  *   imported group's custom name for display
- * - SourceGroup::displayLabelsForIds() prefers the imported custom name
+ * - SourceGroup::displayLabelsForIds() shows the imported custom name with the provider's
  */
 
 use App\Filament\Resources\PlaylistAliases\Pages\EditPlaylistAlias;
@@ -23,7 +23,9 @@ use App\Models\Playlist;
 use App\Models\PlaylistAlias;
 use App\Models\SourceGroup;
 use App\Models\User;
+use Filament\Actions\Testing\TestAction;
 use Illuminate\Support\Str;
+use Livewire\Features\SupportTesting\Testable;
 use Livewire\Livewire;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -251,6 +253,21 @@ describe('PlaylistAliasResource live group sort helpers', function () {
         expect(array_column(array_values($items), 'name'))->toBe(['Sports', 'News', 'Comedy']);
     });
 
+    it('buildLiveGroupSortItems appends newly selected groups in playlist order', function () {
+        makeLiveGroup($this->user, $this->playlist, 'FR| FRANCE 4K', 1);
+        makeLiveGroup($this->user, $this->playlist, 'FR| FRANCE VIP', 2);
+        makeLiveGroup($this->user, $this->playlist, 'FR| CANAL+ LIVE', 3);
+
+        $items = PlaylistAliasResource::buildLiveGroupSortItems(
+            ['Kept'],
+            ['FR| CANAL+ LIVE', 'Unknown', 'FR| FRANCE VIP', 'Kept', 'FR| FRANCE 4K'],
+            $this->playlist->id,
+        );
+
+        expect(array_column(array_values($items), 'name'))
+            ->toBe(['Kept', 'FR| FRANCE 4K', 'FR| FRANCE VIP', 'FR| CANAL+ LIVE', 'Unknown']);
+    });
+
     it('buildLiveGroupSortItems drops deselected groups', function () {
         $items = PlaylistAliasResource::buildLiveGroupSortItems(
             ['Sports', 'News'],
@@ -330,13 +347,13 @@ describe('SourceGroup::displayLabelsForIds', function () {
         $this->playlist = Playlist::factory()->for($this->user)->create();
     });
 
-    it('returns the imported custom name when the group has been imported', function () {
+    it('returns the imported custom name with the provider name when the group has been renamed', function () {
         $sg = SourceGroup::create(['playlist_id' => $this->playlist->id, 'name' => 'Sports', 'type' => 'live']);
         makeLiveGroup($this->user, $this->playlist, 'Sports', 1, customName: 'UK Sports HD');
 
         $labels = SourceGroup::displayLabelsForIds($this->playlist->id, 'live', [$sg->id]);
 
-        expect($labels[$sg->id])->toBe('UK Sports HD');
+        expect($labels[$sg->id])->toBe('UK Sports HD (provider: Sports)');
     });
 
     it('falls back to the source name when no imported group exists', function () {
@@ -369,4 +386,160 @@ it('renders the alias edit form with the custom sort pane enabled', function () 
 
     Livewire::test(EditPlaylistAlias::class, ['record' => $alias->getRouteKey()])
         ->assertSuccessful();
+});
+
+// ── Bouquet groups in the sort pane ───────────────────────────────────────────
+
+describe('bouquet groups in the custom sort pane', function () {
+    beforeEach(function () {
+        $this->user = User::factory()->create();
+        $this->actingAs($this->user);
+        $this->playlist = Playlist::factory()->for($this->user)->create();
+
+        // The live picker holds SourceGroup ids while editing, so each group needs
+        // a source row as well as an imported one.
+        foreach (['Sports', 'News', 'Movies'] as $index => $name) {
+            makeLiveGroup($this->user, $this->playlist, $name, $index + 1);
+            SourceGroup::create(['playlist_id' => $this->playlist->id, 'name' => $name, 'type' => 'live']);
+        }
+
+        $this->bouquet = Bouquet::factory()->create([
+            'user_id' => $this->user->id,
+            'playlist_id' => $this->playlist->id,
+            'group_selections' => ['selected_groups' => ['News', 'Sports']],
+        ]);
+    });
+
+    $sortNames = fn (Testable $livewire): array => PlaylistAliasResource::liveGroupSortNames($livewire->get('data.group_filter.live_group_order'));
+
+    // Bouquet-only groups are appended in the playlist's group order (Sports=1,
+    // News=2), not the order the bouquet lists them.
+    it('lists bouquet-only groups after the saved order when the form loads', function () use ($sortNames) {
+        $alias = makeSortAlias($this->user, $this->playlist, [
+            'selected_groups' => ['Movies'],
+            'sort_live_groups_custom' => true,
+            'live_group_order' => ['Movies'],
+        ]);
+        $alias->bouquets()->attach($this->bouquet);
+
+        $livewire = Livewire::test(EditPlaylistAlias::class, ['record' => $alias->getRouteKey()]);
+
+        expect($sortNames($livewire))->toBe(['Movies', 'Sports', 'News']);
+    });
+
+    it('badges each sort item with the bouquets contributing it', function () {
+        $second = Bouquet::factory()->create([
+            'user_id' => $this->user->id,
+            'playlist_id' => $this->playlist->id,
+            'name' => 'Second Bouquet',
+            'group_selections' => ['selected_groups' => ['News']],
+        ]);
+        $alias = makeSortAlias($this->user, $this->playlist, [
+            'selected_groups' => ['Movies'],
+            'sort_live_groups_custom' => true,
+            'live_group_order' => ['Movies'],
+        ]);
+        $alias->bouquets()->attach([$this->bouquet->id, $second->id]);
+
+        $livewire = Livewire::test(EditPlaylistAlias::class, ['record' => $alias->getRouteKey()])
+            ->assertSuccessful()
+            ->assertSee('Second Bouquet');
+
+        $bouquetsByGroup = collect($livewire->get('data.group_filter.live_group_order'))
+            ->mapWithKeys(fn (array $item): array => [$item['name'] => $item['bouquets']])
+            ->all();
+
+        expect($bouquetsByGroup)->toBe([
+            'Movies' => [],
+            'Sports' => [$this->bouquet->name],
+            'News' => [$this->bouquet->name, 'Second Bouquet'],
+        ]);
+    });
+
+    it('keeps the saved position of a bouquet group', function () use ($sortNames) {
+        $alias = makeSortAlias($this->user, $this->playlist, [
+            'selected_groups' => ['Movies'],
+            'sort_live_groups_custom' => true,
+            'live_group_order' => ['Sports', 'Movies', 'News'],
+        ]);
+        $alias->bouquets()->attach($this->bouquet);
+
+        $livewire = Livewire::test(EditPlaylistAlias::class, ['record' => $alias->getRouteKey()]);
+
+        expect($sortNames($livewire))->toBe(['Sports', 'Movies', 'News']);
+    });
+
+    it('adds and removes bouquet groups as bouquets are assigned', function () use ($sortNames) {
+        $alias = makeSortAlias($this->user, $this->playlist, [
+            'selected_groups' => ['Movies'],
+            'sort_live_groups_custom' => true,
+            'live_group_order' => ['Movies'],
+        ]);
+
+        $livewire = Livewire::test(EditPlaylistAlias::class, ['record' => $alias->getRouteKey()])
+            ->set('data.bouquets', [$this->bouquet->id]);
+
+        expect($sortNames($livewire))->toBe(['Movies', 'Sports', 'News']);
+
+        $livewire->set('data.bouquets', []);
+
+        expect($sortNames($livewire))->toBe(['Movies']);
+    });
+
+    it('seeds the order with bouquet groups in playlist order when custom sort is enabled', function () use ($sortNames) {
+        $alias = makeSortAlias($this->user, $this->playlist, ['selected_groups' => ['Movies']]);
+        $alias->bouquets()->attach($this->bouquet);
+
+        $livewire = Livewire::test(EditPlaylistAlias::class, ['record' => $alias->getRouteKey()])
+            ->set('data.group_filter.sort_live_groups_custom', true);
+
+        expect($sortNames($livewire))->toBe(['Sports', 'News', 'Movies']);
+    });
+
+    it('resets a saved custom order back to playlist order', function () use ($sortNames) {
+        $alias = makeSortAlias($this->user, $this->playlist, [
+            'selected_groups' => ['Movies'],
+            'sort_live_groups_custom' => true,
+            'live_group_order' => ['Movies', 'News', 'Sports'],
+        ]);
+        $alias->bouquets()->attach($this->bouquet);
+
+        $livewire = Livewire::test(EditPlaylistAlias::class, ['record' => $alias->getRouteKey()])
+            ->callAction(TestAction::make('reset_live_group_order')->schemaComponent('group_filter.live_group_order'));
+
+        expect($sortNames($livewire))->toBe(['Sports', 'News', 'Movies']);
+    });
+
+    it('persists a bouquet group position that the output honours', function () {
+        $sportsGroup = Group::where('playlist_id', $this->playlist->id)->where('name_internal', 'Sports')->sole();
+        $newsGroup = Group::where('playlist_id', $this->playlist->id)->where('name_internal', 'News')->sole();
+        $sportsCh = makeLiveChannel($this->user, $this->playlist, $sportsGroup, 'Sports Channel');
+        $newsCh = makeLiveChannel($this->user, $this->playlist, $newsGroup, 'News Channel');
+
+        $alias = makeSortAlias($this->user, $this->playlist, ['sort_live_groups_custom' => true]);
+        $alias->update(['xtream_config' => [[
+            'url' => 'http://example.com:8080',
+            'username' => 'alias-user',
+            'password' => 'alias-pass',
+        ]]]);
+        $alias->bouquets()->attach($this->bouquet);
+
+        $livewire = Livewire::test(EditPlaylistAlias::class, ['record' => $alias->getRouteKey()]);
+        $items = $livewire->get('data.group_filter.live_group_order');
+        $byName = collect($items)->mapWithKeys(fn (array $item, string $key): array => [$item['name'] => $key]);
+
+        // Drag News ahead of Sports, overriding the groups' natural sort_order.
+        $livewire->set('data.group_filter.live_group_order', [
+            $byName['News'] => $items[$byName['News']],
+            $byName['Sports'] => $items[$byName['Sports']],
+        ])
+            ->call('save')
+            ->assertHasNoFormErrors();
+
+        $alias->refresh();
+
+        expect($alias->getLiveGroupSortOrder())->toBe(['News', 'Sports'])
+            ->and(PlaylistGenerateController::getChannelQuery($alias)->get()->pluck('id')->all())
+            ->toBe([$newsCh->id, $sportsCh->id]);
+    });
 });

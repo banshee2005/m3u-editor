@@ -13,9 +13,10 @@ use App\Models\Channel;
 use App\Models\DvrRecording;
 use App\Models\DvrRecordingRule;
 use App\Models\DvrSetting;
-use App\Models\EpgChannel;
+use App\Models\Epg;
 use App\Models\EpgProgramme;
 use App\Support\SeriesKey;
+use Carbon\CarbonInterface;
 use Closure;
 use Exception;
 use Illuminate\Database\Eloquent\Builder;
@@ -67,6 +68,7 @@ class DvrSchedulerService
             $this->triggerPendingRecordings();
             $this->stopExpiredRecordings();
             $this->reconcileStaleRecordings();
+            $this->resumeLostRecordings();
         } catch (Exception $e) {
             Log::error('DVR scheduler tick failed: '.$e->getMessage(), [
                 'exception' => $e,
@@ -230,15 +232,15 @@ class DvrSchedulerService
      * Scopes the programme query to EPG channels that belong to the DVR setting's
      * playlist to avoid matching programmes from unrelated EPG feeds.
      */
-    private function matchSeriesRule(DvrRecordingRule $rule, int $lookaheadMinutes): void
+    private function matchSeriesRule(DvrRecordingRule $rule, int $lookaheadMinutes, bool $dryRun = false): array
     {
         if (empty($rule->series_title)) {
-            return;
+            return [];
         }
 
-        $epgChannelStringIds = $this->resolveSeriesEpgScope($rule);
+        $epgChannelScope = $this->resolveSeriesEpgScope($rule);
 
-        if (empty($epgChannelStringIds)) {
+        if ($epgChannelScope === [] || ($epgChannelScope instanceof Builder && ! (clone $epgChannelScope)->exists())) {
             Log::warning('DVR: Series rule has no EPG channel scope — skipping', [
                 'rule_id' => $rule->id,
                 'series_title' => $rule->series_title,
@@ -247,23 +249,35 @@ class DvrSchedulerService
                 'source_channel_id' => $rule->source_channel_id,
             ]);
 
-            return;
+            return [];
         }
 
         $now = now();
         $lookahead = now()->addMinutes($lookaheadMinutes);
+        $scheduledProgrammeIds = ['scheduled' => [], 'skipped' => [], 'scheduled_keys' => []];
 
+        // XMLTV channel ids are only unique per EPG, so restrict matching to the
+        // DVR owner's own EPGs - another user's EPG can reuse the same ids.
+        // Ordered so the earliest airing of a sports event wins the same-day dedup.
+        //
+        // Matches on end_time (not start_time) so a programme that has already
+        // started but is still airing stays in scope. Without this, a failed
+        // recording's same-airing retry branch in createScheduledRecordingFromProgramme
+        // could never be reached once the programme's start_time passed, even
+        // though its scheduled_end was still in the future and retry budget remained.
         $query = EpgProgramme::query()
-            ->whereIn('epg_channel_id', $epgChannelStringIds)
-            ->where('start_time', '>=', $now)
-            ->where('start_time', '<=', $lookahead);
+            ->onEpgChannels($epgChannelScope)
+            ->whereIn('epg_id', Epg::where('user_id', $rule->dvrSetting->user_id)->select('id'))
+            ->where('end_time', '>', $now)
+            ->where('start_time', '<=', $lookahead)
+            ->orderBy('start_time');
 
         $title = $rule->series_title;
         $matchMode = $rule->match_mode ?? DvrMatchMode::Contains;
 
         if ($matchMode === DvrMatchMode::Tmdb) {
             if (empty($rule->tmdb_id)) {
-                return;
+                return [];
             }
 
             $query->where('tmdb_id', $rule->tmdb_id);
@@ -288,83 +302,167 @@ class DvrSchedulerService
 
         $programmes = $query->get();
         if ($programmes->isEmpty()) {
-            return;
+            return [];
         }
 
-        // For unique_se and new_flag modes, pre-compute series_key so we can check
-        // alreadyHaveEpisode before attempting to schedule each programme.
-        $seriesKey = in_array($rule->series_mode, [DvrSeriesMode::UniqueSe, DvrSeriesMode::NewFlag])
-            ? SeriesKey::for($rule->dvrSetting->id, $rule->series_title)
-            : null;
-
         foreach ($programmes as $programme) {
-            if ($seriesKey !== null && $rule->alreadyHaveEpisode($seriesKey, $programme->season, $programme->episode)) {
+            // Dedup strategy depends on series_mode:
+            // - All: record every matching airing (no dedup)
+            // - UniqueSe/NewFlag with season/episode: dedup by rule series_key
+            //   + S/E (scripted episodes - Purged rows still block, see
+            //   alreadyHaveEpisode)
+            // - UniqueSe/NewFlag without S/E (sports): identity is the
+            //   programme title + airing DATE - a re-match on a different date
+            //   is a new event and records even if an earlier game was
+            //   recorded or purged; a same-day replay is the same game.
+            $hasSeasonEpisode = $programme->season !== null && $programme->episode !== null;
+
+            if ($rule->series_mode === DvrSeriesMode::All) {
+                // All mode: no dedup, record every airing
+                $seriesKey = null;
+            } elseif ($hasSeasonEpisode) {
+                // Has season/episode: use rule's series_key for standard dedup
+                $seriesKey = SeriesKey::for($rule->dvrSetting->id, $rule->series_title);
+            } else {
+                // No season/episode (sports): use programme's full title as identity
+                $seriesKey = SeriesKey::for($rule->dvrSetting->id, $programme->title);
+            }
+
+            $dedupKey = $seriesKey.'|'.($hasSeasonEpisode
+                ? ($programme->season ?? '').'|'.($programme->episode ?? '')
+                : ($programme->start_time?->toDateString() ?? '').'|');
+
+            $windowDays = $rule->sportsDedupDays();
+
+            $alreadyRecorded = $seriesKey !== null && (
+                $hasSeasonEpisode
+                    ? $rule->alreadyHaveEpisode($seriesKey, $programme->season, $programme->episode)
+                    : $rule->alreadyHaveEpisodeOnDate($seriesKey, $programme->start_time, $windowDays)
+            );
+            $alreadyScheduled = $dryRun && $seriesKey !== null && (
+                $hasSeasonEpisode
+                    ? in_array($dedupKey, $scheduledProgrammeIds['scheduled_keys'] ?? [])
+                    : $rule->sportsAlreadyScheduled($seriesKey, $programme->start_time, $windowDays, $scheduledProgrammeIds['scheduled_keys'] ?? [])
+            );
+
+            if ($alreadyRecorded || $alreadyScheduled) {
                 Log::debug('DVR: Skipping programme — already have episode', [
                     'rule_id' => $rule->id,
                     'title' => $programme->title,
                     'season' => $programme->season,
                     'episode' => $programme->episode,
+                    'start_time' => $programme->start_time,
                 ]);
+
+                if ($dryRun) {
+                    $scheduledProgrammeIds['skipped'][] = $programme->id;
+                }
 
                 continue;
             }
 
-            $this->createScheduledRecordingFromProgramme($rule, $programme);
+            if ($dryRun) {
+                $scheduledProgrammeIds['scheduled'][] = $programme->id;
+                $scheduledProgrammeIds['scheduled_keys'][] = $dedupKey;
+            } else {
+                $this->createScheduledRecordingFromProgramme($rule, $programme);
+            }
         }
+
+        return $dryRun ? $scheduledProgrammeIds : [];
     }
 
     /**
-     * Resolve the EPG channel string IDs (e.g. "CNN", "BBC One") that a series rule
-     * should match programmes against. This prevents cross-playlist contamination and
-     * ensures the EPG fallback in resolveStreamUrl can always find a channel.
+     * Dry-run version of matchSeriesRule that returns which programmes
+     * would be scheduled without actually creating recordings.
+     * Used by the matched airings preview to show exactly what will be recorded.
+     */
+    public function matchSeriesRuleDryRun(DvrRecordingRule $rule, int $lookaheadMinutes): array
+    {
+        return $this->matchSeriesRule($rule, $lookaheadMinutes, dryRun: true);
+    }
+
+    /**
+     * Resolve the EPG channels (epg_channels.id values) that a series rule should
+     * match programmes against. Ids rather than XMLTV strings, so the programme
+     * query can match each (epg_id, channel_id) pair - see
+     * EpgProgramme::scopeOnEpgChannels() (#1827). This prevents cross-playlist
+     * contamination and ensures the EPG fallback in resolveStreamUrl can always
+     * find a channel.
      *
      * Priority:
-     *   1. Rule has epg_channel_id (int FK to epg_channels) → use that channel's string ID
-     *   2. Rule has channel_id → use that channel's EPG channel string ID
+     *   1. Rule has epg_channel_id (int FK to epg_channels) → that EPG channel
+     *   2. Rule has channel_id → that channel's EPG mapping
      *   3. Neither → all EPG-mapped channels in the DVR setting's playlist
      *
-     * @return list<string>
+     * @return Builder|list<int> A subquery selecting channels.epg_channel_id, or a literal id list
      */
-    private function resolveSeriesEpgScope(DvrRecordingRule $rule): array
+    private function resolveSeriesEpgScope(DvrRecordingRule $rule): Builder|array
     {
         // 1. Explicit EPG channel set on the rule
         if ($rule->epg_channel_id) {
-            $stringId = $rule->epgChannel?->channel_id;
-
-            return $stringId ? [$stringId] : [];
+            return $rule->epgChannel ? [$rule->epg_channel_id] : [];
         }
 
         // 2. Pinned channel: derive EPG scope from that channel's mapping
         if ($rule->channel_id) {
-            $stringId = $rule->channel?->epgChannel?->channel_id;
-
-            return $stringId ? [$stringId] : [];
+            return $this->resolveEpgScopeForChannelLabel($rule, $rule->channel_id);
         }
 
         // 2.5. Source channel: created via Browse Shows; use the original channel's EPG mapping
         if ($rule->source_channel_id) {
-            $stringId = $rule->sourceChannel?->epgChannel?->channel_id;
-
-            return $stringId ? [$stringId] : [];
+            return $this->resolveEpgScopeForChannelLabel($rule, $rule->source_channel_id);
         }
 
         // 3. No explicit channel: scope to all EPG-mapped channels reachable through
         // the rule's DVR setting owner (a Playlist, CustomPlaylist, or MergedPlaylist).
-        $channelQuery = $rule->dvrSetting->ownerChannels();
+        // Resolved entirely at the database level - playlists can have hundreds of
+        // thousands of channels, so hydrating every Channel/EpgChannel model here
+        // is not an option (this also runs from the interactive airings preview).
+        $ownerChannelsSubquery = $rule->dvrSetting->ownerChannelsSubquery();
 
-        if (! $channelQuery) {
+        if (! $ownerChannelsSubquery) {
             return [];
         }
 
-        return $channelQuery
+        return Channel::whereIn('channels.id', $ownerChannelsSubquery)
             ->whereNotNull('channels.epg_channel_id')
-            ->with('epgChannel')
-            ->get()
-            ->map(fn (Channel $c) => $c->epgChannel?->channel_id)
-            ->filter()
-            ->unique()
-            ->values()
-            ->all();
+            ->select('channels.epg_channel_id');
+    }
+
+    /**
+     * Resolve EPG scope for a rule pinned to a specific channel. The channel
+     * selector groups channels by displayed label (title, falling back to
+     * name) because IPTV providers commonly list several duplicate rows for
+     * the same channel (quality/stream variants) - one enabled, one not,
+     * sometimes with different EPG mappings or none at all. Pinning to a
+     * channel must therefore scope to every channel sharing that label, not
+     * just the single DB row the user happened to select, or picking a
+     * duplicate with no (or a stale) EPG mapping silently drops airings a
+     * sibling duplicate would have matched.
+     *
+     * @return Builder|list<int> A subquery selecting channels.epg_channel_id, or [] when unresolvable
+     */
+    private function resolveEpgScopeForChannelLabel(DvrRecordingRule $rule, int $channelId): Builder|array
+    {
+        $pinned = Channel::find($channelId, ['id', 'title', 'name']);
+
+        if (! $pinned) {
+            return [];
+        }
+
+        $label = $pinned->title ?: $pinned->name;
+
+        $ownerChannelsSubquery = $rule->dvrSetting->ownerChannelsSubquery();
+
+        if (! $ownerChannelsSubquery) {
+            return [];
+        }
+
+        return Channel::whereIn('channels.id', $ownerChannelsSubquery)
+            ->where(fn (Builder $q) => $q->where('channels.title', $label)->orWhere('channels.name', $label))
+            ->whereNotNull('channels.epg_channel_id')
+            ->select('channels.epg_channel_id');
     }
 
     /**
@@ -469,6 +567,10 @@ class DvrSchedulerService
             $scheduledStart = $rule->manual_start->subSeconds($startEarly);
             $scheduledEnd = $rule->manual_end->addSeconds($endLate);
 
+            if (! $this->hasUsableRecordingWindow($rule, $title, $scheduledStart, $scheduledEnd)) {
+                return;
+            }
+
             [$streamUrl] = $this->resolveStreamUrl($rule, $setting);
 
             $recording = DvrRecording::create([
@@ -562,6 +664,13 @@ class DvrSchedulerService
             $startEarly = $setting->resolveStartEarlySeconds($rule->start_early_seconds);
             $endLate = $setting->resolveEndLateSeconds($rule->end_late_seconds);
 
+            $scheduledStart = $slotStart->copy()->subSeconds($startEarly);
+            $scheduledEnd = $slotEnd->copy()->addSeconds($endLate);
+
+            if (! $this->hasUsableRecordingWindow($rule, $title, $scheduledStart, $scheduledEnd)) {
+                return;
+            }
+
             [$streamUrl] = $this->resolveStreamUrl($rule, $setting);
 
             DvrRecording::create([
@@ -573,8 +682,8 @@ class DvrSchedulerService
                 'title' => $title,
                 'series_key' => $seriesKey,
                 'normalized_title' => $normalizedTitle,
-                'scheduled_start' => $slotStart->copy()->subSeconds($startEarly),
-                'scheduled_end' => $slotEnd->copy()->addSeconds($endLate),
+                'scheduled_start' => $scheduledStart,
+                'scheduled_end' => $scheduledEnd,
                 'programme_start' => $slotStart,
                 'programme_end' => $slotEnd,
                 'stream_url' => $streamUrl,
@@ -589,6 +698,26 @@ class DvrSchedulerService
                 'slot_end' => $slotEnd,
             ]);
         });
+    }
+
+    /**
+     * Whether the padded recording window still has a positive length.
+     *
+     * Negative padding (start late / finish early) can cancel out a short programme
+     * entirely; scheduling it would only produce an instantly-missed recording.
+     */
+    private function hasUsableRecordingWindow(DvrRecordingRule $rule, string $title, CarbonInterface $scheduledStart, CarbonInterface $scheduledEnd): bool
+    {
+        if ($scheduledEnd->gt($scheduledStart)) {
+            return true;
+        }
+
+        Log::debug("DVR: Skipping '{$title}' - rule {$rule->id} padding leaves no recording window", [
+            'scheduled_start' => $scheduledStart,
+            'scheduled_end' => $scheduledEnd,
+        ]);
+
+        return false;
     }
 
     /**
@@ -712,6 +841,10 @@ class DvrSchedulerService
 
             $scheduledStart = $programme->start_time->copy()->subSeconds($startEarly);
             $scheduledEnd = $programme->end_time->copy()->addSeconds($endLate);
+
+            if (! $this->hasUsableRecordingWindow($rule, $programme->title, $scheduledStart, $scheduledEnd)) {
+                return;
+            }
 
             [$streamUrl, $resolvedChannelId] = $this->resolveStreamUrl($rule, $setting, $programme);
 
@@ -845,6 +978,42 @@ class DvrSchedulerService
     }
 
     /**
+     * Resume in-progress recordings the proxy no longer has a broadcast for,
+     * which happens when the proxy restarts mid-recording. Without this the
+     * recording silently stops capturing and ends up truncated at scheduled_end.
+     *
+     * Skipped entirely when the proxy can't be asked, and recordings that only
+     * just started or are about to end are left alone.
+     */
+    private function resumeLostRecordings(): void
+    {
+        $now = now();
+        $candidates = DvrRecording::recording()
+            ->whereNotNull('proxy_network_id')
+            ->where('actual_start', '<=', UtcDateTime::forQuery($now->copy()->subMinute()))
+            ->where('scheduled_end', '>', UtcDateTime::forQuery($now->copy()->addSeconds(30)))
+            ->get(['id', 'proxy_network_id', 'title']);
+
+        if ($candidates->isEmpty()) {
+            return;
+        }
+
+        $activeIds = app(M3uProxyService::class)->activeBroadcastIds();
+        if ($activeIds === null) {
+            return;
+        }
+
+        foreach ($candidates as $recording) {
+            if (in_array($recording->proxy_network_id, $activeIds, true)) {
+                continue;
+            }
+
+            Log::warning("DvrSchedulerService: Recording {$recording->id} ({$recording->title}) is missing from the proxy, resuming");
+            StartDvrRecording::dispatch($recording->id, resume: true)->onQueue('dvr');
+        }
+    }
+
+    /**
      * Resolve the stream URL to use for a recording.
      *
      * Uses the channel proxy URL if the source playlist has proxy enabled.
@@ -865,20 +1034,17 @@ class DvrSchedulerService
         } elseif ($programme?->epg_channel_id) {
             // Rule was created without an explicit channel (e.g. series defaults or guest once rule).
             // Attempt to resolve the matching channel from the programme's EPG channel ID.
-            $epgChannelPk = EpgChannel::where('channel_id', $programme->epg_channel_id)->value('id');
+            $ownerChannels = $setting->ownerChannelsSubquery();
+            $channel = $ownerChannels
+                ? app(EpgProgrammeChannelResolver::class)->channelForProgramme($programme, $ownerChannels)
+                : null;
 
-            if ($epgChannelPk) {
-                $channel = Channel::where('playlist_id', $setting->playlist_id)
-                    ->where('epg_channel_id', $epgChannelPk)
-                    ->first();
-
-                if ($channel) {
-                    Log::debug('DVR: Resolved channel via EPG fallback', [
-                        'rule_id' => $rule->id,
-                        'epg_channel_id' => $programme->epg_channel_id,
-                        'channel_id' => $channel->id,
-                    ]);
-                }
+            if ($channel) {
+                Log::debug('DVR: Resolved channel via EPG fallback', [
+                    'rule_id' => $rule->id,
+                    'epg_channel_id' => $programme->epg_channel_id,
+                    'channel_id' => $channel->id,
+                ]);
             }
         }
 

@@ -1,25 +1,41 @@
 <?php
 
+use App\Enums\CachedContentFileStatus;
 use App\Enums\SyncRunPhase;
 use App\Enums\SyncRunStatus;
-use App\Filament\Resources\Categories\CategoryResource;
 use App\Filament\Resources\DynamicGroups\DynamicGroupResource;
 use App\Filament\Resources\DynamicGroups\Pages\ViewDynamicGroup;
 use App\Filament\Resources\DynamicGroups\RelationManagers\ChannelsRelationManager;
 use App\Filament\Resources\DynamicGroups\RelationManagers\SeriesRelationManager;
-use App\Filament\Resources\VodGroups\VodGroupResource;
+use App\Filament\Resources\Series\SeriesResource;
+use App\Filament\Resources\SeriesDynamicGroups\SeriesDynamicGroupResource;
+use App\Filament\Resources\VodDynamicGroups\VodDynamicGroupResource;
 use App\Filament\Resources\Vods\VodResource;
+use App\Jobs\DownloadCachedContentFile;
+use App\Jobs\QueueCachedContentDownloads;
+use App\Models\CachedContentFile;
 use App\Models\Channel;
 use App\Models\DynamicGroup;
 use App\Models\DynamicGroupItemSnapshot;
+use App\Models\Episode;
 use App\Models\Playlist;
+use App\Models\Season;
 use App\Models\Series;
 use App\Models\SyncRun;
 use App\Models\User;
+use App\Services\CachedContentDispatchService;
+use App\Services\TmdbService;
+use App\Settings\GeneralSettings;
+use Filament\Actions\ActionGroup;
+use Filament\Actions\Testing\TestAction;
+use Filament\Notifications\DatabaseNotification;
+use Filament\Tables\Table;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Bus;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Notification as NotificationFacade;
+use Illuminate\Support\Facades\Storage;
 use Livewire\Livewire;
 
 uses(RefreshDatabase::class);
@@ -32,6 +48,15 @@ beforeEach(function () {
     // Playlist creation fires PlaylistListener → SyncPipelineService → Redis.
     // Fake the bus so we don't need a live Redis during unit tests.
     Bus::fake();
+
+    // The two sibling listing resources (VodDynamicGroupResource and
+    // SeriesDynamicGroupResource) gate their nav visibility on BOTH the
+    // feature flag AND TmdbService::isConfigured(). Mock TMDB configured
+    // here so those sibling resources - not this view-only parent - would
+    // advertise themselves in the sidebar if a test queried them.
+    $tmdb = Mockery::mock(TmdbService::class);
+    $tmdb->shouldReceive('isConfigured')->andReturn(true);
+    app()->instance(TmdbService::class, $tmdb);
 
     $this->user = User::factory()->create();
     $this->actingAs($this->user);
@@ -47,10 +72,11 @@ beforeEach(function () {
 it('registers only the view page (no index) and stays out of nav', function () {
     // The standalone index was removed because its auto-generated breadcrumb
     // off the per-playlist widgets landed users on a list page they never
-    // asked to be on. The view page is reachable via the widget row's
-    // view action (or a click anywhere on the row), with a breadcrumb that
-    // chains through the type-appropriate VodGroupResource/CategoryResource
-    // index instead of the (now-missing) index or the owning playlist.
+    // asked to be on. The view page is reachable via the per-type listing
+    // row's view action (or a click anywhere on the row), with a breadcrumb
+    // that chains through the type-appropriate per-type Dynamic Groups
+    // index (VodDynamicGroupResource / SeriesDynamicGroupResource)
+    // instead of the (now-missing) index or the owning playlist.
     $pages = DynamicGroupResource::getPages();
 
     expect(DynamicGroupResource::canCreate())->toBeFalse()
@@ -301,7 +327,490 @@ it('lists the real synced dynamic_group_items members on the Series relation man
         ->assertCanSeeTableRecords([$attached]);
 });
 
-it('chains the View page breadcrumb through VodGroupResource for vod-type groups, pre-selecting the owning playlist tab', function () {
+// --- row actions on the Dynamic Group items tables ---
+
+function setEnableCacheForDynamicGroupTest(bool $value): void
+{
+    $mock = Mockery::mock(GeneralSettings::class);
+    $mock->enable_cache = $value;
+    app()->instance(GeneralSettings::class, $mock);
+}
+
+/**
+ * Attach a row to the group through the same `dynamic_group_items` pivot that
+ * `SyncDynamicGroups` writes, which is what the relation managers query.
+ */
+function attachItemToDynamicGroupTest(DynamicGroup $group, string $itemType, int $itemId): void
+{
+    DB::table('dynamic_group_items')->insert([
+        'dynamic_group_id' => $group->id,
+        'item_type' => $itemType,
+        'item_id' => $itemId,
+    ]);
+}
+
+function channelsManagerForTest(DynamicGroup $group)
+{
+    return Livewire::test(ChannelsRelationManager::class, [
+        'ownerRecord' => $group,
+        'pageClass' => ViewDynamicGroup::class,
+    ]);
+}
+
+function seriesManagerForTest(DynamicGroup $group)
+{
+    return Livewire::test(SeriesRelationManager::class, [
+        'ownerRecord' => $group,
+        'pageClass' => ViewDynamicGroup::class,
+    ]);
+}
+
+/**
+ * Flatten a table's configured record actions to their names, descending into
+ * ActionGroups so the assertions see what the kebab menu actually renders.
+ *
+ * @return array<int, string>
+ */
+function dynamicGroupRecordActionNames(Table $table): array
+{
+    $names = [];
+
+    foreach ($table->getRecordActions() as $action) {
+        if ($action instanceof ActionGroup) {
+            foreach ($action->getActions() as $child) {
+                $names[] = $child->getName();
+            }
+
+            continue;
+        }
+
+        $names[] = $action->getName();
+    }
+
+    return $names;
+}
+
+/**
+ * Flatten a table's configured bulk actions to their names, descending into
+ * `BulkActionGroup`s and `BulkModalActionGroup`s so the assertion sees what
+ * the toolbar actually renders. Mirrors `dynamicGroupRecordActionNames()` for the
+ * bulk slot.
+ *
+ * @return array<int, string>
+ */
+function dynamicGroupBulkActionNames(Table $table): array
+{
+    $names = [];
+
+    foreach ($table->getBulkActions() as $action) {
+        if (method_exists($action, 'getActions')) {
+            foreach ($action->getActions() as $child) {
+                $names[] = $child->getName();
+            }
+
+            continue;
+        }
+
+        $names[] = $action->getName();
+    }
+
+    return $names;
+}
+
+it('shows the reused Cache Now action on an attached Movie row when caching is enabled', function () {
+    setEnableCacheForDynamicGroupTest(true);
+    Storage::fake(CachedContentFile::DISK);
+
+    $group = DynamicGroup::create([
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'type' => 'vod', 'source' => 'trending', 'name' => 'Trending Now',
+    ]);
+    $channel = Channel::factory()->for($this->user)->for($this->playlist)->create([
+        'is_vod' => true,
+        'tmdb_id' => fake()->unique()->numberBetween(1000, 999999),
+        'title' => 'Attached Movie',
+        'url' => 'https://example.com/attached-movie.mp4',
+    ]);
+    attachItemToDynamicGroupTest($group, Channel::class, $channel->id);
+
+    channelsManagerForTest($group)
+        ->assertOk()
+        ->loadTable()
+        ->assertActionVisible(TestAction::make('cache_now')->table($channel));
+});
+
+it('hides the Cache Now action on the Movies relation manager when caching is disabled', function () {
+    setEnableCacheForDynamicGroupTest(false);
+    Storage::fake(CachedContentFile::DISK);
+
+    $group = DynamicGroup::create([
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'type' => 'vod', 'source' => 'trending', 'name' => 'Trending Now',
+    ]);
+    $channel = Channel::factory()->for($this->user)->for($this->playlist)->create([
+        'is_vod' => true,
+        'tmdb_id' => fake()->unique()->numberBetween(1000, 999999),
+        'title' => 'Attached Movie',
+        'url' => 'https://example.com/attached-movie.mp4',
+    ]);
+    attachItemToDynamicGroupTest($group, Channel::class, $channel->id);
+
+    channelsManagerForTest($group)
+        ->assertOk()
+        ->loadTable()
+        ->assertActionHidden(TestAction::make('cache_now')->table($channel));
+});
+
+it('queues a download when Cache Now runs from the Movies relation manager row', function () {
+    setEnableCacheForDynamicGroupTest(true);
+    Storage::fake(CachedContentFile::DISK);
+
+    $group = DynamicGroup::create([
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'type' => 'vod', 'source' => 'trending', 'name' => 'Trending Now',
+    ]);
+    $channel = Channel::factory()->for($this->user)->for($this->playlist)->create([
+        'is_vod' => true,
+        'tmdb_id' => fake()->unique()->numberBetween(1000, 999999),
+        'title' => 'Attached Movie',
+        'url' => 'https://example.com/attached-movie.mp4',
+    ]);
+    attachItemToDynamicGroupTest($group, Channel::class, $channel->id);
+
+    channelsManagerForTest($group)
+        ->assertOk()
+        ->callAction(TestAction::make('cache_now')->table($channel))
+        ->assertNotified('Cache download queued');
+
+    Bus::assertDispatched(DownloadCachedContentFile::class);
+    expect($channel->cachedContentFile()->first()->status)->toBe(CachedContentFileStatus::Pending);
+});
+
+it('shows the reused Cache all episodes action on an attached Series row when caching is enabled', function () {
+    setEnableCacheForDynamicGroupTest(true);
+    Storage::fake(CachedContentFile::DISK);
+
+    $group = DynamicGroup::create([
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'type' => 'series', 'source' => 'trending', 'name' => 'Trending Series',
+    ]);
+    $series = Series::factory()->for($this->user)->for($this->playlist)->create(['name' => 'Attached Show']);
+    attachItemToDynamicGroupTest($group, Series::class, $series->id);
+
+    seriesManagerForTest($group)
+        ->assertOk()
+        ->loadTable()
+        ->assertActionVisible(TestAction::make('cache_all_episodes')->table($series));
+});
+
+it('hides the Cache all episodes action on the Series relation manager when caching is disabled', function () {
+    setEnableCacheForDynamicGroupTest(false);
+    Storage::fake(CachedContentFile::DISK);
+
+    $group = DynamicGroup::create([
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'type' => 'series', 'source' => 'trending', 'name' => 'Trending Series',
+    ]);
+    $series = Series::factory()->for($this->user)->for($this->playlist)->create(['name' => 'Attached Show']);
+    attachItemToDynamicGroupTest($group, Series::class, $series->id);
+
+    seriesManagerForTest($group)
+        ->assertOk()
+        ->loadTable()
+        ->assertActionHidden(TestAction::make('cache_all_episodes')->table($series));
+});
+
+it('queues a download for every episode when Cache all episodes runs from the Series relation manager row', function () {
+    setEnableCacheForDynamicGroupTest(true);
+    Storage::fake(CachedContentFile::DISK);
+
+    $group = DynamicGroup::create([
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'type' => 'series', 'source' => 'trending', 'name' => 'Trending Series',
+    ]);
+    $series = Series::factory()->for($this->user)->for($this->playlist)->create(['name' => 'Attached Show']);
+    attachItemToDynamicGroupTest($group, Series::class, $series->id);
+
+    foreach ([[1, 1, 'https://example.com/s1e1.mp4'], [1, 2, 'https://example.com/s1e2.mp4'], [2, 1, 'https://example.com/s2e1.mp4']] as [$seasonNumber, $episodeNumber, $url]) {
+        $season = Season::factory()->for($series)->create(['season_number' => $seasonNumber]);
+        Episode::factory()->for($series)->create([
+            'playlist_id' => $this->playlist->id,
+            'user_id' => $this->user->id,
+            'season_id' => $season->id,
+            'season' => $seasonNumber,
+            'episode_num' => $episodeNumber,
+            'url' => $url,
+        ]);
+    }
+
+    seriesManagerForTest($group)
+        ->assertOk()
+        ->callAction(TestAction::make('cache_all_episodes')->table($series))
+        ->assertNotified('Queued 3 episodes for caching');
+
+    expect(CachedContentFile::where('status', CachedContentFileStatus::Pending)->count())->toBe(3);
+    Bus::assertDispatchedTimes(DownloadCachedContentFile::class, 3);
+});
+
+it('reuses the canonical row actions on either relation manager', function () {
+    setEnableCacheForDynamicGroupTest(true);
+    Storage::fake(CachedContentFile::DISK);
+
+    $vodGroup = DynamicGroup::create([
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'type' => 'vod', 'source' => 'trending', 'name' => 'Trending Now',
+    ]);
+    $channel = Channel::factory()->for($this->user)->for($this->playlist)->create([
+        'is_vod' => true,
+        'tmdb_id' => fake()->unique()->numberBetween(1000, 999999),
+        'title' => 'Attached Movie',
+        'url' => 'https://example.com/attached-movie.mp4',
+    ]);
+    attachItemToDynamicGroupTest($vodGroup, Channel::class, $channel->id);
+
+    $seriesGroup = DynamicGroup::create([
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'type' => 'series', 'source' => 'trending', 'name' => 'Trending Series',
+    ]);
+    $series = Series::factory()->for($this->user)->for($this->playlist)->create(['name' => 'Attached Show']);
+    attachItemToDynamicGroupTest($seriesGroup, Series::class, $series->id);
+
+    // Row actions act on the item itself, not its (computed) group
+    // membership, so both managers keep the canonical VodResource /
+    // SeriesResource row menus unchanged.
+    $canonicalNames = fn (array $actions): array => collect($actions)
+        ->flatMap(fn ($action) => $action instanceof ActionGroup ? $action->getActions() : [$action])
+        ->map(fn ($action) => $action->getName())
+        ->values()
+        ->all();
+
+    expect(dynamicGroupRecordActionNames(channelsManagerForTest($vodGroup)->instance()->getTable()))
+        ->toBe($canonicalNames(VodResource::getTableActions()))
+        ->toContain('cache_now')
+        ->and(dynamicGroupRecordActionNames(seriesManagerForTest($seriesGroup)->instance()->getTable()))
+        ->toBe($canonicalNames(SeriesResource::getTableActions()))
+        ->toContain('cache_all_episodes');
+});
+
+it('only exposes the cache bulk action on either relation manager', function () {
+    setEnableCacheForDynamicGroupTest(true);
+    Storage::fake(CachedContentFile::DISK);
+
+    $vodGroup = DynamicGroup::create([
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'type' => 'vod', 'source' => 'trending', 'name' => 'Trending Now',
+    ]);
+    $channel = Channel::factory()->for($this->user)->for($this->playlist)->create([
+        'is_vod' => true,
+        'tmdb_id' => fake()->unique()->numberBetween(1000, 999999),
+        'title' => 'Attached Movie',
+        'url' => 'https://example.com/attached-movie.mp4',
+    ]);
+    attachItemToDynamicGroupTest($vodGroup, Channel::class, $channel->id);
+
+    $seriesGroup = DynamicGroup::create([
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'type' => 'series', 'source' => 'trending', 'name' => 'Trending Series',
+    ]);
+    $series = Series::factory()->for($this->user)->for($this->playlist)->create(['name' => 'Attached Show']);
+    attachItemToDynamicGroupTest($seriesGroup, Series::class, $series->id);
+
+    // Membership is computed, so no membership-mutating bulk action may
+    // resurface from `VodResource`/`SeriesResource`. The only allowed bulk
+    // action on each manager is the cache variant (parallel to the row
+    // action), and a future canonical resource bulk action must not silently
+    // leak through.
+    expect(dynamicGroupBulkActionNames(channelsManagerForTest($vodGroup)->instance()->getTable()))
+        ->toBe(['cache_now'])
+        ->and(dynamicGroupBulkActionNames(seriesManagerForTest($seriesGroup)->instance()->getTable()))
+        ->toBe(['cache_all_episodes']);
+});
+
+it('shows the Cache Now bulk action on the Movies relation manager when caching is enabled', function () {
+    setEnableCacheForDynamicGroupTest(true);
+    Storage::fake(CachedContentFile::DISK);
+
+    $group = DynamicGroup::create([
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'type' => 'vod', 'source' => 'trending', 'name' => 'Trending Now',
+    ]);
+    $channel = Channel::factory()->for($this->user)->for($this->playlist)->create([
+        'is_vod' => true,
+        'tmdb_id' => fake()->unique()->numberBetween(1000, 999999),
+        'title' => 'Attached Movie',
+        'url' => 'https://example.com/attached-movie.mp4',
+    ]);
+    attachItemToDynamicGroupTest($group, Channel::class, $channel->id);
+
+    channelsManagerForTest($group)
+        ->assertOk()
+        ->loadTable()
+        ->assertTableBulkActionVisible('cache_now');
+});
+
+it('hides the Cache Now bulk action on the Movies relation manager when caching is disabled', function () {
+    setEnableCacheForDynamicGroupTest(false);
+    Storage::fake(CachedContentFile::DISK);
+
+    $group = DynamicGroup::create([
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'type' => 'vod', 'source' => 'trending', 'name' => 'Trending Now',
+    ]);
+    $channel = Channel::factory()->for($this->user)->for($this->playlist)->create([
+        'is_vod' => true,
+        'tmdb_id' => fake()->unique()->numberBetween(1000, 999999),
+        'title' => 'Attached Movie',
+        'url' => 'https://example.com/attached-movie.mp4',
+    ]);
+    attachItemToDynamicGroupTest($group, Channel::class, $channel->id);
+
+    channelsManagerForTest($group)
+        ->assertOk()
+        ->loadTable()
+        ->assertTableBulkActionHidden('cache_now');
+});
+
+it('queues a download for every selected VOD when Cache Now bulk runs on the Movies relation manager', function () {
+    setEnableCacheForDynamicGroupTest(true);
+    Storage::fake(CachedContentFile::DISK);
+    NotificationFacade::fake();
+
+    $group = DynamicGroup::create([
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'type' => 'vod', 'source' => 'trending', 'name' => 'Trending Now',
+    ]);
+
+    $channels = collect();
+    foreach (range(1, 3) as $i) {
+        $channel = Channel::factory()->for($this->user)->for($this->playlist)->create([
+            'is_vod' => true,
+            'tmdb_id' => fake()->unique()->numberBetween(1000, 999999),
+            'title' => "Attached Movie {$i}",
+            'url' => "https://example.com/attached-{$i}.mp4",
+        ]);
+        attachItemToDynamicGroupTest($group, Channel::class, $channel->id);
+        $channels->push($channel);
+    }
+
+    channelsManagerForTest($group)
+        ->assertOk()
+        ->callTableBulkAction('cache_now', $channels)
+        ->assertNotified('Caching started');
+
+    // The selection is handed to a background job instead of being queued
+    // inside the request.
+    Bus::assertNotDispatched(DownloadCachedContentFile::class);
+    Bus::assertDispatched(QueueCachedContentDownloads::class, fn (QueueCachedContentDownloads $job): bool => $job->type === 'vod'
+        && collect($job->ids)->sort()->values()->all() === $channels->pluck('id')->sort()->values()->all()
+        && $job->userId === $this->user->id);
+
+    Bus::dispatched(QueueCachedContentDownloads::class)->first()->handle(app(CachedContentDispatchService::class));
+
+    expect(CachedContentFile::where('status', CachedContentFileStatus::Pending)->count())->toBe(3);
+    NotificationFacade::assertSentTo($this->user, DatabaseNotification::class, fn (DatabaseNotification $notification): bool => $notification->toArray()['title'] === 'Queued 3 VODs for caching');
+    Bus::assertDispatchedTimes(DownloadCachedContentFile::class, 3);
+});
+
+it('shows the Cache all episodes bulk action on the Series relation manager when caching is enabled', function () {
+    setEnableCacheForDynamicGroupTest(true);
+    Storage::fake(CachedContentFile::DISK);
+
+    $group = DynamicGroup::create([
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'type' => 'series', 'source' => 'trending', 'name' => 'Trending Series',
+    ]);
+    $series = Series::factory()->for($this->user)->for($this->playlist)->create(['name' => 'Attached Show']);
+    attachItemToDynamicGroupTest($group, Series::class, $series->id);
+
+    seriesManagerForTest($group)
+        ->assertOk()
+        ->loadTable()
+        ->assertTableBulkActionVisible('cache_all_episodes');
+});
+
+it('hides the Cache all episodes bulk action on the Series relation manager when caching is disabled', function () {
+    setEnableCacheForDynamicGroupTest(false);
+    Storage::fake(CachedContentFile::DISK);
+
+    $group = DynamicGroup::create([
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'type' => 'series', 'source' => 'trending', 'name' => 'Trending Series',
+    ]);
+    $series = Series::factory()->for($this->user)->for($this->playlist)->create(['name' => 'Attached Show']);
+    attachItemToDynamicGroupTest($group, Series::class, $series->id);
+
+    seriesManagerForTest($group)
+        ->assertOk()
+        ->loadTable()
+        ->assertTableBulkActionHidden('cache_all_episodes');
+});
+
+it('queues a download for every episode across every selected series when Cache all episodes bulk runs on the Series relation manager', function () {
+    setEnableCacheForDynamicGroupTest(true);
+    Storage::fake(CachedContentFile::DISK);
+    NotificationFacade::fake();
+
+    $group = DynamicGroup::create([
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'type' => 'series', 'source' => 'trending', 'name' => 'Trending Series',
+    ]);
+
+    $serieses = collect();
+    foreach (range(1, 2) as $i) {
+        $series = Series::factory()->for($this->user)->for($this->playlist)->create(['name' => "Attached Show {$i}"]);
+        attachItemToDynamicGroupTest($group, Series::class, $series->id);
+
+        // Two episodes per series - 4 total queued.
+        foreach ([[1, 1, "https://example.com/s{$i}e1.mp4"], [1, 2, "https://example.com/s{$i}e2.mp4"]] as [$seasonNumber, $episodeNumber, $url]) {
+            $season = Season::factory()->for($series)->create(['season_number' => $seasonNumber]);
+            Episode::factory()->for($series)->create([
+                'playlist_id' => $this->playlist->id,
+                'user_id' => $this->user->id,
+                'season_id' => $season->id,
+                'season' => $seasonNumber,
+                'episode_num' => $episodeNumber,
+                'url' => $url,
+            ]);
+        }
+
+        $serieses->push($series);
+    }
+
+    seriesManagerForTest($group)
+        ->assertOk()
+        ->callTableBulkAction('cache_all_episodes', $serieses)
+        ->assertNotified('Caching started');
+
+    // Episodes are fanned out from a background job, not inside the request.
+    Bus::assertNotDispatched(DownloadCachedContentFile::class);
+    Bus::assertDispatched(QueueCachedContentDownloads::class, fn (QueueCachedContentDownloads $job): bool => $job->type === 'series'
+        && collect($job->ids)->sort()->values()->all() === $serieses->pluck('id')->sort()->values()->all()
+        && $job->userId === $this->user->id);
+
+    Bus::dispatched(QueueCachedContentDownloads::class)->first()->handle(app(CachedContentDispatchService::class));
+
+    expect(CachedContentFile::where('status', CachedContentFileStatus::Pending)->count())->toBe(4);
+    NotificationFacade::assertSentTo($this->user, DatabaseNotification::class, fn (DatabaseNotification $notification): bool => $notification->toArray()['title'] === 'Queued 4 episodes for caching');
+    Bus::assertDispatchedTimes(DownloadCachedContentFile::class, 4);
+});
+
+it('chains the View page breadcrumb through VodDynamicGroupResource for vod-type groups', function () {
     $group = DynamicGroup::create([
         'playlist_id' => $this->playlist->id,
         'user_id' => $this->user->id,
@@ -313,16 +822,19 @@ it('chains the View page breadcrumb through VodGroupResource for vod-type groups
         ->instance()
         ->getBreadcrumbs();
 
-    $expectedUrl = VodGroupResource::getUrl('index').'?tab='.$this->playlist->id;
+    // The root segment points at the per-type Dynamic Groups
+    // index (VodDynamicGroupResource for vod), not the older
+    // VOD Groups / Categories pages, and carries `?tab=` so the
+    // destination lands back on this record's playlist tab.
+    $indexUrl = VodDynamicGroupResource::getUrl('index').'?tab='.$this->playlist->id;
 
-    expect($breadcrumbs)->toHaveKey($expectedUrl)
-        ->and($breadcrumbs[$expectedUrl])->toBe('Groups')
+    expect($breadcrumbs)->toHaveKey($indexUrl)
+        ->and($breadcrumbs[$indexUrl])->toBe('Dynamic Groups')
         ->and($breadcrumbs)->toContain('Dynamic')
-        ->and($breadcrumbs)->toContain('Trending Now')
-        ->and($breadcrumbs)->not->toContain('Dynamic Groups');
+        ->and($breadcrumbs)->toContain('Trending Now');
 });
 
-it('chains the View page breadcrumb through CategoryResource for series-type groups, pre-selecting the owning playlist tab', function () {
+it('chains the View page breadcrumb through SeriesDynamicGroupResource for series-type groups', function () {
     $group = DynamicGroup::create([
         'playlist_id' => $this->playlist->id,
         'user_id' => $this->user->id,
@@ -334,15 +846,19 @@ it('chains the View page breadcrumb through CategoryResource for series-type gro
         ->instance()
         ->getBreadcrumbs();
 
-    $expectedUrl = CategoryResource::getUrl('index').'?tab='.$this->playlist->id;
+    // The root segment points at the per-type Dynamic Groups
+    // index (SeriesDynamicGroupResource for series). Label is
+    // "Dynamic Groups" - same as the vod-side. Carries `?tab=` so
+    // the destination lands back on this record's playlist tab.
+    $indexUrl = SeriesDynamicGroupResource::getUrl('index').'?tab='.$this->playlist->id;
 
-    expect($breadcrumbs)->toHaveKey($expectedUrl)
-        ->and($breadcrumbs[$expectedUrl])->toBe('Categories')
+    expect($breadcrumbs)->toHaveKey($indexUrl)
+        ->and($breadcrumbs[$indexUrl])->toBe('Dynamic Groups')
         ->and($breadcrumbs)->toContain('Dynamic')
         ->and($breadcrumbs)->toContain('Trending Series');
 });
 
-it('the View page\'s back action points at Groups for vod-type and Categories for series-type', function () {
+it('the View page\'s back action points at the per-type Dynamic Groups index for both types', function () {
     $vodGroup = DynamicGroup::create([
         'playlist_id' => $this->playlist->id,
         'user_id' => $this->user->id,
@@ -354,17 +870,37 @@ it('the View page\'s back action points at Groups for vod-type and Categories fo
         'type' => 'series', 'source' => 'trending', 'name' => 'Series Group',
     ]);
 
+    // The back button label is the same for both types - the user
+    // goes back to the Dynamic Groups list (whichever per-type
+    // page they came from). The URL is per-type and carries `?tab=`
+    // so the destination lands back on this record's playlist tab.
     Livewire::test(ViewDynamicGroup::class, ['record' => $vodGroup->id])
         ->assertOk()
-        ->assertSee('Back to Groups')
+        ->assertSee('Back to Dynamic Groups')
+        ->assertDontSee('Back to Groups')
         ->assertDontSee('Back to Categories')
-        ->assertActionHasUrl('back_to_index', VodGroupResource::getUrl('index').'?tab='.$this->playlist->id);
+        ->assertActionHasUrl('back_to_index', VodDynamicGroupResource::getUrl('index').'?tab='.$this->playlist->id);
 
     Livewire::test(ViewDynamicGroup::class, ['record' => $seriesGroup->id])
         ->assertOk()
-        ->assertSee('Back to Categories')
+        ->assertSee('Back to Dynamic Groups')
         ->assertDontSee('Back to Groups')
-        ->assertActionHasUrl('back_to_index', CategoryResource::getUrl('index').'?tab='.$this->playlist->id);
+        ->assertDontSee('Back to Categories')
+        ->assertActionHasUrl('back_to_index', SeriesDynamicGroupResource::getUrl('index').'?tab='.$this->playlist->id);
+});
+
+it('uses the Dynamic Group title for both VOD and Series detail records', function () {
+    $group = DynamicGroup::create([
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'type' => 'series',
+        'source' => 'trending',
+        'name' => 'Series Group',
+    ]);
+
+    expect(Livewire::test(ViewDynamicGroup::class, ['record' => $group->id])
+        ->instance()
+        ->getTitle())->toBe(__('View Dynamic Group'));
 });
 
 it('deletes the DynamicGroup and cascades its dynamic_group_items when the View page delete action runs', function () {
@@ -407,5 +943,58 @@ it('titles the View page "View Dynamic Group" for vod-type and "View Dynamic Cat
     expect(Livewire::test(ViewDynamicGroup::class, ['record' => $vodGroup->id])->instance()->getTitle())
         ->toBe('View Dynamic Group');
     expect(Livewire::test(ViewDynamicGroup::class, ['record' => $seriesGroup->id])->instance()->getTitle())
-        ->toBe('View Dynamic Category');
+        ->toBe('View Dynamic Group');
+});
+
+it('defaults the Movies relation manager sort to TMDB rank', function () {
+    $group = DynamicGroup::create([
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'type' => 'vod', 'source' => 'trending', 'name' => 'Trending Now',
+    ]);
+
+    // Created in reverse rank order so an id/created_at sort can't pass by accident.
+    $third = Channel::factory()->for($this->user)->for($this->playlist)->create(['is_vod' => true, 'enabled' => true]);
+    $second = Channel::factory()->for($this->user)->for($this->playlist)->create(['is_vod' => true, 'enabled' => true]);
+    $first = Channel::factory()->for($this->user)->for($this->playlist)->create(['is_vod' => true, 'enabled' => true]);
+
+    DB::table('dynamic_group_items')->insert([
+        ['dynamic_group_id' => $group->id, 'item_type' => Channel::class, 'item_id' => $third->id, 'position' => 2],
+        ['dynamic_group_id' => $group->id, 'item_type' => Channel::class, 'item_id' => $second->id, 'position' => 1],
+        ['dynamic_group_id' => $group->id, 'item_type' => Channel::class, 'item_id' => $first->id, 'position' => 0],
+    ]);
+
+    Livewire::test(ChannelsRelationManager::class, [
+        'ownerRecord' => $group,
+        'pageClass' => ViewDynamicGroup::class,
+    ])
+        ->assertOk()
+        ->loadTable()
+        ->assertCanSeeTableRecords([$first, $second, $third], inOrder: true);
+});
+
+it('defaults the Series relation manager sort to TMDB rank', function () {
+    $group = DynamicGroup::create([
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'type' => 'series', 'source' => 'trending', 'name' => 'Trending Series',
+    ]);
+
+    $third = Series::factory()->for($this->user)->for($this->playlist)->create(['enabled' => true]);
+    $second = Series::factory()->for($this->user)->for($this->playlist)->create(['enabled' => true]);
+    $first = Series::factory()->for($this->user)->for($this->playlist)->create(['enabled' => true]);
+
+    DB::table('dynamic_group_items')->insert([
+        ['dynamic_group_id' => $group->id, 'item_type' => Series::class, 'item_id' => $third->id, 'position' => 2],
+        ['dynamic_group_id' => $group->id, 'item_type' => Series::class, 'item_id' => $second->id, 'position' => 1],
+        ['dynamic_group_id' => $group->id, 'item_type' => Series::class, 'item_id' => $first->id, 'position' => 0],
+    ]);
+
+    Livewire::test(SeriesRelationManager::class, [
+        'ownerRecord' => $group,
+        'pageClass' => ViewDynamicGroup::class,
+    ])
+        ->assertOk()
+        ->loadTable()
+        ->assertCanSeeTableRecords([$first, $second, $third], inOrder: true);
 });

@@ -69,6 +69,53 @@ return [
     | Blank any entry in your .env to disable that particular fallback.
     |
     */
+    /*
+    |--------------------------------------------------------------------------
+    | Optional Integrations
+    |--------------------------------------------------------------------------
+    |
+    | Master switches for optional integrations. When false, the integration is
+    | hidden in the UI and its background work (syncs, resolves, schedules and
+    | its Horizon supervisor) stops; content it already produced keeps being
+    | served. Only an explicit false disables one, so a blank templated .env
+    | line keeps it on. config/horizon.php reads the same variables.
+    |
+    */
+    'schedules_direct' => [
+        'enabled' => env('SCHEDULES_DIRECT_ENABLED', true) !== false,
+    ],
+
+    'aiostreams' => [
+        'enabled' => env('AIOSTREAMS_ENABLED', true) !== false,
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Watch History Trackers (Trakt, SIMKL, MDBList)
+    |--------------------------------------------------------------------------
+    |
+    | Public client ids for the device sign-in flow, shared with the M3U TV
+    | app. None is a secret: Trakt signs in with PKCE, and the SIMKL and
+    | MDBList device flows take no client secret. Register your own app and
+    | set these to use it instead (Trakt: https://trakt.tv/oauth/applications,
+    | SIMKL: https://simkl.com/settings/developer/ with the "TV, devices &
+    | command line" type, MDBList: https://mdblist.com/developer/ with the
+    | "Device Code App" type). Changing one signs existing connections out on
+    | their next token refresh.
+    |
+    */
+    'trakt' => [
+        'client_id' => env('TRAKT_CLIENT_ID') ?: '1b95226b593a8c4eb9c933c307fe8e7cf9f5e4d5d73d2d743d73dc33c6dbd84f',
+    ],
+
+    'simkl' => [
+        'client_id' => env('SIMKL_CLIENT_ID') ?: 'a3a6b6b8105c1df0ebce03f1c52665c4b664e7fc0368d3b4c81c94ef842f4f13',
+    ],
+
+    'mdblist' => [
+        'client_id' => env('MDBLIST_CLIENT_ID') ?: 'cATsHhss7WwiKfuocEVFrNZQgPuLJojA31UqC8rX',
+    ],
+
     'stremio' => [
         'meta_addons' => [
             'cinemeta' => env('STREMIO_CINEMETA_URL', 'https://v3-cinemeta.strem.io'),

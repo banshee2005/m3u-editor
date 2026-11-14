@@ -9,7 +9,7 @@
         "@tailwindcss/forms": "^0.5.10",
         "@tailwindcss/postcss": "^4.1.12",
         "@tailwindcss/typography": "^0.5.16",
-        "axios": ">=1.18.0",
+        "axios": "^1.20.0",
         "chokidar": "^4.0.3",
         "concurrently": "^9.2.4",
         "laravel-echo": "^1.17.1",
@@ -21,7 +21,7 @@
         "pusher-js": "^8.4.0-rc2",
         "sass-embedded": "^1.97.3",
         "tailwindcss": "^4.1.12",
-        "vite": ">=8.0.16"
+        "vite": ">=8.1.6"
     },
     "dependencies": {
         "easyqrcodejs": "^4.6.2",
@@ -31,6 +31,8 @@
         "video.js": "^8.23.3"
     },
     "overrides": {
-        "@xmldom/xmldom": "^0.8.15"
+        "@xmldom/xmldom": "^0.8.15",
+        "postcss-selector-parser": "^7.1.6",
+        "shell-quote": "^1.12.0"
     }
 }

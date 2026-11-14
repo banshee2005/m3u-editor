@@ -33,7 +33,7 @@ class ManageCopilotSettings extends BaseSettingsPage
 
     protected static ?string $slug = 'ai-copilot';
 
-    protected static ?int $navigationSort = 10;
+    protected static ?int $navigationSort = 12;
 
     public static function getNavigationLabel(): string
     {
@@ -99,9 +99,12 @@ class ManageCopilotSettings extends BaseSettingsPage
                             ->revealable()
                             ->dehydrated(fn ($state): bool => filled($state))
                             ->visible(fn (Get $get): bool => $get('copilot_provider') !== 'ollama')
-                            ->required(fn (Get $get): bool => (bool) $get('copilot_enabled') && $get('copilot_provider') !== 'ollama')
-                            ->helperText(__('Your API key for the selected provider. Stored in the database.')),
+                            ->required(fn (Get $get): bool => (bool) $get('copilot_enabled') && CopilotProvider::requiresApiKey($get('copilot_provider')))
+                            ->helperText(fn (Get $get): string => $get('copilot_provider') === 'unsloth_studio'
+                                ? __('Your Unsloth Studio API key (starts with sk-unsloth-), created in Studio under Settings > API. Leave blank if keyless API access is enabled in Studio.')
+                                : __('Your API key for the selected provider. Stored in the database.')),
                         TextInput::make('copilot_url')
+                            ->extraInputAttributes(['class' => 'privacy-sensitive'])
                             ->label(__('Base URL'))
                             ->url()
                             ->placeholder(fn (Get $get): string => CopilotProvider::defaultUrl($get('copilot_provider')))

@@ -33,20 +33,84 @@ use Illuminate\Support\Facades\DB;
 class XtreamCategoryService
 {
     /**
+     * Custom-playlist category id namespace for members that have no custom
+     * tag and fall back to their original provider group/category: `tags` and
+     * `groups`/`categories` are independent auto-increment sequences, so a
+     * fallback's raw id can collide with an unrelated custom tag's id and make
+     * the two indistinguishable. Offsetting fallback ids into this reserved
+     * range (the same technique as DynamicGroup::XTREAM_CATEGORY_ID_OFFSET)
+     * keeps every custom-playlist category_id unique regardless of which
+     * table it came from.
+     */
+    public const CUSTOM_PLAYLIST_FALLBACK_ID_OFFSET = 800_000_000;
+
+    /**
+     * Encode a fallback group/category id (one with no custom tag) into the
+     * reserved custom-playlist category_id range.
+     */
+    public static function customPlaylistFallbackCategoryId(int|string $id): string
+    {
+        return (string) (self::CUSTOM_PLAYLIST_FALLBACK_ID_OFFSET + (int) $id);
+    }
+
+    /**
+     * Whether a requested custom-playlist category_id is a fallback
+     * group/category id rather than a custom tag id.
+     */
+    public static function isCustomPlaylistFallbackCategoryId(int|string $categoryId): bool
+    {
+        return (int) $categoryId >= self::CUSTOM_PLAYLIST_FALLBACK_ID_OFFSET;
+    }
+
+    /**
+     * Inverse of {@see customPlaylistFallbackCategoryId()}: the underlying
+     * group/category id a fallback category_id encodes.
+     */
+    public static function decodeCustomPlaylistFallbackCategoryId(int|string $categoryId): int
+    {
+        return (int) $categoryId - self::CUSTOM_PLAYLIST_FALLBACK_ID_OFFSET;
+    }
+
+    /**
      * Xtream category entries for a standard playlist's live or VOD list. A
      * merged group stands in for its children (which never appear on their own),
      * and a child group's channels are what make the parent category eligible.
      *
+     * For a live-content PlaylistAlias with a custom group sort enabled (see
+     * PlaylistAlias::hasCustomLiveGroupSort()), a category ranks by the lowest
+     * saved-order position among its constituent groups' `name_internal` values,
+     * mirroring the `channels.group_internal` CASE ordering
+     * PlaylistGenerateController::getChannelQuery() applies to the channel/M3U
+     * listing, so the category tabs most Xtream-API clients build their group
+     * menu from stay in sync with it. Groups outside the saved order fall
+     * through to the normal sort_order below.
+     *
      * @param  Playlist|MergedPlaylist|PlaylistAlias  $playlist
-     * @param  array<int, string>  $aliasGroupFilter  provider group names an alias is limited to
+     *                                                           An alias's own filter decides which channels count, through
+     *                                                           PlaylistAlias::applyContentFilter(); $aliasGroupFilter only applies to other targets.
+     * @param  array<int, string>  $aliasGroupFilter  provider group names the listing is limited to
      * @return array<int, array{category_id: string, category_name: string, parent_id: int}>
      */
     public static function groupCategories($playlist, bool $isVod, array $aliasGroupFilter = []): array
     {
-        $channelConstraint = function ($query) use ($isVod, $aliasGroupFilter): void {
+        // Merged sources flagged only_unmatched hide some of their movies, so a VOD group
+        // only counts the movies the merge actually lists. The rule correlates to the
+        // merged_playlist_playlist row that groups() joins through.
+        $hidesUnmatched = $isVod && ($playlist instanceof MergedPlaylist
+            || ($playlist instanceof PlaylistAlias && $playlist->merged_playlist_id));
+
+        $aliasType = $isVod ? 'vod' : 'live';
+        $filtersAlias = $playlist instanceof PlaylistAlias && $playlist->isContentFiltered($aliasType);
+
+        $channelConstraint = function ($query) use ($isVod, $aliasGroupFilter, $hidesUnmatched, $playlist, $aliasType, $filtersAlias): void {
             $query->where('enabled', true)->where('is_vod', $isVod);
-            if (! empty($aliasGroupFilter)) {
+            if ($filtersAlias) {
+                $query->where(fn ($query) => $playlist->applyContentFilter($query, $aliasType));
+            } elseif (! $playlist instanceof PlaylistAlias && ! empty($aliasGroupFilter)) {
                 $query->whereIn('group_internal', $aliasGroupFilter);
+            }
+            if ($hidesUnmatched) {
+                $query->where(MergedPlaylist::onlyUnmatchedChannels());
             }
         };
 
@@ -58,17 +122,30 @@ class XtreamCategoryService
             })
             ->get();
 
+        $customOrder = (! $isVod && $playlist instanceof PlaylistAlias && $playlist->hasCustomLiveGroupSort())
+            ? array_flip($playlist->getLiveGroupSortOrder())
+            : null;
+        $unmatchedOffset = $customOrder !== null ? count($customOrder) : 0;
+
         $categories = [];
         foreach ($groups as $group) {
             $id = (string) ($group->parent_id ?? $group->id);
+            $defaultSort = $group->parent?->sort_order ?? $group->sort_order ?? 999999;
+            $sort = $customOrder !== null && isset($customOrder[$group->name_internal])
+                ? $customOrder[$group->name_internal]
+                : $unmatchedOffset + $defaultSort;
+
             if (isset($categories[$id])) {
+                $categories[$id]['_sort'] = min($categories[$id]['_sort'], $sort);
+
                 continue;
             }
+
             $categories[$id] = [
                 'category_id' => $id,
                 'category_name' => $group->parent?->name ?? $group->name,
                 'parent_id' => 0,
-                '_sort' => $group->parent?->sort_order ?? $group->sort_order ?? 999999,
+                '_sort' => $sort,
             ];
         }
 
@@ -177,7 +254,9 @@ class XtreamCategoryService
     {
         $source = self::dynamicGroupSource($playlist);
 
-        if ($source === null || ! empty($aliasFilter)) {
+        $filtersAlias = $playlist instanceof PlaylistAlias && $playlist->isContentFiltered($isVod ? 'vod' : 'series');
+
+        if ($source === null || ! empty($aliasFilter) || $filtersAlias) {
             return $categories;
         }
 
@@ -194,6 +273,10 @@ class XtreamCategoryService
      * The `enabled` cut is left to the caller's base query, which already
      * filters `enabled = true` on both the channels and series paths.
      *
+     * Also replaces the caller's ordering with the members' TMDB rank
+     * (`dynamic_group_items.position`, written by SyncDynamicGroups), with
+     * id as a stable tie-breaker.
+     *
      * @param  \Illuminate\Contracts\Database\Query\Builder|Builder|Relation  $query
      */
     public static function applyDynamicGroupFilter($query, int $dynamicGroupId, bool $isVod): void
@@ -201,12 +284,14 @@ class XtreamCategoryService
         $table = $isVod ? 'channels' : 'series';
         $itemType = $isVod ? Channel::class : Series::class;
 
-        $query->whereIn("{$table}.id", function ($sub) use ($dynamicGroupId, $itemType): void {
-            $sub->select('item_id')
-                ->from('dynamic_group_items')
-                ->where('dynamic_group_id', $dynamicGroupId)
-                ->where('item_type', $itemType);
-        });
+        $members = DB::table('dynamic_group_items')
+            ->where('dynamic_group_id', $dynamicGroupId)
+            ->where('item_type', $itemType);
+
+        $query->whereIn("{$table}.id", (clone $members)->select('item_id'))
+            ->reorder()
+            ->orderBy((clone $members)->select('position')->whereColumn('item_id', "{$table}.id"))
+            ->orderBy("{$table}.id");
     }
 
     /**

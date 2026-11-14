@@ -26,13 +26,29 @@ use Exception;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Http\Request;
 use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Redis;
+use Illuminate\Support\Facades\URL;
 
 class M3uProxyService
 {
+    /**
+     * How long (seconds) a player may cache the redirect to a catchup proxy stream. Seeking
+     * players (FFmpeg/mpv) then send their Range requests straight to the proxy instead of
+     * back through the editor. Kept below m3u-proxy's idle stream cleanup (STREAM_TIMEOUT,
+     * 15s by default) so a cached redirect never points at a stream the proxy has removed.
+     */
+    public const TIMESHIFT_REDIRECT_MAX_AGE = 10;
+
+    /**
+     * How long (seconds) a client's catchup session is remembered. Each reuse first checks
+     * that the proxy still has the stream, so this only bounds how long the entry is kept.
+     */
+    private const TIMESHIFT_SESSION_TTL = 6 * 60 * 60;
+
     protected string $apiBaseUrl;
 
     protected ?string $apiPublicUrl;
@@ -442,6 +458,160 @@ class M3uProxyService
             ]);
 
             return 0;
+        }
+    }
+
+    /**
+     * Get the DISTINCT channel ids currently being watched live under the given
+     * playlist UUID, whether the stream was opened directly against that playlist
+     * (metadata `playlist_uuid`) or through a wrapper (CustomPlaylist/MergedPlaylist)
+     * whose channels resolve back to it (metadata `source_playlist_uuid`).
+     *
+     * Used by DVR capacity accounting so a wrapper's own limit and its source
+     * playlist's limit (e.g. a tuner pool) can each be enforced against the
+     * streams that actually count toward them.
+     *
+     * @return array<int, int>
+     */
+    public static function getActiveLiveChannelIds(string $playlistUuid): array
+    {
+        $ids = [];
+
+        foreach (['playlist_uuid', 'source_playlist_uuid'] as $field) {
+            $service = new self;
+
+            if (empty($service->apiBaseUrl)) {
+                return [];
+            }
+
+            try {
+                $response = Http::timeout(5)->acceptJson()
+                    ->withHeaders($service->apiToken ? ['X-API-Token' => $service->apiToken] : [])
+                    ->get($service->apiBaseUrl.'/streams/by-metadata', [
+                        'field' => $field,
+                        'value' => $playlistUuid,
+                        'active_only' => true,
+                    ]);
+
+                if (! $response->successful()) {
+                    continue;
+                }
+
+                foreach ($response->json('matching_streams') ?? [] as $stream) {
+                    if (($stream['metadata']['type'] ?? null) !== 'channel') {
+                        continue;
+                    }
+
+                    $channelId = $stream['metadata']['channel_id'] ?? $stream['metadata']['id'] ?? null;
+                    if ($channelId !== null) {
+                        $ids[(int) $channelId] = true;
+                    }
+                }
+            } catch (Exception $e) {
+                Log::warning('Error listing active live channels', [
+                    'metadata_field' => $field,
+                    'exception' => $e->getMessage(),
+                ]);
+            }
+        }
+
+        return array_keys($ids);
+    }
+
+    /**
+     * Same as getActiveLiveChannelIds(), but for VOD episode streams (metadata
+     * `episode_id`/`id` instead of `channel_id`). Used for wrapper-aware
+     * capacity accounting in getEpisodeUrl().
+     *
+     * @return array<int, int>
+     */
+    public static function getActiveLiveEpisodeIds(string $playlistUuid): array
+    {
+        $ids = [];
+
+        foreach (['playlist_uuid', 'source_playlist_uuid'] as $field) {
+            $service = new self;
+
+            if (empty($service->apiBaseUrl)) {
+                return [];
+            }
+
+            try {
+                $response = Http::timeout(5)->acceptJson()
+                    ->withHeaders($service->apiToken ? ['X-API-Token' => $service->apiToken] : [])
+                    ->get($service->apiBaseUrl.'/streams/by-metadata', [
+                        'field' => $field,
+                        'value' => $playlistUuid,
+                        'active_only' => true,
+                    ]);
+
+                if (! $response->successful()) {
+                    continue;
+                }
+
+                foreach ($response->json('matching_streams') ?? [] as $stream) {
+                    if (($stream['metadata']['type'] ?? null) !== 'episode') {
+                        continue;
+                    }
+
+                    $episodeId = $stream['metadata']['episode_id'] ?? $stream['metadata']['id'] ?? null;
+                    if ($episodeId !== null) {
+                        $ids[(int) $episodeId] = true;
+                    }
+                }
+            } catch (Exception $e) {
+                Log::warning('Error listing active live episodes', [
+                    'metadata_field' => $field,
+                    'exception' => $e->getMessage(),
+                ]);
+            }
+        }
+
+        return array_keys($ids);
+    }
+
+    /**
+     * List active live streams on the proxy, including their metadata and
+     * creation time. Used to pick the oldest LIVE-VIEWER stream to evict when
+     * a playlist is at capacity, while excluding DVR-recording-backed channels.
+     *
+     * @return array<int, array{stream_id: string, created_at: ?string, metadata: array}>
+     */
+    public function getActiveLiveStreams(): array
+    {
+        if (empty($this->apiBaseUrl)) {
+            return [];
+        }
+
+        try {
+            $response = Http::timeout(5)->acceptJson()
+                ->withHeaders($this->apiToken ? ['X-API-Token' => $this->apiToken] : [])
+                ->get($this->apiBaseUrl.'/streams');
+
+            if (! $response->successful()) {
+                return [];
+            }
+
+            $result = [];
+            foreach ($response->json('streams') ?? [] as $stream) {
+                if (! ($stream['is_active'] ?? false) || (int) ($stream['client_count'] ?? 0) === 0) {
+                    continue;
+                }
+
+                $result[] = [
+                    'stream_id' => (string) ($stream['stream_id'] ?? ''),
+                    'created_at' => $stream['created_at'] ?? null,
+                    'metadata' => $stream['metadata'] ?? [],
+                ];
+            }
+
+            return $result;
+        } catch (Exception $e) {
+            Log::warning('Failed to list active live streams', [
+                'exception' => $e->getMessage(),
+            ]);
+
+            return [];
         }
     }
 
@@ -885,6 +1055,23 @@ class M3uProxyService
     }
 
     /**
+     * Re-apply a PlaylistAlias's provider URL replacement to a URL picked by a provider profile.
+     *
+     * When the source playlist has provider profiles, the profile builds the upstream URL
+     * instead of the alias, so the alias's own transform never runs. The profile's
+     * credentials are kept; only the provider URL is swapped, when the alias entry
+     * matching the stream has URL replacement enabled.
+     */
+    private function applyAliasProviderUrl(string $url, $playlist, Channel|Episode $item): string
+    {
+        if (! $playlist instanceof PlaylistAlias || $url === '') {
+            return $url;
+        }
+
+        return $playlist->replaceProviderUrl($url, $item->getEffectivePlaylist()?->xtream_config);
+    }
+
+    /**
      * Check whether a PlaylistAuth user is within their per-auth stream limit.
      *
      * When the limit is reached and stop-oldest is enabled (per-auth setting takes
@@ -986,6 +1173,18 @@ class M3uProxyService
         $originalChannelId = $channel->id;
         $originalPlaylistUuid = $playlist->uuid;
 
+        // The channel the client asked for, which differs from $originalChannelId when the
+        // request was swapped to a media-server item or a catchup failover before reaching
+        // here. The TV app stops its stream by this id.
+        $requestedChannelId = $request?->attributes->get('requested_channel_id') ?? $originalChannelId;
+
+        // The channel's true source Playlist, if it has one - distinct from $playlist,
+        // which may be a CustomPlaylist/MergedPlaylist/PlaylistAlias wrapper. Tagged on
+        // every stream (regardless of profiles_enabled) so DVR capacity accounting can
+        // enforce a source-level limit (e.g. a tuner pool) even when the channel is only
+        // ever accessed through an unlimited wrapper.
+        $sourcePlaylist = $channel->playlist instanceof Playlist ? $channel->playlist : null;
+
         // Build client identifier for profile affinity tracking
         $clientIdentifier = ProfileService::buildClientIdentifier($request?->ip(), $username);
 
@@ -1025,7 +1224,31 @@ class M3uProxyService
         // Timeshift/catchup requests require a different upstream URL (/timeshift/ instead of /live/),
         // so they must NEVER reuse an existing pooled live stream. We detect this early and skip
         // all pool reuse paths when timeshift parameters are present on the request.
-        $isTimeshiftRequest = $request && ($request->filled('timeshift_duration') || $request->filled('timeshift_date') || $request->filled('utc'));
+        $isTimeshiftRequest = PlaylistService::isTimeshiftRequest($request);
+        $normalizeLiveOutput = ! $profile && ! $isTimeshiftRequest
+            && ($channel->proxy_options['normalize_live_output'] ?? app(GeneralSettings::class)->proxy_normalize_live_output ?? config('proxy.normalize_live_output', false)) === true
+            && $this->isNormalizableLiveChannel($channel, PlaylistUrlService::getChannelUrl($channel, $playlist));
+
+        // Catchup players request this URL again for every seek (each Range probe), while the
+        // stream from their previous request may still be open. Hand the same client its own
+        // running stream back instead of re-running capacity checks (which would count that
+        // stream against the client) and provider profile selection on every probe.
+        $timeshiftSessionKey = $isTimeshiftRequest
+            ? self::timeshiftSessionKey($request, $originalChannelId, $originalPlaylistUuid, $profile, $username)
+            : null;
+        if ($timeshiftSessionKey !== null) {
+            $session = Cache::get($timeshiftSessionKey);
+
+            if ($session && $this->streamExists($session['stream_id'])) {
+                Log::debug('Reusing running timeshift stream for the same client and programme window', [
+                    'stream_id' => $session['stream_id'],
+                    'original_channel_id' => $originalChannelId,
+                    'original_playlist_uuid' => $originalPlaylistUuid,
+                ]);
+
+                return $session['url'];
+            }
+        }
 
         // Before creating a new stream, check if there's an active DVR recording for this channel.
         // If so, route through the editor's DVR HLS proxy so we piggyback off the existing
@@ -1044,13 +1267,9 @@ class M3uProxyService
                     'proxy_network_id' => $dvrRecording->proxy_network_id,
                 ]);
 
-                $playlist->loadMissing('user');
-
-                return route('dvr.recording.hls.playlist', [
-                    'username' => $playlist->user->name,
-                    'password' => $playlist->uuid,
-                    'uuid' => $dvrRecording->uuid,
-                ]);
+                // Signed for this recording only: the viewer may be a Playlist Auth guest, so
+                // the redirect must not carry the owner's credentials.
+                return url(URL::signedRoute('dvr.recording.hls.signed', ['uuid' => $dvrRecording->uuid], absolute: false));
             }
         }
 
@@ -1140,7 +1359,7 @@ class M3uProxyService
         // If a pooled stream exists, we can reuse it without consuming additional capacity.
         // (Same logic as the transcoded pool check above, but for direct streams)
         if (! $profile) {
-            $existingStreamId = $this->findExistingPooledStream($originalChannelId, $originalPlaylistUuid, null, null);
+            $existingStreamId = $this->findExistingPooledStream($originalChannelId, $originalPlaylistUuid, null, null, 'channel', $normalizeLiveOutput);
 
             if ($existingStreamId && ! $isTimeshiftRequest) {
                 Log::debug('Reusing existing pooled direct stream (bypassing capacity check)', [
@@ -1179,80 +1398,90 @@ class M3uProxyService
             }
         }
 
-        // Check if primary playlist has stream limits and if it's at capacity
-        // Only check capacity if we're about to create a NEW stream (no existing pooled stream found)
-        // This check applies regardless of whether provider profiles are enabled —
-        // available_streams is the authoritative proxy-level limit.
+        // Check if the playlist(s) this request counts against have stream limits and are
+        // at capacity. Only check capacity if we're about to create a NEW stream (no
+        // existing pooled stream found). This check applies regardless of whether provider
+        // profiles are enabled - available_streams is the authoritative proxy-level limit.
+        //
+        // A wrapper playlist (CustomPlaylist/MergedPlaylist/PlaylistAlias) and the channel's
+        // true source Playlist can each carry their own independent cap (e.g. a MergedPlaylist
+        // limiting guest connections, wrapping an HDHomeRun-style source with a hard tuner
+        // limit) - both are enforced.
         $primaryUrl = null;
         $actualChannel = $channel;  // Track the actual channel being used (may differ from original if failover)
 
-        // The capacity authority is the SOURCE playlist (what streams key on) —
-        // a merged/custom wrapper may have available_streams=0 (unlimited)
-        // while its source has a hard limit (e.g. an HDHomeRun tuner pool).
-        $limitPlaylist = $channel->playlist instanceof Playlist
-            ? $channel->playlist
-            : $playlist;
+        $capacityLimitPlaylists = collect([$sourcePlaylist, $playlist])
+            ->filter()
+            ->unique('uuid')
+            ->filter(fn ($p) => $p->available_streams !== 0)
+            ->values();
 
-        if ($limitPlaylist->available_streams !== 0) {
-            // Count DISTINCT active channels: live proxy streams (which may be
-            // piggybacked by recordings) PLUS active DVR recordings. DVR
-            // recordings on direct-URL playlists (e.g. HDHomeRun tuners) never
-            // create a proxy stream, so counting streams alone lets a 5th live
-            // stream slip through while 4 recordings hold the tuners.
-            $liveIds = array_map('intval', self::getActiveLiveChannelIds($limitPlaylist->uuid));
-            $dvrChannelIds = [];
-            if ($limitPlaylist->dvrSetting) {
-                $dvrChannelIds = $limitPlaylist->dvrSetting->recordings()
-                    ->where('status', DvrRecordingStatus::Recording)
-                    ->pluck('channel_id')
-                    ->map(fn ($c) => (int) $c)
-                    ->all();
-            }
-            $activeChannelIds = array_values(array_unique(array_merge($liveIds, $dvrChannelIds)));
-            $activeStreams = count($activeChannelIds);
-
+        if ($capacityLimitPlaylists->isNotEmpty()) {
             // Keep track of original playlist in case we need to check failovers
             $originalUuid = $playlist->uuid;
+            $deniedPlaylist = null;
 
-            if ($activeStreams >= $limitPlaylist->available_streams) {
-                // DVR-wins: recordings keep their slots unconditionally, so a
-                // LIVE request evicts the oldest LIVE-VIEWER stream (never a
-                // recording-backed one) instead of being refused — recording +
-                // playback share the pool exactly as two recordings do. Only a
-                // pool full of recordings (no live stream left to evict)
-                // refuses the request.
-                $liveCandidates = collect(self::getActiveLiveStreams())
-                    ->filter(fn (array $s) => ($s['metadata']['original_playlist_uuid'] ?? $s['metadata']['playlist_uuid'] ?? null) === $limitPlaylist->uuid)
-                    ->filter(fn (array $s) => (int) ($s['metadata']['channel_id'] ?? 0) !== (int) $id)
-                    ->filter(fn (array $s) => ! in_array((int) ($s['metadata']['channel_id'] ?? 0), $dvrChannelIds, true))
-                    ->sortBy(fn (array $s) => (string) ($s['created_at'] ?? ''))
-                    ->values();
+            foreach ($capacityLimitPlaylists as $limitPlaylist) {
+                // DVR recordings hold their slot unconditionally (never evicted below), so
+                // count them alongside live viewers against this playlist's limit. Direct-URL
+                // playlists (e.g. HDHomeRun tuners) never create a proxy stream for a
+                // recording, so counting live streams alone would let extra live viewers in
+                // while recordings still occupy the underlying tuners.
+                $dvrChannelIds = $limitPlaylist->dvrSetting
+                    ? $limitPlaylist->dvrSetting->recordings()
+                        ->where('status', DvrRecordingStatus::Recording)
+                        ->pluck('channel_id')
+                        ->map(fn ($c) => (int) $c)
+                        ->all()
+                    : [];
 
-                if ($liveCandidates->isNotEmpty()) {
-                    $oldest = $liveCandidates->first();
-                    self::deleteStream((string) $oldest['stream_id']);
+                $liveIds = array_map('intval', self::getActiveLiveChannelIds($limitPlaylist->uuid));
+                $activeStreams = count(array_unique(array_merge($liveIds, $dvrChannelIds)));
 
-                    Log::debug('DVR-wins: stopped oldest live stream to free capacity for new channel request', [
-                        'channel_id' => $id,
-                        'playlist_uuid' => $limitPlaylist->uuid,
-                        'evicted_stream_id' => $oldest['stream_id'],
-                        'evicted_channel_id' => $oldest['metadata']['channel_id'] ?? null,
-                        'stream_created_at' => $oldest['created_at'] ?? null,
-                    ]);
+                if ($activeStreams >= $limitPlaylist->available_streams) {
+                    // Check if "stop oldest on limit" is enabled in settings
+                    if ($this->stopOldestOnLimit) {
+                        // DVR-wins: recordings keep their slot, so evict the oldest
+                        // LIVE-VIEWER stream tied to this playlist (never a recording-backed
+                        // one, and never the channel being requested) to make room.
+                        $liveCandidates = collect($this->getActiveLiveStreams())
+                            ->filter(fn (array $s) => ($s['metadata']['type'] ?? null) === 'channel')
+                            ->filter(fn (array $s) => ($s['metadata']['playlist_uuid'] ?? null) === $limitPlaylist->uuid
+                                || ($s['metadata']['source_playlist_uuid'] ?? null) === $limitPlaylist->uuid)
+                            ->filter(fn (array $s) => (int) ($s['metadata']['channel_id'] ?? $s['metadata']['id'] ?? 0) !== (int) $id)
+                            ->filter(fn (array $s) => ! in_array((int) ($s['metadata']['channel_id'] ?? $s['metadata']['id'] ?? 0), $dvrChannelIds, true))
+                            ->sortBy(fn (array $s) => (string) ($s['created_at'] ?? ''))
+                            ->values();
 
-                    // A live slot was freed; the recording keeps its slot.
-                    // Recompute with live streams only — the new live request
-                    // may now proceed.
-                    usleep(100000); // 100ms to allow the proxy to clean up
-                    $liveIds = array_map('intval', self::getActiveLiveChannelIds($limitPlaylist->uuid));
-                    $activeStreams = count($liveIds);
+                        if ($liveCandidates->isNotEmpty()) {
+                            $oldest = $liveCandidates->first();
+                            $this->stopStream((string) $oldest['stream_id']);
+
+                            Log::debug('Stopped oldest live stream to free capacity for new channel request', [
+                                'channel_id' => $id,
+                                'limit_playlist_uuid' => $limitPlaylist->uuid,
+                                'evicted_stream_id' => $oldest['stream_id'],
+                                'evicted_channel_id' => $oldest['metadata']['channel_id'] ?? $oldest['metadata']['id'] ?? null,
+                            ]);
+
+                            // Short delay to allow proxy to clean up
+                            usleep(100000); // 100ms
+                            $liveIds = array_map('intval', self::getActiveLiveChannelIds($limitPlaylist->uuid));
+                            $activeStreams = count(array_unique(array_merge($liveIds, $dvrChannelIds)));
+                        }
+                    }
+
+                    // If still at capacity (either setting disabled, or no evictable
+                    // live stream was found), this playlist denies the request.
+                    if ($activeStreams >= $limitPlaylist->available_streams) {
+                        $deniedPlaylist = $limitPlaylist;
+                        break;
+                    }
                 }
             }
 
-            // If still at capacity (either no live stream was evictable or the
-            // eviction failed), check failovers
-            if ($activeStreams >= $limitPlaylist->available_streams) {
-                // Primary playlist is at capacity, check failovers
+            if ($deniedPlaylist) {
+                // Primary/source playlist is at capacity, check failovers
                 $failoverChannels = $channel->failoverChannels()
                     ->select([
                         'channels.id',
@@ -1260,6 +1489,7 @@ class M3uProxyService
                         'channels.url_custom',
                         'channels.playlist_id',
                         'channels.custom_playlist_id',
+                        'channels.is_vod',
                     ])->get();
 
                 foreach ($failoverChannels as $failoverChannel) {
@@ -1290,9 +1520,8 @@ class M3uProxyService
                 if ($playlist->uuid === $originalUuid) {
                     Log::debug('Channel stream request denied - all playlists at capacity', [
                         'channel_id' => $id,
-                        'primary_playlist' => $playlist->uuid,
-                        'primary_limit' => $playlist->available_streams,
-                        'primary_active' => $activeStreams,
+                        'denied_playlist' => $deniedPlaylist->uuid,
+                        'denied_limit' => $deniedPlaylist->available_streams,
                     ]);
 
                     abort(503, 'All playlists have reached their maximum stream limit. Please try again later.');
@@ -1316,12 +1545,8 @@ class M3uProxyService
             if (! $selectedProfile) {
                 // Check if reuse was detected inside the lock (another request is creating this stream).
                 if (ProfileService::isChannelStreamActive($originalChannelId, $originalPlaylistUuid)) {
-                    // For non-transcoded streams, findExistingPooledStream only matches transcoded
-                    // streams (requires metadata.transcoding=true), so check the channel stream key
-                    // in Redis first. Then verify the proxy still has an active stream for this
-                    // channel — the Redis key can outlive the proxy stream (restart, timeout, etc.).
-                    $existingStreamId = ProfileService::getChannelActiveStreamId($originalChannelId, $originalPlaylistUuid)
-                        ?? $this->findExistingPooledStream($originalChannelId, $originalPlaylistUuid, null, null);
+                    // Redis mappings do not encode normalization mode. Verify proxy metadata.
+                    $existingStreamId = $this->findExistingPooledStream($originalChannelId, $originalPlaylistUuid, null, null, 'channel', $normalizeLiveOutput);
 
                     if ($existingStreamId && ! $isTimeshiftRequest) {
                         $activeChannelStreams = self::getActiveStreamsCountByMetadata('original_channel_id', (string) $originalChannelId);
@@ -1383,13 +1608,17 @@ class M3uProxyService
             // Use the selected profile as context if available
             $urlContext = $selectedProfile ?? $playlist;
             $primaryUrl = PlaylistUrlService::getChannelUrl($channel, $urlContext);
+
+            if ($selectedProfile) {
+                $primaryUrl = $this->applyAliasProviderUrl($primaryUrl, $playlist, $channel);
+            }
         }
         if (empty($primaryUrl)) {
             throw new Exception('Channel primary URL is empty');
         }
 
         // Check if timeshift parameters are provided
-        if ($request && ($request->filled('timeshift_duration') || $request->filled('timeshift_date') || $request->filled('utc'))) {
+        if ($isTimeshiftRequest) {
             $primaryUrl = PlaylistService::generateTimeshiftUrl($request, $primaryUrl, $playlist, $channel);
         }
 
@@ -1431,6 +1660,9 @@ class M3uProxyService
                     // Use the selected profile as context if available
                     $urlContext = $selectedProfile ?? $playlist;
                     $url = PlaylistUrlService::getChannelUrl($ch, $urlContext);
+                    if ($selectedProfile) {
+                        $url = $this->applyAliasProviderUrl($url, $playlist, $ch);
+                    }
 
                     return $this->resolveMediaServerUpstreamUrl($url)['url'] ?? $url;
                 })
@@ -1454,11 +1686,19 @@ class M3uProxyService
                 'playlist_uuid' => $playlist->uuid,  // Actual playlist being used
                 'profile_id' => $profile->id,
                 'original_channel_id' => $originalChannelId,  // For cross-provider failover pooling
+                'requested_channel_id' => $requestedChannelId,  // Searched by TvApiController::stopPlayerStream
                 'original_playlist_uuid' => $originalPlaylistUuid,  // For cross-provider failover pooling
                 'is_failover' => $isFailover,
                 'strict_live_ts' => $playlist->strict_live_ts ?? false,
                 'use_sticky_session' => $playlist->use_sticky_session ?? false,
             ];
+
+            // Tag the true source Playlist for DVR capacity accounting, but only when one
+            // exists - the proxy API rejects null metadata values, and a channel with no
+            // source Playlist (e.g. created directly under a Custom Playlist) is valid.
+            if ($actualChannel->playlist instanceof Playlist) {
+                $metadata['source_playlist_uuid'] = $actualChannel->playlist->uuid;
+            }
 
             // Add provider profile ID if using profiles
             if ($selectedProfile) {
@@ -1468,6 +1708,11 @@ class M3uProxyService
             // Track PlaylistAuth ID for per-auth stream limit enforcement
             if ($playlistAuthId) {
                 $metadata['playlist_auth_id'] = (string) $playlistAuthId;
+            }
+
+            // Catchup streams carry a different upstream URL; tag them so live pool reuse skips them
+            if ($isTimeshiftRequest) {
+                $metadata['timeshift'] = 'true';
             }
 
             Log::debug('Creating transcoded stream with provider profile', [
@@ -1502,7 +1747,7 @@ class M3uProxyService
             }
 
             // Return transcoded stream URL
-            return $this->buildTranscodeStreamUrl($streamId, $profile->format ?? 'ts', $username);
+            return $this->rememberTimeshiftSession($timeshiftSessionKey, $streamId, $this->buildTranscodeStreamUrl($streamId, $profile->format ?? 'ts', $username));
         } else {
             // Use direct streaming endpoint
             Log::debug('Creating direct stream', [
@@ -1524,9 +1769,17 @@ class M3uProxyService
                 'strict_live_ts' => $playlist->strict_live_ts ?? false,
                 'use_sticky_session' => $playlist->use_sticky_session ?? false,
                 'original_channel_id' => $originalChannelId,  // For cross-provider failover pooling
+                'requested_channel_id' => $requestedChannelId,  // Searched by TvApiController::stopPlayerStream
                 'original_playlist_uuid' => $originalPlaylistUuid,  // For cross-provider failover pooling
                 'is_failover' => $isFailover,
             ];
+
+            // Tag the true source Playlist for DVR capacity accounting, but only when one
+            // exists - the proxy API rejects null metadata values, and a channel with no
+            // source Playlist (e.g. created directly under a Custom Playlist) is valid.
+            if ($actualChannel->playlist instanceof Playlist) {
+                $metadata['source_playlist_uuid'] = $actualChannel->playlist->uuid;
+            }
 
             // Add provider profile ID if using profiles
             if ($selectedProfile) {
@@ -1538,8 +1791,14 @@ class M3uProxyService
                 $metadata['playlist_auth_id'] = (string) $playlistAuthId;
             }
 
+            // Catchup streams carry a different upstream URL; tag them so live pool reuse skips them
+            if ($isTimeshiftRequest) {
+                $metadata['timeshift'] = 'true';
+            }
+
             try {
-                $streamId = $this->createStream($primaryUrl, $failovers, $userAgent, $headers, $metadata);
+                $streamId = $this->createStream($primaryUrl, $failovers, $userAgent, $headers, $metadata,
+                    $normalizeLiveOutput && $this->isNormalizableLiveChannel($actualChannel, $primaryUrl));
             } catch (Exception $e) {
                 if ($selectedProfile && $reservationId) {
                     ProfileService::cancelReservation($selectedProfile, $reservationId);
@@ -1569,8 +1828,41 @@ class M3uProxyService
             }
 
             // Return the direct proxy URL using the stream ID
-            return $this->buildProxyUrl($streamId, $format, $username);
+            return $this->rememberTimeshiftSession($timeshiftSessionKey, $streamId, $this->buildProxyUrl($streamId, $format, $username));
         }
+    }
+
+    /**
+     * Cache key for one client's catchup session: the same client (client_id when the player
+     * sends one, otherwise its user agent) on the same IP and account, watching the same
+     * programme window of the same channel with the same transcoding profile.
+     */
+    private static function timeshiftSessionKey(Request $request, int $originalChannelId, string $originalPlaylistUuid, ?StreamProfile $profile, ?string $username): string
+    {
+        return 'timeshift_session:'.sha1(implode('|', [
+            $request->ip(),
+            $request->input('client_id') ?? $request->userAgent(),
+            $username,
+            $originalPlaylistUuid,
+            $originalChannelId,
+            $profile?->id,
+            $request->input('timeshift_duration'),
+            $request->input('timeshift_date'),
+            $request->input('utc'),
+            $request->input('lutc'),
+        ]));
+    }
+
+    /**
+     * Remember the stream created for a catchup session (see getChannelUrl()) and return its URL.
+     */
+    private function rememberTimeshiftSession(?string $sessionKey, string $streamId, string $url): string
+    {
+        if ($sessionKey !== null) {
+            Cache::put($sessionKey, ['stream_id' => $streamId, 'url' => $url], self::TIMESHIFT_SESSION_TTL);
+        }
+
+        return $url;
     }
 
     /**
@@ -1596,6 +1888,16 @@ class M3uProxyService
         $originalEpisodeId = $id;
         $originalPlaylistUuid = $playlist->uuid;
 
+        // The episode the client asked for, which differs from $originalEpisodeId when the
+        // request was swapped to a media-server episode before reaching here. The TV app
+        // stops its stream by this id.
+        $requestedEpisodeId = $request?->attributes->get('requested_episode_id') ?? $originalEpisodeId;
+
+        // The episode's true source Playlist, if it has one - distinct from $playlist,
+        // which may be a CustomPlaylist/MergedPlaylist/PlaylistAlias wrapper. See
+        // getChannelUrl() for why this is tagged/enforced independently of profiles_enabled.
+        $sourcePlaylist = $episode->playlist instanceof Playlist ? $episode->playlist : null;
+
         // Build client identifier for profile affinity tracking
         $clientIdentifier = ProfileService::buildClientIdentifier($request?->ip(), $username);
 
@@ -1619,75 +1921,104 @@ class M3uProxyService
         // Cached failover episodes so the relationship is only queried once per request
         $cachedFailoverEpisodes = null;
 
-        // Check if playlist has stream limits and if it's at capacity
-        // This check applies regardless of whether provider profiles are enabled —
-        // available_streams is the authoritative proxy-level limit.
-        if ($playlist->available_streams !== 0) {
-            $activeStreams = self::getActiveStreamsCountByMetadata('playlist_uuid', $playlist->uuid);
+        // Check if the playlist(s) this request counts against have stream limits and are
+        // at capacity. A wrapper playlist (CustomPlaylist/MergedPlaylist/PlaylistAlias) and
+        // the episode's true source Playlist can each carry their own independent cap - see
+        // getChannelUrl() for the equivalent live-channel logic this mirrors.
+        $capacityLimitPlaylists = collect([$sourcePlaylist, $playlist])
+            ->filter()
+            ->unique('uuid')
+            ->filter(fn ($p) => $p->available_streams !== 0)
+            ->values();
 
-            if ($activeStreams >= $playlist->available_streams) {
-                // Check if "stop oldest on limit" is enabled in settings
-                if ($this->stopOldestOnLimit) {
-                    // Stop the oldest stream to make room for the new one (latest wins)
-                    $stopResult = self::stopOldestPlaylistStream($playlist->uuid, $id);
+        if ($capacityLimitPlaylists->isNotEmpty()) {
+            $deniedPlaylist = null;
+            $activeStreams = 0;
 
-                    if ($stopResult['deleted_count'] > 0) {
-                        Log::debug('Stopped oldest stream to free capacity for new episode request', [
-                            'episode_id' => $id,
-                            'playlist_uuid' => $playlist->uuid,
-                            'stream_age_seconds' => $stopResult['stream_age_seconds'] ?? null,
-                        ]);
+            foreach ($capacityLimitPlaylists as $limitPlaylist) {
+                $activeStreams = count(self::getActiveLiveEpisodeIds($limitPlaylist->uuid));
 
-                        // Short delay to allow proxy to clean up
-                        usleep(100000); // 100ms
-                        $activeStreams = self::getActiveStreamsCountByMetadata('playlist_uuid', $playlist->uuid);
+                if ($activeStreams >= $limitPlaylist->available_streams) {
+                    // Check if "stop oldest on limit" is enabled in settings
+                    if ($this->stopOldestOnLimit) {
+                        // Evict the oldest LIVE episode stream tied to this playlist (never
+                        // the episode being requested) to make room for the new one.
+                        $liveCandidates = collect($this->getActiveLiveStreams())
+                            ->filter(fn (array $s) => ($s['metadata']['type'] ?? null) === 'episode')
+                            ->filter(fn (array $s) => ($s['metadata']['playlist_uuid'] ?? null) === $limitPlaylist->uuid
+                                || ($s['metadata']['source_playlist_uuid'] ?? null) === $limitPlaylist->uuid)
+                            ->filter(fn (array $s) => (int) ($s['metadata']['episode_id'] ?? $s['metadata']['id'] ?? 0) !== (int) $id)
+                            ->sortBy(fn (array $s) => (string) ($s['created_at'] ?? ''))
+                            ->values();
+
+                        if ($liveCandidates->isNotEmpty()) {
+                            $oldest = $liveCandidates->first();
+                            $this->stopStream((string) $oldest['stream_id']);
+
+                            Log::debug('Stopped oldest episode stream to free capacity for new episode request', [
+                                'episode_id' => $id,
+                                'limit_playlist_uuid' => $limitPlaylist->uuid,
+                                'evicted_stream_id' => $oldest['stream_id'],
+                            ]);
+
+                            // Short delay to allow proxy to clean up
+                            usleep(100000); // 100ms
+                            $activeStreams = count(self::getActiveLiveEpisodeIds($limitPlaylist->uuid));
+                        }
+                    }
+
+                    // If still at capacity (either setting disabled, or no evictable
+                    // live stream was found), this playlist denies the request.
+                    if ($activeStreams >= $limitPlaylist->available_streams) {
+                        $deniedPlaylist = $limitPlaylist;
+                        break;
+                    }
+                }
+            }
+
+            // If still at capacity, try episode failovers.
+            if ($deniedPlaylist) {
+                $cachedFailoverEpisodes = $requestedEpisode->failoverEpisodes()->with('playlist')->get();
+                foreach ($cachedFailoverEpisodes as $failoverEpisode) {
+                    $failoverPlaylist = $failoverEpisode->getEffectivePlaylist();
+                    if (! $failoverPlaylist) {
+                        continue;
+                    }
+
+                    if ($failoverPlaylist->available_streams === 0) {
+                        $playlist = $failoverPlaylist;
+                        $episode = $failoverEpisode;
+                        $actualEpisode = $failoverEpisode;
+                        $id = $episode->id;
+                        break;
+                    }
+
+                    $failoverActiveStreams = self::getActiveStreamsCountByMetadata('playlist_uuid', $failoverPlaylist->uuid);
+                    if ($failoverActiveStreams < $failoverPlaylist->available_streams) {
+                        $playlist = $failoverPlaylist;
+                        $episode = $failoverEpisode;
+                        $actualEpisode = $failoverEpisode;
+                        $id = $episode->id;
+                        break;
                     }
                 }
 
-                // If still at capacity (either setting disabled or stop failed), try episode failovers.
-                if ($activeStreams >= $playlist->available_streams) {
-                    $cachedFailoverEpisodes = $requestedEpisode->failoverEpisodes()->with('playlist')->get();
-                    foreach ($cachedFailoverEpisodes as $failoverEpisode) {
-                        $failoverPlaylist = $failoverEpisode->getEffectivePlaylist();
-                        if (! $failoverPlaylist) {
-                            continue;
-                        }
+                if ($actualEpisode->id === $originalEpisodeId) {
+                    Log::debug('Episode stream request denied - all playlists at capacity', [
+                        'episode_id' => $originalEpisodeId,
+                        'denied_playlist' => $deniedPlaylist->uuid,
+                        'limit' => $deniedPlaylist->available_streams,
+                        'active' => $activeStreams,
+                    ]);
 
-                        if ($failoverPlaylist->available_streams === 0) {
-                            $playlist = $failoverPlaylist;
-                            $episode = $failoverEpisode;
-                            $actualEpisode = $failoverEpisode;
-                            $id = $episode->id;
-                            break;
-                        }
+                    abort(503, 'All playlists have reached their maximum stream limit. Please try again later.');
+                }
 
-                        $failoverActiveStreams = self::getActiveStreamsCountByMetadata('playlist_uuid', $failoverPlaylist->uuid);
-                        if ($failoverActiveStreams < $failoverPlaylist->available_streams) {
-                            $playlist = $failoverPlaylist;
-                            $episode = $failoverEpisode;
-                            $actualEpisode = $failoverEpisode;
-                            $id = $episode->id;
-                            break;
-                        }
-                    }
-
-                    if ($actualEpisode->id === $originalEpisodeId) {
-                        Log::debug('Episode stream request denied - all playlists at capacity', [
-                            'episode_id' => $originalEpisodeId,
-                            'playlist' => $playlist->uuid,
-                            'limit' => $playlist->available_streams,
-                            'active' => $activeStreams,
-                        ]);
-
-                        abort(503, 'All playlists have reached their maximum stream limit. Please try again later.');
-                    }
-
-                    $profileSourcePlaylist = null;
-                    if ($playlist instanceof Playlist && $playlist->profiles_enabled) {
-                        $profileSourcePlaylist = $playlist;
-                    } elseif ($episode->playlist instanceof Playlist && $episode->playlist->profiles_enabled) {
-                        $profileSourcePlaylist = $episode->playlist;
-                    }
+                $profileSourcePlaylist = null;
+                if ($playlist instanceof Playlist && $playlist->profiles_enabled) {
+                    $profileSourcePlaylist = $playlist;
+                } elseif ($episode->playlist instanceof Playlist && $episode->playlist->profiles_enabled) {
+                    $profileSourcePlaylist = $episode->playlist;
                 }
             }
         }
@@ -1797,7 +2128,7 @@ class M3uProxyService
             ]);
 
             // Transform URL using selected profile
-            $url = $selectedProfile->transformEpisodeUrl($episode);
+            $url = $this->applyAliasProviderUrl($selectedProfile->transformEpisodeUrl($episode), $playlist, $episode);
         }
 
         // Media-server-backed episodes (Plex/Emby/Jellyfin/WebDAV/AIOStreams) store our own
@@ -1846,9 +2177,17 @@ class M3uProxyService
                 'strict_live_ts' => $playlist->strict_live_ts ?? false,
                 'use_sticky_session' => $playlist->use_sticky_session ?? false,
                 'original_episode_id' => $originalEpisodeId,           // Enables findExistingPooledStream reuse
+                'requested_episode_id' => $requestedEpisodeId,         // Searched by TvApiController::stopPlayerStream
                 'original_playlist_uuid' => $originalPlaylistUuid,
                 'is_failover' => $actualEpisode->id !== $originalEpisodeId,
             ];
+
+            // Tag the true source Playlist for wrapper-aware capacity accounting, but only
+            // when one exists - the proxy API rejects null metadata values, and an episode
+            // with no source Playlist (e.g. from a Custom Playlist-only entry) is valid.
+            if ($actualEpisode->playlist instanceof Playlist) {
+                $metadata['source_playlist_uuid'] = $actualEpisode->playlist->uuid;
+            }
 
             // Add provider profile ID if using profiles
             if ($selectedProfile) {
@@ -1893,9 +2232,17 @@ class M3uProxyService
                 'strict_live_ts' => $playlist->strict_live_ts ?? false,
                 'use_sticky_session' => $playlist->use_sticky_session ?? false,
                 'original_episode_id' => $originalEpisodeId,           // Enables findExistingPooledStream reuse
+                'requested_episode_id' => $requestedEpisodeId,         // Searched by TvApiController::stopPlayerStream
                 'original_playlist_uuid' => $originalPlaylistUuid,
                 'is_failover' => $actualEpisode->id !== $originalEpisodeId,
             ];
+
+            // Tag the true source Playlist for wrapper-aware capacity accounting, but only
+            // when one exists - the proxy API rejects null metadata values, and an episode
+            // with no source Playlist (e.g. from a Custom Playlist-only entry) is valid.
+            if ($actualEpisode->playlist instanceof Playlist) {
+                $metadata['source_playlist_uuid'] = $actualEpisode->playlist->uuid;
+            }
 
             // Add provider profile ID if using profiles
             if ($selectedProfile) {
@@ -2049,6 +2396,33 @@ class M3uProxyService
             ]);
 
             return ['success' => false, 'triggered_count' => 0, 'stream_ids' => [], 'error' => $e->getMessage()];
+        }
+    }
+
+    /**
+     * Whether the external proxy still has the given stream (it removes streams once idle).
+     */
+    public function streamExists(string $streamId): bool
+    {
+        if (empty($this->apiBaseUrl)) {
+            return false;
+        }
+
+        try {
+            return Http::timeout(5)->acceptJson()
+                ->withHeaders($this->apiToken ? [
+                    'X-API-Token' => $this->apiToken,
+                ] : [])
+                ->get($this->apiBaseUrl.'/streams/'.$streamId)
+                ->successful();
+        } catch (Exception $e) {
+            Log::warning('Error checking proxy stream', [
+                'stream_id' => $streamId,
+                'exception_class' => $e::class,
+                'exception_code' => $e->getCode(),
+            ]);
+
+            return false;
         }
     }
 
@@ -2405,6 +2779,7 @@ class M3uProxyService
         ?string $userAgent = null,
         ?array $headers = [],
         ?array $metadata = [],
+        bool $normalizeLiveOutput = false,
     ): string {
         try {
             $endpoint = $this->apiBaseUrl.'/streams';
@@ -2414,6 +2789,11 @@ class M3uProxyService
                 'url' => $url,
                 'metadata' => $metadata,
             ];
+
+            if ($normalizeLiveOutput) {
+                $payload['normalize_live_output'] = true;
+                $payload['normalization_encoder'] = $this->normalizationEncoder();
+            }
 
             // Handle strict_live_ts flag if set in metadata
             if ($metadata['strict_live_ts'] ?? false) {
@@ -2427,19 +2807,7 @@ class M3uProxyService
                 unset($metadata['use_sticky_session']);
             }
 
-            // Apply global silence detection settings from GeneralSettings
-            try {
-                $generalSettings = app(GeneralSettings::class);
-                if ($generalSettings->enable_silence_detection) {
-                    $payload['enable_silence_detection'] = true;
-                    $payload['silence_threshold_db'] = $generalSettings->silence_threshold_db ?? -50.0;
-                    $payload['silence_duration'] = $generalSettings->silence_duration ?? 3.0;
-                    $payload['silence_check_interval'] = $generalSettings->silence_check_interval ?? 10.0;
-                    $payload['silence_failover_threshold'] = $generalSettings->silence_failover_threshold ?? 3;
-                    $payload['silence_monitoring_grace_period'] = $generalSettings->silence_monitoring_grace_period ?? 15.0;
-                }
-            } catch (Exception $e) {
-            }
+            $this->applyGlobalStreamSettings($payload);
 
             // If using failovers, provide the callback URL for smart failover handling, or list of URLs
             if ($failovers) {
@@ -2588,19 +2956,7 @@ class M3uProxyService
                 unset($metadata['use_sticky_session']);
             }
 
-            // Apply global silence detection settings from GeneralSettings
-            try {
-                $generalSettings = app(GeneralSettings::class);
-                if ($generalSettings->enable_silence_detection) {
-                    $payload['enable_silence_detection'] = true;
-                    $payload['silence_threshold_db'] = $generalSettings->silence_threshold_db ?? -50.0;
-                    $payload['silence_duration'] = $generalSettings->silence_duration ?? 3.0;
-                    $payload['silence_check_interval'] = $generalSettings->silence_check_interval ?? 10.0;
-                    $payload['silence_failover_threshold'] = $generalSettings->silence_failover_threshold ?? 3;
-                    $payload['silence_monitoring_grace_period'] = $generalSettings->silence_monitoring_grace_period ?? 15.0;
-                }
-            } catch (Exception $e) {
-            }
+            $this->applyGlobalStreamSettings($payload);
 
             // If using failovers, provide the callback URL for smart failover handling, or list of URLs
             if ($failovers) {
@@ -2680,6 +3036,31 @@ class M3uProxyService
                 'exception_code' => $e->getCode(),
             ]);
             throw $e;
+        }
+    }
+
+    /**
+     * Apply the global failover settings from GeneralSettings (silence detection and
+     * same-URL retry on a silent close) to a stream creation payload.
+     *
+     * @param  array<string, mixed>  $payload
+     */
+    protected function applyGlobalStreamSettings(array &$payload): void
+    {
+        try {
+            $generalSettings = app(GeneralSettings::class);
+            if ($generalSettings->enable_silence_detection) {
+                $payload['enable_silence_detection'] = true;
+                $payload['silence_threshold_db'] = $generalSettings->silence_threshold_db ?? -50.0;
+                $payload['silence_duration'] = $generalSettings->silence_duration ?? 3.0;
+                $payload['silence_check_interval'] = $generalSettings->silence_check_interval ?? 10.0;
+                $payload['silence_failover_threshold'] = $generalSettings->silence_failover_threshold ?? 3;
+                $payload['silence_monitoring_grace_period'] = $generalSettings->silence_monitoring_grace_period ?? 15.0;
+            }
+            $payload['silent_close_retry_window'] = $generalSettings->silent_close_retry_enabled
+                ? max(0, (int) ($generalSettings->silent_close_retry_window ?? 60))
+                : 0;
+        } catch (Exception $e) {
         }
     }
 
@@ -2887,6 +3268,15 @@ class M3uProxyService
         return $url.$separator.http_build_query(['username' => $username]);
     }
 
+    /**
+     * Only raw live MPEG-TS inputs are supported. Extensionless IPTV endpoints are
+     * allowed, but opting in still requires the operator to verify MPEG-TS codecs.
+     */
+    private function isNormalizableLiveChannel(Channel $channel, ?string $url): bool
+    {
+        return $channel->is_vod === false && in_array(strtolower($this->getFormatFromUrl($url)), ['', 'ts', 'mpegts'], true);
+    }
+
     private function getFormatFromUrl(?string $url): string
     {
         $path = parse_url($url ?? '', PHP_URL_PATH) ?? $url ?? '';
@@ -2950,6 +3340,14 @@ class M3uProxyService
         return ProxyFacade::getBaseUrl().'/m3u-proxy';
     }
 
+    protected function normalizationEncoder(): string
+    {
+        // Only expose the worker's supported presets; never send arbitrary commands/devices.
+        $encoder = app(GeneralSettings::class)->proxy_normalization_encoder;
+
+        return in_array($encoder, ['cpu', 'vaapi', 'qsv'], true) ? $encoder : 'cpu';
+    }
+
     /**
      * Find an existing pooled transcoded stream for the given channel.
      * This allows multiple clients to connect to the same transcoded stream without
@@ -2965,7 +3363,7 @@ class M3uProxyService
      * @param  string  $type  The type of model ('channel' or 'episode') for metadata keys
      * @return string|null Stream ID if found, null otherwise
      */
-    protected function findExistingPooledStream(int $modelId, string $playlistUuid, ?int $profileId = null, ?int $providerProfileId = null, string $type = 'channel'): ?string
+    protected function findExistingPooledStream(int $modelId, string $playlistUuid, ?int $profileId = null, ?int $providerProfileId = null, string $type = 'channel', bool $normalizeLiveOutput = false): ?string
     {
         try {
             // Query m3u-proxy for streams by ORIGINAL channel ID metadata
@@ -2998,7 +3396,38 @@ class M3uProxyService
                 // 3. If profileId specified: must be a transcoded stream with matching StreamProfile ID
                 //    If profileId is null: must be a direct (non-transcoded) stream
                 // 4. Same PlaylistProfile ID (provider profile, if specified)
+                // 5. Not a catchup stream (same channel, but a different upstream URL)
+                if (($metadata['timeshift'] ?? null) === 'true') {
+                    continue;
+                }
+
                 $isTranscoded = ($metadata['transcoding'] ?? null) === 'true';
+                if ($type === 'channel' && $profileId === null) {
+                    $expectedNormalization = false;
+                    if ($normalizeLiveOutput) {
+                        // Capacity failover may have selected a non-TS or VOD source.
+                        // Match creation's effective mode using the pool's actual source,
+                        // never the original requested URL. Unknown opt-in sources fail closed.
+                        $sourceUrl = $stream['url'] ?? null;
+                        if (($metadata['type'] ?? null) !== 'channel'
+                            || empty($metadata['id']) || empty($metadata['playlist_uuid'])
+                            || ! is_string($sourceUrl) || $sourceUrl === '') {
+                            continue;
+                        }
+                        $sourceChannel = Channel::withoutGlobalScope(ExcludeAioFailoverClonesScope::class)->find($metadata['id']);
+                        if (! $sourceChannel || $sourceChannel->is_vod === null) {
+                            continue;
+                        }
+                        $expectedNormalization = $this->isNormalizableLiveChannel($sourceChannel, $sourceUrl);
+                    }
+                    if ((($metadata['normalize_live_output'] ?? null) === 'true') !== $expectedNormalization) {
+                        continue;
+                    }
+                    // Older normalized pools predate encoder metadata and always used CPU.
+                    if ($expectedNormalization && ($metadata['normalization_encoder'] ?? 'cpu') !== $this->normalizationEncoder()) {
+                        continue;
+                    }
+                }
                 $transcodingMatch = $profileId !== null
                     ? ($isTranscoded && ($metadata['profile_id'] ?? null) == $profileId)
                     : ! $isTranscoded;
@@ -3280,7 +3709,7 @@ class M3uProxyService
             // If the failover chain is exhausted for an AIOStreams-backed channel,
             // asynchronously re-resolve fresh candidates for the *next* playback
             // attempt rather than trying to serve a URL synchronously mid-request.
-            if ($nextUrl === null && $channel->aio_integration_id) {
+            if ($nextUrl === null && $channel->aio_integration_id && config('services.aiostreams.enabled', true)) {
                 ResolveAioStreamsChannel::dispatch($channel->id);
             }
 
@@ -3415,7 +3844,7 @@ class M3uProxyService
             // If the failover chain is exhausted for an AIOStreams-backed episode,
             // asynchronously re-resolve fresh candidates for the *next* playback
             // attempt rather than trying to serve a URL synchronously mid-request.
-            if ($nextUrl === null && $episode->is_custom && $episode->aio_item_id) {
+            if ($nextUrl === null && $episode->is_custom && $episode->aio_item_id && config('services.aiostreams.enabled', true)) {
                 ResolveAioStreamsEpisode::dispatch($episode->id);
             }
 
@@ -3604,6 +4033,68 @@ class M3uProxyService
     }
 
     /**
+     * Check that the proxy's webhooks reach M3U Editor: the webhook must be
+     * registered with the proxy (registering it now if it isn't), and the
+     * proxy must deliver a test event to it. Proxy > Watch History needs
+     * this, as it's built from those events.
+     *
+     * @return array{ok: bool, reason: 'ok'|'not_configured'|'proxy_unreachable'|'not_registered'|'delivery_failed'|'test_failed', message: string}
+     */
+    public function checkWebhook(bool $registerIfMissing = true): array
+    {
+        $fail = fn (string $reason, string $message): array => ['ok' => false, 'reason' => $reason, 'message' => $message];
+
+        $webhookUrl = $this->getWebhookUrl();
+        if (! $webhookUrl || empty($this->apiBaseUrl)) {
+            return $fail('not_configured', __('Set the Resolver URL under Settings > Proxy > Failover & Recovery, the address the proxy uses to reach M3U Editor. Webhooks are sent there.'));
+        }
+
+        $request = fn (int $timeout) => Http::timeout($timeout)
+            ->acceptJson()
+            ->withHeaders($this->apiToken ? ['X-API-Token' => $this->apiToken] : []);
+
+        try {
+            $list = $request(5)->get($this->apiBaseUrl.'/webhooks');
+        } catch (ConnectionException) {
+            return $fail('proxy_unreachable', __('M3U Editor could not reach the proxy.'));
+        }
+
+        if (! $list->successful()) {
+            return $fail('proxy_unreachable', __('The proxy answered HTTP :status when listing webhooks.', ['status' => $list->status()]));
+        }
+
+        $registered = collect($list->json('webhooks', []))->contains('url', $webhookUrl);
+        if (! $registered) {
+            if ($registerIfMissing) {
+                Artisan::call('m3u-proxy:register-webhook');
+
+                return $this->checkWebhook(registerIfMissing: false);
+            }
+
+            return $fail('not_registered', __('The webhook isn\'t registered with the proxy, and registering it failed. Check the proxy\'s logs.'));
+        }
+
+        try {
+            $test = $request(20)->post($this->apiBaseUrl.'/webhooks/test?'.http_build_query(['webhook_url' => $webhookUrl]));
+        } catch (ConnectionException) {
+            return $fail('proxy_unreachable', __('M3U Editor could not reach the proxy.'));
+        }
+
+        if ($test->successful()) {
+            return ['ok' => true, 'reason' => 'ok', 'message' => __('The proxy delivered a test event to M3U Editor.')];
+        }
+
+        if ($test->status() !== 502) {
+            return $fail('test_failed', __('The proxy answered HTTP :status when sending a test event.', ['status' => $test->status()]));
+        }
+
+        $port = parse_url($webhookUrl, PHP_URL_PORT);
+        $host = parse_url($webhookUrl, PHP_URL_HOST).($port ? ":{$port}" : '');
+
+        return $fail('delivery_failed', __('The proxy couldn\'t deliver a test event to M3U Editor at :host. Check that the proxy can reach that address, and that both use the same API token.', ['host' => $host]));
+    }
+
+    /**
      * Get the webhook callback URL for m3u-proxy to send webhook events.
      *
      * @return string|null The webhook callback endpoint URL, or null if not configured
@@ -3655,11 +4146,14 @@ class M3uProxyService
 
         $networkId = $recording->uuid;
 
+        // Record from now (a late start or a resume) to the scheduled end, so a
+        // restarted capture doesn't overrun the airing window.
         $durationSeconds = 0;
         if ($recording->scheduled_start && $recording->scheduled_end) {
-            $durationSeconds = (int) abs($recording->scheduled_end->diffInSeconds($recording->scheduled_start));
-            // Add end-late buffer
-            $durationSeconds += (int) $setting->resolveEndLateSeconds(null);
+            // scheduled_end already includes the rule's end-late/finish-early padding,
+            // so adding the playlist default again would over-record.
+            $startsAt = now()->max($recording->scheduled_start);
+            $durationSeconds = max(0, (int) $startsAt->diffInSeconds($recording->scheduled_end, false));
         }
 
         // When transcoding is enabled the proxy runs FFmpeg for the DVR broadcast
@@ -3696,6 +4190,38 @@ class M3uProxyService
         }
 
         return $networkId;
+    }
+
+    /**
+     * Network ids of every broadcast the proxy currently knows about, across all
+     * users (unlike fetchBroadcasts(), which is scoped to the logged-in user).
+     *
+     * @return list<string>|null null when the proxy could not be asked, so callers
+     *                           never act on "missing" when the answer is unknown
+     */
+    public function activeBroadcastIds(): ?array
+    {
+        if (empty($this->apiBaseUrl)) {
+            return null;
+        }
+
+        try {
+            $response = Http::connectTimeout(2)
+                ->timeout(5)
+                ->acceptJson()
+                ->withHeaders($this->apiToken ? ['X-API-Token' => $this->apiToken] : [])
+                ->get($this->apiBaseUrl.'/broadcast');
+
+            if (! $response->successful()) {
+                return null;
+            }
+
+            return array_values(array_filter(array_column($response->json('broadcasts') ?? [], 'network_id')));
+        } catch (Exception $e) {
+            Log::warning('Unable to list proxy broadcasts: '.$e->getMessage());
+
+            return null;
+        }
     }
 
     /**

@@ -6,7 +6,7 @@
         x-data="{
         intervalSeconds: (() => { const s = Number(localStorage.getItem('streamMonitor.refreshInterval')); return [0, 3, 5, 10, 30].includes(s) ? s : {{ $refreshInterval }}; })(),
         intervalId: null,
-        showUrls: (() => { const v = localStorage.getItem('streamMonitor.showUrls'); return v === null ? true : v === '1'; })(),
+        showUrls: @js($privacyMode) || (() => { const v = localStorage.getItem('streamMonitor.showUrls'); return v === null ? true : v === '1'; })(),
         startPolling() {
             this.stopPolling();
             if (this.intervalSeconds <= 0) return;
@@ -21,6 +21,12 @@
                 clearInterval(this.intervalId);
                 this.intervalId = null;
             }
+        },
+        onVisibilityChange: null,
+        // Alpine calls this when SPA navigation removes the page; there's no alpine:destroy event.
+        destroy() {
+            this.stopPolling();
+            document.removeEventListener('visibilitychange', this.onVisibilityChange);
         }
     }"
         x-init="
@@ -32,15 +38,12 @@
             $watch('showUrls', (value) => {
                 localStorage.setItem('streamMonitor.showUrls', value ? '1' : '0');
             });
-            const onVisibilityChange = () => {
+            onVisibilityChange = () => {
                 if (document.visibilityState === 'visible' && intervalSeconds > 0) {
                     $wire.refreshData();
                 }
             };
             document.addEventListener('visibilitychange', onVisibilityChange);
-            $el.addEventListener('alpine:destroy', () =>
-                document.removeEventListener('visibilitychange', onVisibilityChange),
-            );
         "
         x-on:beforeunload.window="stopPolling()"
     >
@@ -128,17 +131,19 @@
                 </x-filament::badge>
             </div>
 
-            <div class="flex items-center">
-                <x-filament::button
-                    color="gray"
-                    size="sm"
-                    @click="showUrls = ! showUrls"
-                    x-bind:icon="showUrls ? 'heroicon-o-eye-slash' : 'heroicon-o-eye'"
-                    aria-label="Toggle URL visibility"
-                >
-                    <span x-text="showUrls ? 'Hide URLs' : 'Show URLs'"></span>
-                </x-filament::button>
-            </div>
+            @unless ($privacyMode)
+                <div class="flex items-center">
+                    <x-filament::button
+                        color="gray"
+                        size="sm"
+                        @click="showUrls = ! showUrls"
+                        x-bind:icon="showUrls ? 'heroicon-o-eye-slash' : 'heroicon-o-eye'"
+                        aria-label="{{ __('Toggle URL visibility') }}"
+                    >
+                        <span x-text="showUrls ? @js(__('Hide URLs')) : @js(__('Show URLs'))"></span>
+                    </x-filament::button>
+                </div>
+            @endunless
         </div>
 
         <!-- Streams List -->
@@ -161,7 +166,7 @@
                                 <li>The m3u-proxy server is running</li>
                                 <li>
                                     The proxy URL is configured correctly:
-                                    <code class="rounded bg-red-200 px-1 py-0.5 text-xs dark:bg-red-800">{{ config('proxy.m3u_proxy_url') ?? url('/m3u-proxy') }}</code>
+                                    <code class="privacy-sensitive rounded bg-red-200 px-1 py-0.5 text-xs dark:bg-red-800">{{ config('proxy.m3u_proxy_url') ?? url('/m3u-proxy') }}</code>
                                 </li>
                                 <li>There are no firewall or network issues blocking the connection</li>
                             </ul>
@@ -226,7 +231,7 @@
                                             @endif
                                         </p>
                                         <p
-                                            class="truncate font-mono text-xs text-gray-500 transition-[filter] duration-150 dark:text-gray-400"
+                                            class="privacy-sensitive truncate font-mono text-xs text-gray-500 transition-[filter] duration-150 dark:text-gray-400"
                                             :class="{ 'blur-xs select-none': ! showUrls }"
                                         >
                                             {{ $stream['source_url'] }}
@@ -734,7 +739,7 @@
                                                         <p class="mt-1 text-xs text-orange-600 dark:text-orange-300">
                                                             Original URL:
                                                             <span
-                                                                class="font-mono break-all transition-[filter] duration-150"
+                                                                class="privacy-sensitive font-mono break-all transition-[filter] duration-150"
                                                                 :class="{ 'blur-sm select-none': ! showUrls }"
                                                             >{{ $stream['source_url'] }}</span>
                                                         </p>
@@ -742,7 +747,7 @@
                                                             <p class="text-xs text-orange-600 dark:text-orange-300">
                                                                 Current URL:
                                                                 <span
-                                                                    class="font-mono break-all transition-[filter] duration-150"
+                                                                    class="privacy-sensitive font-mono break-all transition-[filter] duration-150"
                                                                     :class="{ 'blur-sm select-none': ! showUrls }"
                                                                 >{{ $stream['current_url'] }}</span>
                                                             </p>
@@ -771,7 +776,7 @@
                                                                     {{ $index + 1 }}
                                                                 </x-filament::badge>
                                                                 <span
-                                                                    class="transition-[filter] duration-150 {{ $stream['current_failover_index'] === $index + 1 ? 'text-orange-600 dark:text-orange-400 font-medium' : '' }}"
+                                                                    class="transition-[filter] duration-150 privacy-sensitive {{ $stream['current_failover_index'] === $index + 1 ? 'text-orange-600 dark:text-orange-400 font-medium' : '' }}"
                                                                     :class="{ 'blur-sm select-none': ! showUrls }"
                                                                 >
                                                                     {{ $url }}

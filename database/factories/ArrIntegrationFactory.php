@@ -51,4 +51,18 @@ class ArrIntegrationFactory extends Factory
             'guest_enabled' => true,
         ]);
     }
+
+    public function cacheEnabled(): static
+    {
+        return $this->state(fn (): array => [
+            'cache_enabled' => true,
+        ]);
+    }
+
+    public function cacheFailback(): static
+    {
+        return $this->state(fn (): array => [
+            'cache_failback' => true,
+        ]);
+    }
 }

@@ -7,6 +7,7 @@ use App\Http\Controllers\Controller;
 use App\Models\PlaylistAlias;
 use App\Models\PushDeviceToken;
 use App\Models\TvDevice;
+use App\Models\TvDeviceLog;
 use App\Models\TvNotification;
 use App\Services\M3uProxyService;
 use App\Settings\GeneralSettings;
@@ -331,8 +332,10 @@ class TvApiController extends Controller
             'client_id' => ['required', 'string', 'max:128', 'regex:/^[\w-]+$/'],
         ]);
 
+        // Match on the ID the TV asked for. The stream may be for another item: a media-server
+        // copy, a catchup failover, or a live failover the proxy fell back to.
         $isSeries = $data['type'] === 'series';
-        $field = $isSeries ? 'episode_id' : 'channel_id';
+        $field = $isSeries ? 'requested_episode_id' : 'requested_channel_id';
         $id = $isSeries ? $data['episode_id'] : $data['stream_id'];
 
         $belongsToPlaylist = $isSeries
@@ -371,6 +374,42 @@ class TvApiController extends Controller
                 });
             }
         });
+    }
+
+    /**
+     * POST /api/tv/{username}/{password}/logs
+     *
+     * Stores a diagnostic log snapshot from the app's Logs & Diagnostics
+     * screen against this device's registry row, for an admin to read from
+     * Registered Devices. The app sends the same identity query params as its
+     * notifications call, so the row is upserted here too. Only the newest
+     * TvDeviceLog::KEEP_PER_DEVICE uploads are kept per device.
+     */
+    public function uploadLogs(Request $request): JsonResponse
+    {
+        $auth = $this->resolveAuth($request);
+
+        $data = $request->validate([
+            'log' => ['required', 'string', 'max:'.TvDeviceLog::MAX_BYTES],
+        ]);
+
+        abort_if($this->touchDeviceRegistry($request, $auth, $auth['playlist']), 403, 'Device access revoked.');
+
+        $device = TvDevice::where('device_id', (string) $request->query('device_id', ''))->first();
+        abort_if($device === null, 422, 'Missing or unknown device_id.');
+
+        $log = $device->logs()->create([
+            'app_version' => $device->app_version,
+            'size_bytes' => strlen($data['log']),
+            'content' => $data['log'],
+        ]);
+
+        $staleIds = $device->logs()->pluck('id')->slice(TvDeviceLog::KEEP_PER_DEVICE);
+        if ($staleIds->isNotEmpty()) {
+            TvDeviceLog::whereIn('id', $staleIds)->delete();
+        }
+
+        return response()->json(['ok' => true, 'id' => $log->id]);
     }
 
     /**

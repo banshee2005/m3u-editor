@@ -1,8 +1,11 @@
 <?php
 
+use App\Http\Controllers\LogoProxyController;
+use App\Models\AedProfile;
 use App\Models\Channel;
 use App\Models\Epg;
 use App\Models\EpgChannel;
+use App\Models\Group;
 use App\Models\Playlist;
 use App\Models\PlaylistAuth;
 use App\Models\User;
@@ -354,4 +357,324 @@ it('rejects batch EPG for network playlists', function () {
     $this->getJson(batchUrl($auth->username, $auth->password, ['stream_ids' => '1']))
         ->assertStatus(400)
         ->assertJsonPath('error', 'Batch EPG not supported for network playlists');
+});
+
+it('omits extended programme details unless the client asks for them', function () {
+    $ctx = makeBatchChannel($this->user, $this->playlist, 'channel.plain');
+
+    putProgramme($ctx['epg'], Carbon::now()->format('Y-m-d'), 'channel.plain', [
+        'id' => 'plain-1', 'title' => 'Plain Show', 'desc' => '',
+        'start' => Carbon::now()->addMinutes(5)->format('Y-m-d H:i:s'),
+        'stop' => Carbon::now()->addHour()->format('Y-m-d H:i:s'),
+        'category' => 'Drama',
+        'icon' => 'https://images.example/plain.jpg',
+    ]);
+
+    $response = $this->getJson(batchUrl($this->username, $this->password, [
+        'stream_ids' => (string) $ctx['channel']->id,
+    ]))->assertOk();
+
+    $listing = collect($response->json((string) $ctx['channel']->id.'.epg_listings'))
+        ->first(fn ($p) => $p['id'] === 'plain-1');
+
+    expect($listing)->not->toHaveKeys(['category', 'icon']);
+});
+
+it('includes extended programme details when details=1', function () {
+    $this->playlist->update(['enable_logo_proxy' => false]);
+    $ctx = makeBatchChannel($this->user, $this->playlist, 'channel.rich');
+
+    putProgramme($ctx['epg'], Carbon::now()->format('Y-m-d'), 'channel.rich', [
+        'id' => 'rich-1', 'title' => 'Rich Show', 'desc' => 'Plenty going on.',
+        'start' => Carbon::now()->addMinutes(5)->format('Y-m-d H:i:s'),
+        'stop' => Carbon::now()->addHour()->format('Y-m-d H:i:s'),
+        'category' => 'Drama',
+        'rating' => 'TV-14',
+        'icon' => 'https://images.example/rich.jpg',
+        'episode_num' => '1.4.',
+        'episode_nums' => [['system' => 'xmltv_ns', 'value' => '1.4.']],
+        'new' => true,
+        'premiere' => false,
+        'previously_shown' => false,
+        'production_year' => 2024,
+    ]);
+    putProgramme($ctx['epg'], Carbon::now()->format('Y-m-d'), 'channel.rich', [
+        'id' => 'bare-1', 'title' => 'Bare Show', 'desc' => '',
+        'start' => Carbon::now()->addHours(2)->format('Y-m-d H:i:s'),
+        'stop' => Carbon::now()->addHours(3)->format('Y-m-d H:i:s'),
+    ]);
+
+    $response = $this->getJson(batchUrl($this->username, $this->password, [
+        'stream_ids' => (string) $ctx['channel']->id,
+        'details' => 1,
+    ]))->assertOk();
+
+    $listings = collect($response->json((string) $ctx['channel']->id.'.epg_listings'))->keyBy('id');
+
+    expect($listings['rich-1'])->toMatchArray([
+        'category' => 'Drama',
+        'rating' => 'TV-14',
+        'icon' => 'https://images.example/rich.jpg',
+        'season' => 2,
+        'episode' => 5,
+        'is_new' => 1,
+        'year' => 2024,
+    ])
+        ->and($listings['rich-1'])->not->toHaveKeys(['premiere', 'previously_shown'])
+        ->and($listings['bare-1'])->not->toHaveKeys(['category', 'rating', 'icon', 'season', 'episode', 'is_new', 'year']);
+});
+
+it('routes extended programme icons through the logo proxy when the playlist enables it', function () {
+    $this->playlist->update(['enable_logo_proxy' => true]);
+    $ctx = makeBatchChannel($this->user, $this->playlist, 'channel.proxied');
+
+    putProgramme($ctx['epg'], Carbon::now()->format('Y-m-d'), 'channel.proxied', [
+        'id' => 'proxied-1', 'title' => 'Proxied Show', 'desc' => '',
+        'start' => Carbon::now()->addMinutes(5)->format('Y-m-d H:i:s'),
+        'stop' => Carbon::now()->addHour()->format('Y-m-d H:i:s'),
+        'icon' => 'https://images.example/proxied.jpg',
+    ]);
+
+    $response = $this->getJson(batchUrl($this->username, $this->password, [
+        'stream_ids' => (string) $ctx['channel']->id,
+        'details' => 1,
+    ]))->assertOk();
+
+    $listing = collect($response->json((string) $ctx['channel']->id.'.epg_listings'))
+        ->first(fn ($p) => $p['id'] === 'proxied-1');
+
+    expect($listing['icon'])->toBe(LogoProxyController::generateProxyUrl('https://images.example/proxied.jpg'));
+});
+
+it('prefers the alternative image closest to 16:9 for the guide artwork', function () {
+    $this->playlist->update(['enable_logo_proxy' => false]);
+    $ctx = makeBatchChannel($this->user, $this->playlist, 'channel.art');
+
+    putProgramme($ctx['epg'], Carbon::now()->format('Y-m-d'), 'channel.art', [
+        'id' => 'wide-1', 'title' => 'Wide Art', 'desc' => '',
+        'start' => Carbon::now()->addMinutes(5)->format('Y-m-d H:i:s'),
+        'stop' => Carbon::now()->addHour()->format('Y-m-d H:i:s'),
+        'icon' => 'https://images.example/square.jpg',
+        'images' => [
+            ['url' => 'https://images.example/poster.jpg', 'type' => 'poster', 'width' => 480, 'height' => 720, 'orient' => 'P', 'size' => 2],
+            ['url' => 'https://images.example/four-three.jpg', 'type' => 'poster', 'width' => 720, 'height' => 540, 'orient' => 'L', 'size' => 2],
+            ['url' => 'https://images.example/wide-small.jpg', 'type' => 'backdrop', 'width' => 480, 'height' => 270, 'orient' => 'L', 'size' => 1],
+            ['url' => 'https://images.example/wide.jpg', 'type' => 'poster', 'width' => 960, 'height' => 540, 'orient' => 'L', 'size' => 2],
+        ],
+    ]);
+    putProgramme($ctx['epg'], Carbon::now()->format('Y-m-d'), 'channel.art', [
+        'id' => 'tall-1', 'title' => 'Tall Art', 'desc' => '',
+        'start' => Carbon::now()->addHours(2)->format('Y-m-d H:i:s'),
+        'stop' => Carbon::now()->addHours(3)->format('Y-m-d H:i:s'),
+        'icon' => 'https://images.example/primary.jpg',
+        'images' => [
+            ['url' => 'https://images.example/poster.jpg', 'type' => 'poster', 'width' => 480, 'height' => 720, 'orient' => 'P', 'size' => 2],
+        ],
+    ]);
+
+    $response = $this->getJson(batchUrl($this->username, $this->password, [
+        'stream_ids' => (string) $ctx['channel']->id,
+        'details' => 1,
+    ]))->assertOk();
+
+    $listings = collect($response->json((string) $ctx['channel']->id.'.epg_listings'))->keyBy('id');
+
+    expect($listings['wide-1']['icon'])->toBe('https://images.example/wide.jpg')
+        ->and($listings['tall-1']['icon'])->toBe('https://images.example/primary.jpg');
+});
+
+it('adds role-specific poster and backdrop artwork to detailed batch listings without changing the guide icon', function () {
+    $this->playlist->update(['enable_logo_proxy' => false]);
+    $ctx = makeBatchChannel($this->user, $this->playlist, 'channel.roles');
+
+    putProgramme($ctx['epg'], Carbon::now()->format('Y-m-d'), 'channel.roles', [
+        'id' => 'roles-1', 'title' => 'Role Art', 'desc' => '',
+        'start' => Carbon::now()->addMinutes(5)->format('Y-m-d H:i:s'),
+        'stop' => Carbon::now()->addHour()->format('Y-m-d H:i:s'),
+        'icon' => 'https://images.example/primary.jpg',
+        'images' => [
+            // Schedules Direct labels its 16:9 "Iconic" art `poster`; geometry wins.
+            ['url' => 'https://images.example/iconic-wide.jpg', 'type' => 'poster', 'width' => 1920, 'height' => 1080, 'orient' => 'L', 'size' => 3],
+            ['url' => 'https://images.example/small-poster.jpg', 'type' => 'poster', 'width' => 240, 'height' => 360, 'orient' => 'P', 'size' => 2],
+            ['url' => 'https://images.example/big-poster.jpg', 'type' => 'poster', 'width' => 1000, 'height' => 1500, 'orient' => 'P', 'size' => 3],
+            ['url' => 'https://images.example/headshot.jpg', 'type' => 'person', 'width' => 2000, 'height' => 3000, 'orient' => 'P', 'size' => 3],
+        ],
+    ]);
+    putProgramme($ctx['epg'], Carbon::now()->format('Y-m-d'), 'channel.roles', [
+        'id' => 'roles-2', 'title' => 'Landscape Only', 'desc' => '',
+        'start' => Carbon::now()->addHours(2)->format('Y-m-d H:i:s'),
+        'stop' => Carbon::now()->addHours(3)->format('Y-m-d H:i:s'),
+        'images' => [
+            ['url' => 'https://images.example/mislabelled.jpg', 'type' => 'poster', 'width' => 1280, 'height' => 720, 'orient' => 'P', 'size' => 3],
+        ],
+    ]);
+
+    putProgramme($ctx['epg'], Carbon::now()->format('Y-m-d'), 'channel.roles', [
+        'id' => 'roles-3', 'title' => 'Orientless Poster', 'desc' => '',
+        'start' => Carbon::now()->addHours(4)->format('Y-m-d H:i:s'),
+        'stop' => Carbon::now()->addHours(5)->format('Y-m-d H:i:s'),
+        'images' => [
+            // From <image type="poster" size="3">: XMLTV makes orient optional.
+            ['url' => 'https://images.example/orientless.jpg', 'type' => 'poster', 'width' => 0, 'height' => 0, 'orient' => '', 'size' => 3],
+            ['url' => 'https://images.example/untyped.jpg', 'type' => '', 'width' => 0, 'height' => 0, 'orient' => '', 'size' => 0],
+        ],
+    ]);
+
+    $response = $this->getJson(batchUrl($this->username, $this->password, [
+        'stream_ids' => (string) $ctx['channel']->id,
+        'details' => 1,
+    ]))->assertOk();
+
+    $listings = collect($response->json((string) $ctx['channel']->id.'.epg_listings'))->keyBy('id');
+
+    expect($listings['roles-1'])->toMatchArray([
+        'icon' => 'https://images.example/iconic-wide.jpg',
+        'poster_url' => 'https://images.example/big-poster.jpg',
+        'backdrop_url' => 'https://images.example/iconic-wide.jpg',
+    ])
+        ->and($listings['roles-2']['backdrop_url'])->toBe('https://images.example/mislabelled.jpg')
+        ->and($listings['roles-2'])->not->toHaveKey('poster_url')
+        ->and($listings['roles-3']['poster_url'])->toBe('https://images.example/orientless.jpg');
+});
+
+it('keeps programme artwork out of batch listings unless details=1', function () {
+    $ctx = makeBatchChannel($this->user, $this->playlist, 'channel.roles-plain');
+
+    putProgramme($ctx['epg'], Carbon::now()->format('Y-m-d'), 'channel.roles-plain', [
+        'id' => 'roles-plain-1', 'title' => 'Plain', 'desc' => '',
+        'start' => Carbon::now()->addMinutes(5)->format('Y-m-d H:i:s'),
+        'stop' => Carbon::now()->addHour()->format('Y-m-d H:i:s'),
+        'images' => [
+            ['url' => 'https://images.example/poster.jpg', 'type' => 'poster', 'width' => 1000, 'height' => 1500, 'orient' => 'P', 'size' => 3],
+        ],
+    ]);
+
+    $response = $this->getJson(batchUrl($this->username, $this->password, [
+        'stream_ids' => (string) $ctx['channel']->id,
+    ]))->assertOk();
+
+    expect($response->json((string) $ctx['channel']->id.'.epg_listings.0'))->not->toHaveKeys(['poster_url', 'backdrop_url']);
+});
+
+it('adds role-specific artwork to get_short_epg and get_simple_data_table through the logo proxy', function () {
+    $this->playlist->update(['enable_logo_proxy' => true]);
+    $ctx = makeBatchChannel($this->user, $this->playlist, 'channel.short');
+
+    putProgramme($ctx['epg'], Carbon::now()->format('Y-m-d'), 'channel.short', [
+        'id' => 'short-1', 'title' => 'Short Art', 'desc' => '',
+        'start' => Carbon::now()->addMinutes(5)->format('Y-m-d H:i:s'),
+        'stop' => Carbon::now()->addHour()->format('Y-m-d H:i:s'),
+        'images' => [
+            ['url' => 'https://images.example/poster.jpg', 'type' => 'poster', 'width' => 1000, 'height' => 1500, 'orient' => 'P', 'size' => 3],
+            ['url' => 'https://images.example/backdrop.jpg', 'type' => 'backdrop', 'width' => 1920, 'height' => 1080, 'orient' => 'L', 'size' => 3],
+        ],
+    ]);
+
+    foreach (['get_short_epg', 'get_simple_data_table'] as $action) {
+        $response = $this->getJson(batchUrl($this->username, $this->password, [
+            'action' => $action,
+            'stream_id' => (string) $ctx['channel']->id,
+        ]))->assertOk();
+
+        expect($response->json('epg_listings.0'))->toMatchArray([
+            'poster_url' => LogoProxyController::generateProxyUrl('https://images.example/poster.jpg'),
+            'backdrop_url' => LogoProxyController::generateProxyUrl('https://images.example/backdrop.jpg'),
+        ]);
+    }
+});
+
+/** An AED profile reading "Channel 1: Big Game @ 14:00" as Big Game at 14:00 UTC. */
+function makeBatchAedProfile(User $user, array $attributes = []): AedProfile
+{
+    return AedProfile::factory()->for($user)->create([
+        'title_regex' => ':\s*(.+?)\s*@',
+        'time_regex' => '@\s*(\d{2}:\d{2})',
+        'time_format' => 'H:i',
+        'event_duration_minutes' => 120,
+        'pre_event_format' => null,
+        'post_event_format' => null,
+        ...$attributes,
+    ]);
+}
+
+/** @return list<array<string, mixed>> */
+function decodedBatchListings(array $listings): array
+{
+    return array_map(fn (array $listing): array => [...$listing, 'title' => base64_decode($listing['title'])], $listings);
+}
+
+it('serves the AED event instead of the mapped guide when the group profile overrides', function () {
+    $profile = makeBatchAedProfile($this->user, ['override' => true]);
+    $group = Group::factory()->for($this->user)->for($this->playlist)->create(['aed_profile_id' => $profile->id]);
+    $ctx = makeBatchChannel($this->user, $this->playlist, 'channel.aed', [
+        'title' => 'Channel 1: Big Game @ 14:00',
+        'group_id' => $group->id,
+    ]);
+    putProgramme($ctx['epg'], '2026-08-13', 'channel.aed', [
+        'title' => 'Provider Filler',
+        'start' => '2026-08-13 13:00:00',
+        'stop' => '2026-08-13 15:00:00',
+    ]);
+
+    $listings = decodedBatchListings($this->getJson(batchUrl($this->username, $this->password, [
+        'stream_ids' => (string) $ctx['channel']->id,
+        'date' => '2026-08-13',
+    ]))->assertOk()->json((string) $ctx['channel']->id.'.epg_listings'));
+
+    $event = collect($listings)->firstWhere('title', 'Big Game');
+    expect($event)->not->toBeNull()
+        ->and($event['start'])->toBe('2026-08-13 14:00:00')
+        ->and($event['end'])->toBe('2026-08-13 16:00:00')
+        ->and($event['epg_id'])->toBe('aed-'.$profile->id)
+        ->and(collect($listings)->pluck('title'))->not->toContain('Provider Filler');
+});
+
+it('keeps the mapped guide for a profile without override, but uses AED on unmapped channels', function () {
+    $profile = makeBatchAedProfile($this->user, ['override' => false]);
+    $mapped = makeBatchChannel($this->user, $this->playlist, 'channel.mapped', [
+        'title' => 'Channel 1: Big Game @ 14:00',
+        'aed_profile_id' => $profile->id,
+    ]);
+    putProgramme($mapped['epg'], '2026-08-13', 'channel.mapped', [
+        'title' => 'Provider Show',
+        'start' => '2026-08-13 13:00:00',
+        'stop' => '2026-08-13 15:00:00',
+    ]);
+    $unmapped = Channel::factory()->for($this->user)->for($this->playlist)->create([
+        'enabled' => true,
+        'epg_channel_id' => null,
+        'group_id' => null,
+        'title' => 'Channel 2: Other Game @ 18:00',
+        'aed_profile_id' => $profile->id,
+    ]);
+
+    $response = $this->getJson(batchUrl($this->username, $this->password, [
+        'stream_ids' => $mapped['channel']->id.','.$unmapped->id,
+        'date' => '2026-08-13',
+    ]))->assertOk();
+
+    expect(collect(decodedBatchListings($response->json($mapped['channel']->id.'.epg_listings')))->pluck('title'))
+        ->toContain('Provider Show')->not->toContain('Big Game')
+        ->and(collect(decodedBatchListings($response->json($unmapped->id.'.epg_listings')))->firstWhere('title', 'Other Game')['start'])
+        ->toBe('2026-08-13 18:00:00');
+});
+
+it('serves the AED event on get_short_epg', function () {
+    $profile = makeBatchAedProfile($this->user, ['override' => true]);
+    $ctx = makeBatchChannel($this->user, $this->playlist, 'channel.short-aed', [
+        'title' => 'Channel 1: Big Game @ 14:00',
+        'aed_profile_id' => $profile->id,
+    ]);
+
+    $listings = $this->getJson(batchUrl($this->username, $this->password, [
+        'action' => 'get_short_epg',
+        'stream_id' => (string) $ctx['channel']->id,
+    ]))->assertOk()->json('epg_listings');
+
+    expect($listings)->toHaveCount(1)
+        ->and($listings[0])->toMatchArray([
+            'title' => 'Big Game',
+            'start' => '2026-08-13 14:00:00',
+            'epg_id' => 'aed-'.$profile->id,
+        ]);
 });

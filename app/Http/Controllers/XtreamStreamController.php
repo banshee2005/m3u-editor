@@ -3,6 +3,7 @@
 namespace App\Http\Controllers;
 
 use App\Http\Controllers\Api\M3uProxyApiController;
+use App\Models\CachedContentFile;
 use App\Models\Channel;
 use App\Models\CustomPlaylist;
 use App\Models\Episode;
@@ -11,17 +12,25 @@ use App\Models\Network;
 use App\Models\Playlist;
 use App\Models\PlaylistAlias;
 use App\Models\PlaylistAuth;
+use App\Services\CachedContentDispatchService;
+use App\Services\MediaSourcePreferenceService;
+use App\Services\PlaylistCredentialResolver;
 use App\Services\PlaylistService;
 use App\Services\PlaylistUrlService;
 use Carbon\Carbon;
 use Illuminate\Database\Eloquent\Model;
-use Illuminate\Database\Eloquent\ModelNotFoundException;
+use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Redirect;
 
 class XtreamStreamController extends Controller
 {
+    /**
+     * How long (seconds) a player may cache a direct (non-proxied) catchup redirect.
+     */
+    private const TIMESHIFT_DIRECT_REDIRECT_MAX_AGE = 3600;
+
     /**
      * Validate a client-requested transcoding profile (?profile=<id>|none) and stash
      * the result in request attributes for the proxy controller. Request attributes
@@ -61,10 +70,9 @@ class XtreamStreamController extends Controller
     }
 
     /**
-     * Authenticates a playlist using either PlaylistAuth credentials or the original method
-     * (username = playlist owner's name, password = playlist UUID).
-     */
-    /**
+     * Authenticates a playlist using either PlaylistAuth credentials or the owner's default
+     * login (username = playlist owner's name, password = playlist UUID or custom password).
+     *
      * Returns [$playlist, $streamModel, $playlistAuth] where $playlistAuth is non-null
      * only when authentication succeeded via PlaylistAuth credentials.
      */
@@ -93,54 +101,16 @@ class XtreamStreamController extends Controller
             }
         }
 
-        // Method 2: Fall back to original authentication (username = playlist owner, password = playlist UUID)
+        // Method 2: Fall back to the owner's default login (username = playlist owner,
+        // password = playlist UUID or custom password, per playlist), then an alias' own credentials
+        // unless the alias has expired (matching PlaylistService::authenticate())
         if (! $playlist) {
-            // Try to find playlist by UUID (password parameter)
-            try {
-                $playlist = Playlist::with(['user'])->where('uuid', $password)->firstOrFail();
-
-                // Verify username matches playlist owner's name
-                if ($playlist->user->name !== $username) {
-                    $playlist = null;
-                }
-            } catch (ModelNotFoundException $e) {
-                try {
-                    $playlist = MergedPlaylist::with(['user'])->where('uuid', $password)->firstOrFail();
-
-                    // Verify username matches playlist owner's name
-                    if ($playlist->user->name !== $username) {
-                        $playlist = null;
-                    }
-                } catch (ModelNotFoundException $e) {
-                    try {
-                        $playlist = CustomPlaylist::with(['user'])->where('uuid', $password)->firstOrFail();
-
-                        // Verify username matches playlist owner's name
-                        if ($playlist->user->name !== $username) {
-                            $playlist = null;
-                        }
-                    } catch (ModelNotFoundException $e) {
-                        try {
-                            $playlist = PlaylistAlias::with(['user'])
-                                ->where('uuid', $password)
-                                ->orWhere(fn ($query) => $query->where([
-                                    ['username', $username],
-                                    ['password', $password],
-                                ]))->firstOrFail();
-
-                            // If username and password do not match directly, then username must match playlist owner's name
-                            if (! ($playlist->username === $username && $playlist->password === $password)) {
-                                // Verify username matches playlist owner's name
-                                if ($playlist->user->name !== $username) {
-                                    $playlist = null;
-                                }
-                            }
-                        } catch (ModelNotFoundException $e) {
-                            return [null, null, null];
-                        }
-                    }
-                }
-            }
+            $playlist = app(PlaylistCredentialResolver::class)->resolveDefaultLogin($username, $password)
+                ?? PlaylistAlias::with(['user'])
+                    ->where('username', $username)
+                    ->where('password', $password)
+                    ->get()
+                    ->first(fn (PlaylistAlias $alias): bool => ! $alias->isExpired());
         }
 
         // If no authentication method worked, return null
@@ -273,22 +243,42 @@ class XtreamStreamController extends Controller
         $format = $format ?? 'ts'; // Default to 'ts' if no format provided
         [$playlist, $channel, $playlistAuth] = $this->findAuthenticatedPlaylistAndStreamModel($username, $password, $streamId, 'live');
 
-        // Handle network playlists - stream_id is actually a network ID
+        // Handle network playlists. The stream_id in a network playlist's HDHR/Xtream
+        // URLs is the projected Channel's own primary key (see
+        // NetworkChannelSyncService::upsertChannel()), not the Network's primary key -
+        // those are independently allocated and can collide. Resolve the Network via
+        // the projected Channel's network_id instead of treating stream_id as a Network id.
         if ($playlist instanceof Playlist && $playlist->is_network_playlist) {
-            return $this->handleNetworkStream($playlist, $streamId);
+            if (! $channel instanceof Channel || $channel->network_id === null) {
+                return response()->json(['error' => 'Network not found or not enabled'], 404);
+            }
+
+            return $this->handleNetworkStream($playlist, $channel->network_id);
         }
 
         if ($channel instanceof Channel) {
+            // Catchup (utc/lutc) requests are served from a failover with catchup when this
+            // channel has none, the same as the /timeshift/ route.
+            $isTimeshiftRequest = PlaylistService::isTimeshiftRequest($request);
+            $streamChannel = $channel;
+            if ($isTimeshiftRequest) {
+                $request->attributes->set('requested_channel_id', $channel->id);
+                $streamChannel = $this->resolveCatchupChannel($channel);
+            }
+
             // When the channel's source playlist pools provider profiles, the proxy path
             // must be taken even if enable_proxy is off on both the channel and the
             // (possibly merged/custom) playlist being streamed through - profile
             // selection and pool distribution only happen on the proxy path.
-            $needsProxy = $channel->enable_proxy
-                || $playlist->enable_proxy
-                || $request->input('proxy') === 'true'
-                || ($channel->playlist instanceof Playlist && $channel->playlist->profiles_enabled);
+            $needsProxy = Channel::needsProxy(
+                channelEnableProxy: (bool) $channel->enable_proxy,
+                playlistEnableProxy: (bool) $playlist->enable_proxy,
+                requestProxyFlag: $request->input('proxy') === 'true',
+                sourcePlaylistProfilesEnabled: $channel->playlist instanceof Playlist && $channel->playlist->profiles_enabled,
+                userCanUseProxy: $playlist->user->canUseProxy(),
+            );
 
-            if ($needsProxy && $playlist->user->canUseProxy()) {
+            if ($needsProxy) {
                 // Timeshift handled in proxy controller (if needed)
                 // Add username and PlaylistAuth ID to request for proxy traceability and per-auth enforcement
                 $request->merge(['username' => $username]);
@@ -302,22 +292,16 @@ class XtreamStreamController extends Controller
                 $method = $request->input('player') === 'true' ? 'channelPlayer' : 'channel';
 
                 return app()->call([app(M3uProxyApiController::class), $method], [
-                    'id' => $streamId,
+                    'id' => $streamChannel->id,
                     'uuid' => $playlist->uuid,
                 ]);
             } else {
-                // Check if this is a timeshift request
-                // TiviMate sends utc/lutc as UNIX epochs (UTC). We only convert TZ + format.
-                $utcPresent = $request->filled('utc');
-
-                // Xtream API sends timeshift_duration (minutes) and timeshift_date (YYYY-MM-DD:HH-MM-SS)
-                $xtreamTimeshiftPresent = $request->filled('timeshift_duration') && $request->filled('timeshift_date');
-
                 // Get the base stream URL
-                $streamUrl = PlaylistUrlService::getChannelUrl($channel, $playlist);
-                if ($utcPresent || $xtreamTimeshiftPresent) {
-                    // Timeshift stream request
-                    $streamUrl = PlaylistService::generateTimeshiftUrl($request, $streamUrl, $playlist, $channel);
+                $streamUrl = PlaylistUrlService::getChannelUrl($streamChannel, $playlist);
+                if ($isTimeshiftRequest) {
+                    // Timeshift stream request: TiviMate/M3U utc+lutc (UNIX epochs), or Xtream
+                    // timeshift_duration (minutes) + timeshift_date (YYYY-MM-DD:HH-MM-SS)
+                    return $this->timeshiftRedirect(PlaylistService::generateTimeshiftUrl($request, $streamUrl, $playlist, $streamChannel));
                 }
 
                 // Regular live stream request, redirect to the stream URL (via MediaFlow Proxy if enabled)
@@ -341,14 +325,22 @@ class XtreamStreamController extends Controller
         $format = $format ?? 'ts'; // Default to 'ts' if no format provided
         [$playlist, $channel, $playlistAuth] = $this->findAuthenticatedPlaylistAndStreamModel($username, $password, $streamId, 'vod');
         if ($channel instanceof Channel) {
+            // Serve a locally cached copy when one is available (see resolveCacheHit()).
+            if ($cacheRedirect = $this->resolveCacheHit($channel, $playlist, $username, $password, $format)) {
+                return $cacheRedirect;
+            }
+
             // See handleLive(): pooled-provider playlists must use the proxy path so
             // profile selection and pool distribution are applied.
-            $needsProxy = $channel->enable_proxy
-                || $playlist->enable_proxy
-                || $request->input('proxy') === 'true'
-                || ($channel->playlist instanceof Playlist && $channel->playlist->profiles_enabled);
+            $needsProxy = Channel::needsProxy(
+                channelEnableProxy: (bool) $channel->enable_proxy,
+                playlistEnableProxy: (bool) $playlist->enable_proxy,
+                requestProxyFlag: $request->input('proxy') === 'true',
+                sourcePlaylistProfilesEnabled: $channel->playlist instanceof Playlist && $channel->playlist->profiles_enabled,
+                userCanUseProxy: $playlist->user->canUseProxy(),
+            );
 
-            if ($needsProxy && $playlist->user->canUseProxy()) {
+            if ($needsProxy) {
                 // Add username and PlaylistAuth ID to request for proxy traceability and per-auth enforcement
                 $request->merge(['username' => $username]);
                 if ($playlistAuth instanceof PlaylistAuth) {
@@ -364,6 +356,17 @@ class XtreamStreamController extends Controller
                     'uuid' => $playlist->uuid,
                 ]);
             } else {
+                // Media-server source preference: stream the matched media
+                // item with its own playlist context instead of the
+                // provider's (needsProxy above still reflects the request
+                // context; proxy requests forward the provider id to
+                // M3uProxyApiController, which does the swap itself).
+                $media = app(MediaSourcePreferenceService::class)->resolveChannel($channel);
+                if ($media !== null) {
+                    $channel = $media;
+                    $playlist = $media->getEffectivePlaylist();
+                }
+
                 return Redirect::to($this->applyMediaFlowProxy(PlaylistUrlService::getChannelUrl($channel, $playlist)));
             }
         }
@@ -384,6 +387,11 @@ class XtreamStreamController extends Controller
         $format = $format ?? 'mp4'; // Default to 'mp4' if no format provided
         [$playlist, $episode, $playlistAuth] = $this->findAuthenticatedPlaylistAndStreamModel($username, $password, $streamId, 'episode');
         if ($episode instanceof Episode) {
+            // Serve a locally cached copy when one is available (see resolveCacheHit()).
+            if ($cacheRedirect = $this->resolveCacheHit($episode, $playlist, $username, $password, $format)) {
+                return $cacheRedirect;
+            }
+
             if (($playlist->enable_proxy || $request->input('proxy') === 'true') && $playlist->user->canUseProxy()) {
                 // Add username and PlaylistAuth ID to request for proxy traceability and per-auth enforcement
                 $request->merge(['username' => $username]);
@@ -400,6 +408,13 @@ class XtreamStreamController extends Controller
                     'uuid' => $playlist->uuid,
                 ]);
             } else {
+                // Media-server source preference (see handleVod()).
+                $media = app(MediaSourcePreferenceService::class)->resolveEpisode($episode);
+                if ($media !== null) {
+                    $episode = $media;
+                    $playlist = $media->playlist;
+                }
+
                 return Redirect::to($this->applyMediaFlowProxy(PlaylistUrlService::getEpisodeUrl($episode, $playlist)));
             }
         }
@@ -450,24 +465,17 @@ class XtreamStreamController extends Controller
             return response()->json(['error' => 'Unauthorized or stream not found'], 403);
         }
 
-        // If the primary channel doesn't support catchup, defer to the first failover that does.
-        // This allows an HD primary (no catchup) to fall back to a lower-res failover for timeshift.
-        $timeshiftChannel = $channel;
-        if (! $channel->catchup || $channel->catchup == 0) {
-            $failoverWithCatchup = $channel->failoverChannels()
-                ->whereNotNull('catchup')
-                ->where('catchup', '!=', '0')
-                ->where('catchup', '!=', '')
-                ->first();
+        // Recorded before any catchup failover swap below: the TV app stops its stream by the
+        // channel it asked for (see M3uProxyService::getChannelUrl's requested_channel_id).
+        $request->attributes->set('requested_channel_id', $channel->id);
 
-            if ($failoverWithCatchup) {
-                $timeshiftChannel = $failoverWithCatchup;
-            }
-        }
+        $timeshiftChannel = $this->resolveCatchupChannel($channel);
 
-        // Convert Unix timestamp to Xtream format if the player sends a numeric date string
+        // Convert Unix timestamp to Xtream format if the player sends a numeric date string.
+        // The result is reinterpreted downstream using config('app.timezone'), so it must be
+        // formatted in that same timezone to preserve the absolute instant the client sent.
         if (ctype_digit($date)) {
-            $date = Carbon::createFromTimestamp((int) $date)->format('Y-m-d:H-i-s');
+            $date = Carbon::createFromTimestamp((int) $date, config('app.timezone', 'UTC'))->format('Y-m-d:H-i-s');
         }
 
         // Parse the date parameter and add timeshift parameters to the request
@@ -492,10 +500,40 @@ class XtreamStreamController extends Controller
             ]);
         } else {
             $streamUrl = PlaylistUrlService::getChannelUrl($timeshiftChannel, $playlist);
-            $streamUrl = PlaylistService::generateTimeshiftUrl($request, $streamUrl, $playlist, $timeshiftChannel);
 
-            return Redirect::to($this->applyMediaFlowProxy($streamUrl));
+            return $this->timeshiftRedirect(PlaylistService::generateTimeshiftUrl($request, $streamUrl, $playlist, $timeshiftChannel));
         }
+    }
+
+    /**
+     * The channel to serve catchup from: the requested one, or when it doesn't support catchup,
+     * its first failover that does. This allows an HD primary (no catchup) to fall back to a
+     * lower-res failover for timeshift.
+     */
+    private function resolveCatchupChannel(Channel $channel): Channel
+    {
+        if ($channel->catchup && $channel->catchup != 0) {
+            return $channel;
+        }
+
+        return $channel->failoverChannels()
+            ->whereNotNull('catchup')
+            ->where('catchup', '!=', '0')
+            ->where('catchup', '!=', '')
+            ->first() ?? $channel;
+    }
+
+    /**
+     * Redirect a direct (non-proxied) catchup request to the provider. FFmpeg-based players
+     * (mpv) restart every seek's Range requests from the original URL unless the redirect is
+     * cacheable, so this lets them go straight to the provider for the rest of the session.
+     * The provider URL for a programme window doesn't change, so a long max-age is safe.
+     */
+    private function timeshiftRedirect(string $streamUrl): RedirectResponse
+    {
+        return Redirect::to($this->applyMediaFlowProxy($streamUrl))
+            ->setPrivate()
+            ->setMaxAge(self::TIMESHIFT_DIRECT_REDIRECT_MAX_AGE);
     }
 
     /**
@@ -510,6 +548,50 @@ class XtreamStreamController extends Controller
         }
 
         return $streamUrl;
+    }
+
+    /**
+     * Cache-hit gate. Redirects to the cached-content stream route when a
+     * playable cached file exists for this item (its own, or one shared by
+     * another of the same user's playlists), otherwise returns null so the
+     * normal live/proxy path runs.
+     *
+     * Skipped entirely while `enable_cache` is off, and for Custom/Merged
+     * playlists and aliases (only plain Playlists own cached files). A row
+     * whose file is missing on disk falls back to live instead of sending
+     * the client to a 404.
+     */
+    private function resolveCacheHit(Channel|Episode $item, Playlist|CustomPlaylist|MergedPlaylist|PlaylistAlias $playlist, string $username, string $password, string $routeFormat): ?RedirectResponse
+    {
+        if (! app(CachedContentDispatchService::class)->isEnabled()) {
+            return null;
+        }
+
+        if (! $playlist instanceof Playlist) {
+            return null;
+        }
+
+        $cached = CachedContentFile::findServableFor($item);
+
+        if ($cached === null || ! $cached->isPlayable()) {
+            return null;
+        }
+
+        // Local media wins over a cached copy: when a reachable media-server
+        // match exists, fall through so the normal path swaps to it. If the
+        // server is down the cached copy still plays.
+        if ($item->playlist?->prefer_media_server_sources
+            && app(MediaSourcePreferenceService::class)->resolveForStreaming($item) !== $item
+        ) {
+            return null;
+        }
+
+        return Redirect::to(PlaylistUrlService::credentialRoute('cached-content.stream', [
+            'username' => $username,
+            'password' => $password,
+            'uuid' => $cached->uuid,
+            'format' => $routeFormat,
+        ]));
     }
 
     /**

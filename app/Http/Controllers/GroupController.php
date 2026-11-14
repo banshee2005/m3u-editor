@@ -3,15 +3,17 @@
 namespace App\Http\Controllers;
 
 use App\Facades\PlaylistFacade;
+use App\Http\Resources\Group\GroupResource;
+use App\Http\Resources\Group\GroupSummaryResource;
 use App\Models\Group;
+use Dedoc\Scramble\Attributes\Group as ApiGroup;
+use Dedoc\Scramble\Attributes\QueryParameter;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\Rule;
 
-/**
- * @tags Groups
- */
+#[ApiGroup('Groups', 'Create, edit, reorder and delete channel groups.', weight: 30)]
 class GroupController extends Controller
 {
     /**
@@ -19,36 +21,9 @@ class GroupController extends Controller
      *
      * Retrieve a list of channel groups for the authenticated user.
      * Supports filtering by playlist and includes channel counts.
-     *
-     *
-     * @queryParam playlist_uuid string Filter groups by playlist UUID. Example: abc-123-def
-     * @queryParam with_channels boolean Include channel count statistics. Defaults to true. Example: true
-     *
-     * @response 200 {
-     *   "success": true,
-     *   "data": [
-     *     {
-     *       "id": 1,
-     *       "name": "Sports",
-     *       "sort_order": 1,
-     *       "type": "live",
-     *       "total_channels": 50,
-     *       "enabled_channels": 45,
-     *       "playlist": {
-     *         "id": 1,
-     *         "name": "My Provider",
-     *         "uuid": "abc-123-def"
-     *       }
-     *     }
-     *   ],
-     *   "meta": {
-     *     "total": 25
-     *   }
-     * }
-     * @response 401 {
-     *   "message": "Unauthenticated."
-     * }
      */
+    #[QueryParameter('playlist_uuid', 'Filter groups by playlist UUID.', type: 'string', example: 'abc-123-def')]
+    #[QueryParameter('with_channels', 'Include channel count statistics. Defaults to true.', type: 'bool', example: true)]
     public function index(Request $request): JsonResponse
     {
         $user = $request->user();
@@ -85,33 +60,9 @@ class GroupController extends Controller
         // Get groups ordered by sort_order
         $groups = $query->orderBy('sort_order')->orderBy('name')->get();
 
-        $data = $groups->map(function ($group) use ($withChannels) {
-            $result = [
-                'id' => $group->id,
-                'name' => $group->name,
-                'sort_order' => $group->sort_order,
-                'type' => $group->type ?? 'live',
-            ];
-
-            if ($withChannels) {
-                $result['total_channels'] = $group->channels_count ?? 0;
-                $result['enabled_channels'] = $group->enabled_channels_count ?? 0;
-            }
-
-            if ($group->playlist) {
-                $result['playlist'] = [
-                    'id' => $group->playlist->id,
-                    'name' => $group->playlist->name,
-                    'uuid' => $group->playlist->uuid,
-                ];
-            }
-
-            return $result;
-        });
-
         return response()->json([
             'success' => true,
-            'data' => $data,
+            'data' => GroupSummaryResource::collection($groups),
             'meta' => [
                 'total' => $groups->count(),
             ],
@@ -122,34 +73,6 @@ class GroupController extends Controller
      * Get a single group
      *
      * Retrieve detailed information about a specific group by ID.
-     *
-     *
-     * @response 200 {
-     *   "success": true,
-     *   "data": {
-     *     "id": 1,
-     *     "name": "Sports",
-     *     "sort_order": 1,
-     *     "type": "live",
-     *     "total_channels": 50,
-     *     "enabled_channels": 45,
-     *     "live_channels": 45,
-     *     "vod_channels": 5,
-     *     "playlist": {
-     *       "id": 1,
-     *       "name": "My Provider",
-     *       "uuid": "abc-123-def"
-     *     }
-     *   }
-     * }
-     * @response 404 {
-     *   "success": false,
-     *   "message": "Group not found"
-     * }
-     * @response 403 {
-     *   "success": false,
-     *   "message": "You do not have permission to access this group"
-     * }
      */
     public function show(Request $request, int $id): JsonResponse
     {
@@ -175,7 +98,7 @@ class GroupController extends Controller
 
         return response()->json([
             'success' => true,
-            'data' => $this->serializeGroup($group),
+            'data' => new GroupResource($group),
         ]);
     }
 
@@ -230,14 +153,17 @@ class GroupController extends Controller
         return response()->json([
             'success' => true,
             'message' => 'Group created successfully',
-            'data' => $this->serializeGroup($group),
+            'data' => new GroupResource($group),
         ], 201);
     }
 
     /**
      * Update a group
      *
-     * Update specific fields of a group. Only the provided fields will be updated. Updated values are stored in custom fields (e.g., `name_internal`).
+     * Update specific fields of a group. Only the provided fields will be updated. A `name`
+     * update is stored as the group's effective display name (`name`), the same column the
+     * Filament Name field writes to, so the rename is reflected consistently everywhere -
+     * list/detail responses, the channel's group field and generated playlist output.
      */
     public function update(Request $request, int $id): JsonResponse
     {
@@ -260,7 +186,7 @@ class GroupController extends Controller
         ]);
 
         if (array_key_exists('name', $validated)) {
-            $group->name_internal = $validated['name'];
+            $group->name = $validated['name'];
         }
         if (array_key_exists('sort_order', $validated)) {
             $group->sort_order = $validated['sort_order'];
@@ -281,6 +207,18 @@ class GroupController extends Controller
                 ], 422);
             }
 
+            // A merged group's own type must match every one of its children's
+            // (see Group::assertMergedGroupRulesHold()) - any existing child was
+            // created to match the CURRENT type, so changing the parent's type
+            // always breaks that invariant for it. Reject rather than silently
+            // leaving the parent and its children on different types.
+            if ($group->is_merged && $group->children()->exists()) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Cannot change a merged group\'s type while it has child groups',
+                ], 422);
+            }
+
             $group->type = $validated['type'];
         }
 
@@ -293,7 +231,7 @@ class GroupController extends Controller
         return response()->json([
             'success' => true,
             'message' => 'Group updated successfully',
-            'data' => $this->serializeGroup($group),
+            'data' => new GroupResource($group),
         ]);
     }
 
@@ -347,6 +285,17 @@ class GroupController extends Controller
             return response()->json([
                 'success' => false,
                 'message' => 'Target group must be the same type as the source group',
+            ], 422);
+        }
+
+        // A merged group is a container only and never owns channels directly (see
+        // Group::scopeAssignableTarget()) - moving channels into one would create
+        // direct ownership the merged-group invariant doesn't allow, leaving the
+        // channel invisible to the merged parent's own enable/disable actions.
+        if ($targetGroup->is_merged) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Target group cannot be a merged group',
             ], 422);
         }
 
@@ -523,28 +472,5 @@ class GroupController extends Controller
     {
         return $group->load('playlist')
             ->loadCount($this->groupCountRelations());
-    }
-
-    private function serializeGroup(Group $group): array
-    {
-        $data = [
-            'id' => $group->id,
-            'name' => $group->name_internal ?? $group->name,
-            'sort_order' => $group->sort_order,
-            'type' => $group->type ?? 'live',
-            'enabled' => (bool) $group->enabled,
-            'custom' => (bool) $group->custom,
-            'total_channels' => $group->channels_count ?? 0,
-            'enabled_channels' => $group->enabled_channels_count ?? 0,
-            'live_channels' => $group->live_channels_count ?? 0,
-            'vod_channels' => $group->vod_channels_count ?? 0,
-            'playlist' => $group->playlist ? [
-                'id' => $group->playlist->id,
-                'name' => $group->playlist->name,
-                'uuid' => $group->playlist->uuid,
-            ] : null,
-        ];
-
-        return $data;
     }
 }

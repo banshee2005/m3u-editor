@@ -4,9 +4,11 @@ namespace App\Http\Controllers;
 
 use App\Jobs\ProcessEpgImport;
 use App\Models\Epg;
+use Dedoc\Scramble\Attributes\Group;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 
+#[Group('EPG', 'Trigger an EPG sync.', weight: 60)]
 class EpgController extends Controller
 {
     /**
@@ -31,6 +33,12 @@ class EpgController extends Controller
 
         // Fetch the EPG
         $epg = Epg::where('uuid', $uuid)->firstOrFail();
+
+        if ($epg->isSchedulesDirectDisabled()) {
+            return response()->json([
+                'message' => "EPG \"{$epg->name}\" can't be synced while SchedulesDirect is disabled.",
+            ], 409);
+        }
 
         // Refresh the EPG
         // Refresh the playlist

@@ -4,49 +4,10 @@ namespace App\Providers\Filament;
 
 use App\Filament\Auth\EditProfile;
 use App\Filament\Auth\Login;
-use App\Filament\Clusters\Devices\DevicesCluster;
-use App\Filament\Clusters\PlaylistAliases\PlaylistAliasesCluster;
-use App\Filament\Clusters\Settings\SettingsCluster;
 use App\Filament\CopilotTools\EpgMappingStateTool;
+use App\Filament\Navigation\AdminNavigationMenuBuilder;
 use App\Filament\Pages\Backups;
-use App\Filament\Pages\BrowseShows;
-use App\Filament\Pages\CreatePlugin;
 use App\Filament\Pages\CustomDashboard;
-use App\Filament\Pages\LogViewer;
-use App\Filament\Pages\M3uProxyStreamMonitor;
-use App\Filament\Pages\PluginsDashboard;
-use App\Filament\Pages\ReleaseLogs;
-use App\Filament\Pages\RequestContent;
-use App\Filament\Resources\AedProfiles\AedProfileResource;
-use App\Filament\Resources\Assets\AssetResource;
-use App\Filament\Resources\Categories\CategoryResource;
-use App\Filament\Resources\Channels\ChannelResource;
-use App\Filament\Resources\ChannelScrubbers\ChannelScrubberResource;
-use App\Filament\Resources\CustomPlaylists\CustomPlaylistResource;
-use App\Filament\Resources\DvrRecordingRules\DvrRecordingRuleResource;
-use App\Filament\Resources\DvrRecordings\DvrRecordingResource;
-use App\Filament\Resources\EpgChannels\EpgChannelResource;
-use App\Filament\Resources\EpgMaps\EpgMapResource;
-use App\Filament\Resources\Epgs\EpgResource;
-use App\Filament\Resources\Groups\GroupResource;
-use App\Filament\Resources\MediaServerIntegrations\MediaServerIntegrationResource;
-use App\Filament\Resources\MergedEpgs\MergedEpgResource;
-use App\Filament\Resources\MergedPlaylists\MergedPlaylistResource;
-use App\Filament\Resources\Networks\NetworkResource;
-use App\Filament\Resources\PersonalAccessTokens\PersonalAccessTokenResource;
-use App\Filament\Resources\PlaylistAuths\PlaylistAuthResource;
-use App\Filament\Resources\Playlists\PlaylistResource;
-use App\Filament\Resources\PlaylistViewers\PlaylistViewerResource;
-use App\Filament\Resources\PluginInstallReviews\PluginInstallReviewResource;
-use App\Filament\Resources\Plugins\PluginResource;
-use App\Filament\Resources\PostProcesses\PostProcessResource;
-use App\Filament\Resources\QueueMonitor\QueueMonitorResource;
-use App\Filament\Resources\Series\SeriesResource;
-use App\Filament\Resources\StreamFileSettings\StreamFileSettingResource;
-use App\Filament\Resources\StreamProfiles\StreamProfileResource;
-use App\Filament\Resources\Users\UserResource;
-use App\Filament\Resources\VodGroups\VodGroupResource;
-use App\Filament\Resources\Vods\VodResource;
 use App\Filament\Widgets\ActiveStreamsWidget;
 use App\Filament\Widgets\ContentBreakdownChart;
 use App\Filament\Widgets\DvrStorageOverviewWidget;
@@ -77,13 +38,12 @@ use EslamRedaDiv\FilamentCopilot\Tools\RunToolTool;
 use Exception;
 use Filament\Actions\Action;
 use Filament\Auth\MultiFactor\App\AppAuthentication;
+use Filament\FontProviders\LocalFontProvider;
 use Filament\Http\Middleware\Authenticate;
 use Filament\Http\Middleware\AuthenticateSession;
 use Filament\Http\Middleware\DisableBladeIconComponents;
 use Filament\Http\Middleware\DispatchServingFilamentEvent;
 use Filament\Navigation\NavigationBuilder;
-use Filament\Navigation\NavigationGroup;
-use Filament\Navigation\NavigationItem;
 use Filament\Panel;
 use Filament\PanelProvider;
 use Filament\Support\Colors\Color;
@@ -166,6 +126,7 @@ class AdminPanelProvider extends PanelProvider
             ->brandName('m3u editor')
             ->brandLogo(fn () => view('filament.admin.logo'))
             ->favicon('/favicon.png')
+            ->font('Plus Jakarta Sans', provider: LocalFontProvider::class)
             ->brandLogoHeight('2.5rem')
             ->databaseNotifications()
             ->databaseNotificationsPolling('30s')
@@ -183,115 +144,14 @@ class AdminPanelProvider extends PanelProvider
             ->pages([
                 CustomDashboard::class,
             ])
-            // Explicit navigation replaces auto-discovery. When adding a new Resource or Page,
-            // register its getNavigationItems() call in the appropriate group below, or it
-            // will not appear in the sidebar.
-            ->navigation(function (NavigationBuilder $builder) use ($settings): NavigationBuilder {
-                return $builder
-                    ->items([
-                        ...CustomDashboard::getNavigationItems(),
-                    ])
-                    ->groups([
-                        ...($this->isAdmin() ? [
-                            NavigationGroup::make(fn () => __('Administration'))
-                                ->icon('heroicon-s-shield-check')
-                                ->items([
-                                    ...(config('auth.auto_login') ? [] : UserResource::getNavigationItems()),
-                                    ...(($settings['push_relay_enabled'] || $settings['device_pairing_enabled']) ? DevicesCluster::getNavigationItems() : []),
-                                    ...SettingsCluster::getNavigationItems(),
-                                ]),
-                        ] : []),
-                        NavigationGroup::make(fn () => __('Playlist'))
-                            ->icon('heroicon-m-play-pause')
-                            ->items([
-                                ...PlaylistResource::getNavigationItems(),
-                                ...CustomPlaylistResource::getNavigationItems(),
-                                ...MergedPlaylistResource::getNavigationItems(),
-                                ...PlaylistAliasesCluster::getNavigationItems(),
-                                ...PlaylistViewerResource::getNavigationItems(),
-                                ...PlaylistAuthResource::getNavigationItems(),
-                                ...StreamFileSettingResource::getNavigationItems(),
-                                ...ChannelScrubberResource::getNavigationItems(),
-                            ]),
-                        ...(auth()->user()?->canUseDvr() ? [
-                            NavigationGroup::make(fn () => __('DVR'))
-                                ->icon('heroicon-m-video-camera')
-                                ->items([
-                                    ...DvrRecordingResource::getNavigationItems(),
-                                    ...DvrRecordingRuleResource::getNavigationItems(),
-                                    ...BrowseShows::getNavigationItems(),
-                                ]),
-                        ] : []),
-                        NavigationGroup::make(fn () => __('Integrations'))
-                            ->icon('heroicon-m-server-stack')
-                            ->items([
-                                ...MediaServerIntegrationResource::getNavigationItems(),
-                                ...RequestContent::getNavigationItems(),
-                                ...(config('proxy.proxy_integration_enabled', true) ? NetworkResource::getNavigationItems() : []),
-                            ]),
-                        NavigationGroup::make(fn () => __('Live Channels'))
-                            ->icon('heroicon-m-tv')
-                            ->items([
-                                ...GroupResource::getNavigationItems(),
-                                ...ChannelResource::getNavigationItems(),
-                            ]),
-                        NavigationGroup::make(fn () => __('VOD Channels'))
-                            ->icon('heroicon-m-film')
-                            ->items([
-                                ...VodGroupResource::getNavigationItems(),
-                                ...VodResource::getNavigationItems(),
-                            ]),
-                        NavigationGroup::make(fn () => __('Series'))
-                            ->icon('heroicon-m-play')
-                            ->items([
-                                ...CategoryResource::getNavigationItems(),
-                                ...SeriesResource::getNavigationItems(),
-                            ]),
-                        NavigationGroup::make(fn () => __('EPG'))
-                            ->icon('heroicon-m-calendar-days')
-                            ->items([
-                                ...EpgResource::getNavigationItems(),
-                                ...MergedEpgResource::getNavigationItems(),
-                                ...EpgChannelResource::getNavigationItems(),
-                                ...EpgMapResource::getNavigationItems(),
-                                ...AedProfileResource::getNavigationItems(),
-                            ]),
-                        ...(config('proxy.proxy_integration_enabled', true) && auth()->user()?->canUseProxy() ? [
-                            NavigationGroup::make(fn () => __('Proxy'))
-                                ->icon('heroicon-m-arrows-right-left')
-                                ->items([
-                                    ...StreamProfileResource::getNavigationItems(),
-                                    ...M3uProxyStreamMonitor::getNavigationItems(),
-                                ]),
-                        ] : []),
-                        NavigationGroup::make(fn () => __('Plugins'))
-                            ->icon('heroicon-m-puzzle-piece')
-                            ->items([
-                                ...PluginsDashboard::getNavigationItems(),
-                                ...PluginResource::getNavigationItems(),
-                                ...PluginInstallReviewResource::getNavigationItems(),
-                                ...CreatePlugin::getNavigationItems(),
-                            ]),
-                        NavigationGroup::make(fn () => __('Tools'))
-                            ->collapsed()
-                            ->icon('heroicon-m-wrench-screwdriver')
-                            ->items([
-                                ...PersonalAccessTokenResource::getNavigationItems(),
-                                ...AssetResource::getNavigationItems(),
-                                ...PostProcessResource::getNavigationItems(),
-                                ...LogViewer::getNavigationItems(),
-                                ...ReleaseLogs::getNavigationItems(),
-                                ...Backups::getNavigationItems(),
-                                ...QueueMonitorResource::getNavigationItems(),
-                                NavigationItem::make('API Docs')
-                                    ->label(fn () => __('API Docs').' ↗')
-                                    ->url('/docs/api', shouldOpenInNewTab: true)
-                                    ->sort(9)
-                                    ->icon(null)
-                                    ->visible($this->isAdmin(...)),
-                            ]),
-                    ]);
-            })
+            // Navigation content (names/icons/conditions) is defined in
+            // AdminNavigationSchema; final order/visibility per request is
+            // resolved by AdminNavigationMenuBuilder, layering the
+            // admin-configured layout (Settings > Navigation) on top. When
+            // adding a new Resource or Page, register its
+            // getNavigationItems() call in AdminNavigationSchema, or it will
+            // not appear in the sidebar.
+            ->navigation(fn (NavigationBuilder $builder): NavigationBuilder => app(AdminNavigationMenuBuilder::class)->build($builder, $settings))
             ->breadcrumbs($settings['show_breadcrumbs'])
             ->widgets([
                 // Ordering is driven by this array.
@@ -336,6 +196,7 @@ class AdminPanelProvider extends PanelProvider
                 ]),
             ]))
             ->maxContentWidth($settings['content_width'])
+            ->sidebarWidth('16rem')
             ->middleware([
                 EncryptCookies::class,
                 AddQueuedCookiesToResponse::class,
@@ -434,7 +295,7 @@ class AdminPanelProvider extends PanelProvider
         try {
             $isConfigured = $s['copilot_enabled']
                 && ! empty($s['copilot_provider'])
-                && (! empty($s['copilot_api_key']) || $s['copilot_provider'] === 'ollama');
+                && (! empty($s['copilot_api_key']) || ! CopilotProvider::requiresApiKey($s['copilot_provider']));
 
             if (! $isConfigured) {
                 return null;
@@ -466,6 +327,7 @@ class AdminPanelProvider extends PanelProvider
                 ->systemPrompt($s['copilot_system_prompt'] ?: $defaultPrompt)
                 ->globalTools($this->filterBuiltInTools($s['copilot_global_tools'] ?? []))
                 ->quickActions($this->buildQuickActions($s))
+                ->sidebarWidth('42rem')
                 ->managementEnabled($s['copilot_mgmt_enabled'] ?? false)
                 ->managementGuard('admin')
                 ->respectAuthorization()
@@ -484,6 +346,9 @@ class AdminPanelProvider extends PanelProvider
 
         return <<<PROMPT
 You are a helpful AI assistant integrated into m3u editor. You help users manage playlists, EPG data, streams, channels, and other media features. Be concise and accurate.
+
+## Documentation
+For any "how do I", "what does", setup, or troubleshooting question about m3u editor features, call the Search Documentation tool before answering and base your answer on what it returns. Include the returned page URL so the user can read more. If the docs do not cover it, say so rather than guessing.
 
 ## Live TV Guide
 You can look up the live TV guide for the user's mapped channels: what is on right now, what is on later today/tomorrow/this week, what is airing around a specific show, and full channel schedules.
@@ -541,8 +406,9 @@ PROMPT;
     }
 
     /**
-     * Tools that ToolRegistry always registers by default — never pass these
-     * via ->globalTools() or they will be duplicated, causing Gemini 400 errors.
+     * Tools that ToolRegistry always registers by default. Never pass these
+     * via ->globalTools() or they will be duplicated, and providers such as
+     * Gemini reject duplicate function names with a 400 error.
      */
     private const COPILOT_BUILTIN_TOOLS = [
         GetToolsTool::class,
@@ -555,18 +421,19 @@ PROMPT;
     ];
 
     /**
-     * Strip built-in tools from the user-configured global tools list.
-     * Built-ins are always registered by ToolRegistry and must not be duplicated.
+     * Strip built-in tools and repeats from the user-configured global tools list.
+     * Built-ins are always registered by ToolRegistry, and every tool name must be
+     * unique in the request sent to the provider.
      *
      * @param  list<string>  $tools
      * @return list<string>
      */
     private function filterBuiltInTools(array $tools): array
     {
-        return array_values(array_filter(
+        return array_values(array_unique(array_filter(
             $tools,
             fn (string $tool) => ! in_array($tool, self::COPILOT_BUILTIN_TOOLS, true)
-        ));
+        )));
     }
 
     /**

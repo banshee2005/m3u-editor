@@ -22,6 +22,7 @@
  */
 
 use App\Enums\DvrRecordingStatus;
+use App\Facades\ProxyFacade;
 use App\Models\Channel;
 use App\Models\DvrRecording;
 use App\Models\DvrRecordingRule;
@@ -133,7 +134,7 @@ it('emits edl_url and dvr_uuid on get_vod_info for a DVR-backed movie', function
 
     $response = $this->getJson(dvrEdlApiUrl('get_vod_info', ['vod_id' => $channel->id]))->assertOk();
 
-    $expected = config('app.url')."/dvr/edl-user/edl-pass/{$this->recording->uuid}/edl";
+    $expected = ProxyFacade::getBaseUrl()."/dvr/edl-user/edl-pass/{$this->recording->uuid}/edl";
 
     expect($response->json('info.edl_url'))->toBe($expected)
         ->and($response->json('info.dvr_uuid'))->toBe($this->recording->uuid)
@@ -176,7 +177,7 @@ it('emits edl_url and dvr_uuid per episode on get_series_info', function () {
 
     $payload = $response->json('episodes.1.0');
 
-    expect($payload['edl_url'])->toBe(config('app.url')."/dvr/edl-user/edl-pass/{$this->recording->uuid}/edl")
+    expect($payload['edl_url'])->toBe(ProxyFacade::getBaseUrl()."/dvr/edl-user/edl-pass/{$this->recording->uuid}/edl")
         ->and($payload['dvr_uuid'])->toBe($this->recording->uuid);
 });
 
@@ -190,7 +191,7 @@ it('emits edl_url for a DVR episode attached to a non-DVR series', function () {
     $response = $this->getJson(dvrEdlApiUrl('get_series_info', ['series_id' => $episode->series_id]))->assertOk();
 
     expect($response->json('episodes.1.0.edl_url'))
-        ->toBe(config('app.url')."/dvr/edl-user/edl-pass/{$this->recording->uuid}/edl");
+        ->toBe(ProxyFacade::getBaseUrl()."/dvr/edl-user/edl-pass/{$this->recording->uuid}/edl");
 });
 
 it('omits the edl keys on get_series_info for an ordinary episode', function () {
@@ -209,6 +210,18 @@ it('withholds the edl url when comskip is disabled for the recording', function 
     $response = $this->getJson(dvrEdlApiUrl('get_vod_info', ['vod_id' => $channel->id]))->assertOk();
 
     expect($response->json('info'))->not->toHaveKey('edl_url');
+});
+
+it('emits dvr_uuid for the owner without an edl, so clients can manage the recording', function () {
+    $this->setting->update(['enable_comskip' => false]);
+    $channel = dvrEdlVodChannel($this, $this->recording->id);
+    $episode = dvrEdlEpisode($this, $this->recording->id);
+
+    $vod = $this->getJson(dvrEdlApiUrl('get_vod_info', ['vod_id' => $channel->id]))->assertOk();
+    $series = $this->getJson(dvrEdlApiUrl('get_series_info', ['series_id' => $episode->series_id]))->assertOk();
+
+    expect($vod->json('info.dvr_uuid'))->toBe($this->recording->uuid)
+        ->and($series->json('episodes.1.0.dvr_uuid'))->toBe($this->recording->uuid);
 });
 
 it('honours a per-rule comskip override that disagrees with the setting', function () {
@@ -236,7 +249,7 @@ it('honours a per-rule comskip override that disagrees with the setting', functi
     $response = $this->getJson(dvrEdlApiUrl('get_vod_info', ['vod_id' => $channel->id]))->assertOk();
 
     expect($response->json('info.edl_url'))
-        ->toBe(config('app.url')."/dvr/edl-user/edl-pass/{$this->recording->uuid}/edl");
+        ->toBe(ProxyFacade::getBaseUrl()."/dvr/edl-user/edl-pass/{$this->recording->uuid}/edl");
 });
 
 it('withholds the edl url from a credential without DVR access', function () {
@@ -316,5 +329,57 @@ it('still emits the edl url on get_vod_info for the owning credential when other
     $response = $this->getJson(dvrEdlApiUrl('get_vod_info', ['vod_id' => $channel->id]))->assertOk();
 
     expect($response->json('info.edl_url'))
-        ->toBe(config('app.url')."/dvr/edl-user/edl-pass/{$this->recording->uuid}/edl");
+        ->toBe(ProxyFacade::getBaseUrl()."/dvr/edl-user/edl-pass/{$this->recording->uuid}/edl");
+});
+
+it('emits when and where a DVR-backed movie was recorded, with or without comskip', function () {
+    $this->setting->update(['enable_comskip' => false]);
+    $source = Channel::factory()->for($this->playlist)->create(['title' => 'ESPN+ 58', 'is_vod' => false]);
+    $this->recording->update(['channel_id' => $source->id, 'programme_start' => '2026-11-12 19:00:00']);
+    $channel = dvrEdlVodChannel($this, $this->recording->id);
+
+    $info = $this->getJson(dvrEdlApiUrl('get_vod_info', ['vod_id' => $channel->id]))->assertOk()->json('info');
+
+    expect($info['dvr_recorded_at'])->toBe($this->recording->fresh()->programme_start->toIso8601String())
+        ->and($info['dvr_channel_name'])->toBe('ESPN+ 58')
+        ->and($info)->not->toHaveKey('edl_url');
+});
+
+it('emits when a DVR-backed episode was recorded on get_series_info', function () {
+    $this->recording->update(['programme_start' => '2026-11-12 19:00:00']);
+    $episode = dvrEdlEpisode($this, $this->recording->id);
+
+    $payload = $this->getJson(dvrEdlApiUrl('get_series_info', ['series_id' => $episode->series_id]))->assertOk()->json('episodes.1.0');
+
+    expect($payload['dvr_recorded_at'])->toBe($this->recording->fresh()->programme_start->toIso8601String());
+});
+
+it('omits the recorded fields for ordinary VOD and from guests who do not own the recording', function () {
+    $ordinary = dvrEdlVodChannel($this, null);
+    expect($this->getJson(dvrEdlApiUrl('get_vod_info', ['vod_id' => $ordinary->id]))->json('info'))
+        ->not->toHaveKey('dvr_recorded_at');
+
+    $this->recording->update(['playlist_auth_id' => null]);
+    $channel = dvrEdlVodChannel($this, $this->recording->id);
+    expect($this->getJson(dvrEdlApiUrl('get_vod_info', ['vod_id' => $channel->id]))->json('info'))
+        ->not->toHaveKey('dvr_recorded_at');
+});
+
+it('flags DVR movies, series and episodes as recordings for every viewer', function () {
+    $this->setting->update(['enable_comskip' => false]);
+    $movie = dvrEdlVodChannel($this, $this->recording->id);
+    $episode = dvrEdlEpisode($this, $this->recording->id);
+    $ordinaryMovie = dvrEdlVodChannel($this, null);
+    $ordinaryEpisode = dvrEdlEpisode($this, null, importBatchNo: 'upstream');
+
+    expect($this->getJson(dvrEdlApiUrl('get_vod_info', ['vod_id' => $movie->id]))->json('info.dvr_recording'))->toBeTrue()
+        ->and($this->getJson(dvrEdlApiUrl('get_vod_info', ['vod_id' => $ordinaryMovie->id]))->json('info'))->not->toHaveKey('dvr_recording');
+
+    $series = $this->getJson(dvrEdlApiUrl('get_series_info', ['series_id' => $episode->series_id]))->json();
+    expect($series['info']['dvr_recording'])->toBeTrue()
+        ->and($series['episodes']['1'][0]['dvr_recording'])->toBeTrue();
+
+    $ordinary = $this->getJson(dvrEdlApiUrl('get_series_info', ['series_id' => $ordinaryEpisode->series_id]))->json();
+    expect($ordinary['info'])->not->toHaveKey('dvr_recording')
+        ->and($ordinary['episodes']['1'][0])->not->toHaveKey('dvr_recording');
 });

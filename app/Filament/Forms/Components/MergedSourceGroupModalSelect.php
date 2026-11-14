@@ -83,20 +83,26 @@ class MergedSourceGroupModalSelect
                     ? SourceCategory::displayLabelsForIds($playlistIds, $ids, includePlaylistName: count($playlistIds) > 1)
                     : SourceGroup::displayLabelsForIds($playlistIds, $type, $ids, includePlaylistName: count($playlistIds) > 1);
             })
-            ->afterStateHydrated(function ($component, $state, $record, Get $get) use ($scopedQuery, $playlistIdsFor): void {
+            ->afterStateHydrated(function ($component, $state, $record, Get $get) use ($scopedQuery, $selectionKey, $playlistIdsFor): void {
                 // Hidden twin components are still hydrated; bail unless this is a
-                // merged-target record whose stored pairs need resolving to ids.
-                if (! $record?->merged_playlist_id || ! is_array($state) || empty($state)) {
+                // merged-target record whose stored pairs need resolving to ids. A
+                // non-empty $state means they already were (a re-fill) - leave it.
+                if (! $record?->merged_playlist_id || ! empty($state)) {
                     return;
                 }
-                if (! is_array($state[0] ?? null)) {
+                // The pairs are read from the record rather than $state: Filament's
+                // option state cast normalises multi-select state to scalars before
+                // this hook runs, which drops every {playlist_id, name} pair and
+                // would leave the picker empty (and the selections lost on save).
+                $pairs = PlaylistAlias::selectionPairs($record->group_selections[$selectionKey] ?? []);
+                if (empty($pairs)) {
                     return;
                 }
                 $playlistIds = $playlistIdsFor($get, $record);
                 if (empty($playlistIds)) {
                     return;
                 }
-                $component->state(self::pairsToSourceIds($scopedQuery($playlistIds), $state));
+                $component->state(self::pairsToSourceIds($scopedQuery($playlistIds), $pairs));
             })
             ->dehydrateStateUsing(function ($state, $record, Get $get) use ($scopedQuery, $selectionKey, $playlistIdsFor): array {
                 $playlistIds = $playlistIdsFor($get, $record);
@@ -112,8 +118,24 @@ class MergedSourceGroupModalSelect
                 $stored = PlaylistAlias::selectionPairs($record?->group_selections[$selectionKey] ?? []);
                 if (! empty($stored)) {
                     $resolvedTokens = array_map(PlaylistAlias::selectionToken(...), $pairs);
-                    $stale = array_filter($stored, fn (array $pair) => ! in_array(PlaylistAlias::selectionToken($pair), $resolvedTokens, true)
-                        && ! self::pairResolves($scopedQuery([$pair['playlist_id']]), $pair));
+                    $stale = array_filter($stored, function (array $pair) use ($resolvedTokens, $playlistIds, $scopedQuery): bool {
+                        if (in_array(PlaylistAlias::selectionToken($pair), $resolvedTokens, true)) {
+                            return false;
+                        }
+
+                        // A pair whose source is currently out of the picker's scope (its
+                        // Include Live/VOD Channels toggle was switched off, or it was
+                        // dropped from the merged playlist) can't be resolved here at all
+                        // right now - that is not the same thing as the provider having
+                        // deleted/renamed the group, so it must be kept as stale rather
+                        // than checked against (and wrongly found in) the source's table
+                        // regardless of whether it is actually in scope.
+                        if (! in_array($pair['playlist_id'], $playlistIds, true)) {
+                            return true;
+                        }
+
+                        return ! self::pairResolves($scopedQuery([$pair['playlist_id']]), $pair);
+                    });
 
                     if (! empty($stale) && (! empty($ids) || count($stale) === count($stored))) {
                         $pairs = array_merge($pairs, array_values($stale));
@@ -138,11 +160,6 @@ class MergedSourceGroupModalSelect
      */
     private static function pairsToSourceIds(Builder $query, array $pairs): array
     {
-        $pairs = PlaylistAlias::selectionPairs($pairs);
-        if (empty($pairs)) {
-            return [];
-        }
-
         return $query->where(function (Builder $query) use ($pairs): void {
             foreach ($pairs as $pair) {
                 $query->orWhere(fn (Builder $query) => $query

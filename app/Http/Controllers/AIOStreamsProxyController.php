@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Enums\ImageProfile;
 use App\Facades\PlaylistFacade;
 use App\Models\CustomPlaylist;
 use App\Models\MediaServerIntegration;
@@ -10,6 +11,7 @@ use App\Models\Playlist;
 use App\Models\PlaylistAuth;
 use App\Services\AIOStreamsAuthorizationService;
 use App\Services\AIOStreamsService;
+use App\Services\TmdbService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
@@ -188,13 +190,13 @@ class AIOStreamsProxyController extends Controller
     private function proxyMetaImages(array $meta): array
     {
         if (is_string($meta['clearlogo'] ?? null)) {
-            $meta['clearlogo'] = $this->proxyImageUrl($meta['clearlogo']);
+            $meta['clearlogo'] = XtreamApiController::proxyImageUrl(TmdbService::rasterLogoUrl($meta['clearlogo']), ImageProfile::TitleLogo);
         }
 
         if (is_array($meta['cast_list'] ?? null)) {
             $meta['cast_list'] = array_map(function ($member) {
                 if (is_array($member) && isset($member['photo'])) {
-                    $member['photo'] = $this->proxyImageUrl($member['photo']);
+                    $member['photo'] = XtreamApiController::proxyImageUrl($member['photo'], ImageProfile::Photo);
                 }
 
                 return $member;
@@ -202,18 +204,6 @@ class AIOStreamsProxyController extends Controller
         }
 
         return $meta;
-    }
-
-    /**
-     * Wrap an image URL in the logo proxy unless it is already app-hosted.
-     */
-    private function proxyImageUrl(?string $url): ?string
-    {
-        if (! $url || ! filter_var($url, FILTER_VALIDATE_URL) || str_starts_with($url, url('/'))) {
-            return $url;
-        }
-
-        return LogoProxyController::generateProxyUrl($url);
     }
 
     /**
@@ -247,6 +237,10 @@ class AIOStreamsProxyController extends Controller
      */
     private function resolveIntegration(string $username, string $password, int $integrationId, &$playlist = null): ?MediaServerIntegration
     {
+        if (! config('services.aiostreams.enabled', true)) {
+            return null;
+        }
+
         $auth = PlaylistFacade::authenticate($username, $password);
 
         if (! $auth || $auth[0] === null || $auth[1] === 'none') {

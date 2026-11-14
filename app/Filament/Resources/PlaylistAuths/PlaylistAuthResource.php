@@ -8,6 +8,7 @@ use App\Filament\Resources\DvrRecordings\DvrRecordingResource;
 use App\Filament\Resources\PlaylistAuthResource\Pages;
 use App\Filament\Resources\PlaylistAuthResource\RelationManagers;
 use App\Filament\Resources\PlaylistAuths\Pages\ListPlaylistAuths;
+use App\Filament\Resources\TvClientProfiles\TvClientProfileResource;
 use App\Models\CustomPlaylist;
 use App\Models\MediaServerIntegration;
 use App\Models\MergedPlaylist;
@@ -15,6 +16,7 @@ use App\Models\Playlist;
 use App\Models\PlaylistAlias;
 use App\Models\PlaylistAuth;
 use App\Models\StreamProfile;
+use App\Models\TvClientProfile;
 use App\Pivots\PlaylistAuthPivot;
 use App\Rules\UrlSafeCredential;
 use App\Services\DateFormatService;
@@ -91,10 +93,15 @@ class PlaylistAuthResource extends Resource implements CopilotResource
             //     $query->with('playlists');
             // })
             ->columns([
+                TextColumn::make('id')
+                    ->searchable()
+                    ->toggleable()
+                    ->sortable(),
                 TextColumn::make('name')
                     ->searchable()
                     ->sortable(),
                 TextColumn::make('username')
+                    ->extraAttributes(['class' => 'privacy-sensitive'])
                     ->searchable()
                     ->toggleable()
                     ->sortable(),
@@ -285,7 +292,7 @@ class PlaylistAuthResource extends Resource implements CopilotResource
         $aiostreamsSection = Section::make(__('AIOStreams Access'))
             ->description(__('Control whether this user can access AIOStreams content from the assigned playlist.'))
             ->compact()
-            ->hidden(fn () => MediaServerIntegration::where('user_id', auth()->id())
+            ->hidden(fn () => ! config('services.aiostreams.enabled', true) || MediaServerIntegration::where('user_id', auth()->id())
                 ->where('type', 'aiostreams')
                 ->where('enabled', true)
                 ->doesntExist()
@@ -316,6 +323,26 @@ class PlaylistAuthResource extends Resource implements CopilotResource
             ->collapsible()
             ->collapsed(fn ($record) => ! ($record?->library_publishing_enabled));
 
+        $tvClientSection = Section::make(__('M3U TV'))
+            ->description(__('Manage the M3U TV app settings for this user with a Settings Profile.'))
+            ->compact()
+            ->hidden(fn () => ! TvClientProfileResource::isEnabled())
+            ->schema([
+                Select::make('tv_client_profile_id')
+                    ->label(__('Settings Profile'))
+                    ->options(fn () => TvClientProfile::where('user_id', auth()->id())
+                        ->orderBy('name')
+                        ->pluck('name', 'id')
+                        ->toArray())
+                    ->placeholder(__('Use the default profile'))
+                    ->helperText(__('Leave empty to use your default Settings Profile, if you have one.'))
+                    ->nullable()
+                    ->columnSpan(2),
+            ])
+            ->columns(2)
+            ->collapsible()
+            ->collapsed(fn ($record) => ! ($record?->tv_client_profile_id));
+
         return [
             Grid::make()
                 ->schema([
@@ -333,6 +360,7 @@ class PlaylistAuthResource extends Resource implements CopilotResource
                         ->columns(3)
                         ->schema([
                             TextInput::make('username')
+                                ->extraInputAttributes(['class' => 'privacy-sensitive'])
                                 ->label(__('Username'))
                                 ->required()
                                 ->rules(function ($record) {
@@ -419,9 +447,7 @@ class PlaylistAuthResource extends Resource implements CopilotResource
                                 }
                             }
 
-                            $takenPlaylists = $assignedIds[(new Playlist)->getMorphClass()] ?? [];
                             Playlist::where('user_id', $userId)
-                                ->when($takenPlaylists, fn ($q) => $q->whereNotIn('id', $takenPlaylists))
                                 ->get()
                                 ->each(function (Playlist $playlist) use (&$options) {
                                     $key = Playlist::class.'|'.$playlist->id;
@@ -493,6 +519,7 @@ class PlaylistAuthResource extends Resource implements CopilotResource
             $dvrSection,
             $aiostreamsSection,
             $libraryPublishingSection,
+            $tvClientSection,
         ];
     }
 }

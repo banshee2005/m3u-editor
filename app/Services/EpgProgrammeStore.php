@@ -4,6 +4,7 @@ namespace App\Services;
 
 use Generator;
 use PDO;
+use Pdo\Sqlite;
 
 /**
  * Single-file SQLite store for an EPG's cached programmes.
@@ -61,9 +62,15 @@ class EpgProgrammeStore
 
     private int $pendingRows = 0;
 
+    /** Rows inserted by this writer, to decide whether duplicate removal freed enough space to compact. */
+    private int $insertedRows = 0;
+
     private string $buildingPath = '';
 
     private string $finalPath = '';
+
+    /** Inode of the file {@see openExisting()} opened, to detect a rebuild swapping it out. */
+    private int|false $openedInode = false;
 
     /**
      * Strip `channel` / `start` / `stop` (stored as columns) and any key still
@@ -154,6 +161,7 @@ class EpgProgrammeStore
         );
         $this->pdo->beginTransaction();
         $this->pendingRows = 0;
+        $this->insertedRows = 0;
     }
 
     /**
@@ -172,6 +180,7 @@ class EpgProgrammeStore
             $blob = '{}';
         }
         $this->insertStatement->execute([$channelId, $date, $startTs, $stopTs, $blob]);
+        $this->insertedRows++;
 
         if (++$this->pendingRows >= self::COMMIT_EVERY) {
             $this->pdo->commit();
@@ -181,29 +190,91 @@ class EpgProgrammeStore
     }
 
     /**
-     * Commit, build the lookup index, close, and atomically swap the built DB
-     * into place. Throws if the swap fails so the caller can flag the cache
-     * generation as failed rather than leaving a stale/missing store behind a
-     * "success" metadata write.
+     * Commit, build the lookup index, drop exact duplicate programmes (compacting
+     * the file when they were most of it), close, and atomically swap the built
+     * DB into place. Throws if the swap fails so
+     * the caller can flag the cache generation as failed rather than leaving a
+     * stale/missing store behind a "success" metadata write.
+     *
+     * @return int Number of exact duplicate programmes removed
      */
-    public function finish(): void
+    public function finish(): int
     {
         if ($this->pdo === null) {
-            return;
+            return 0;
         }
 
         if ($this->pdo->inTransaction()) {
             $this->pdo->commit();
         }
         $this->pdo->exec('CREATE INDEX programmes_date_channel ON programmes (date, channel_id, start_ts)');
+        $duplicatesRemoved = $this->removeExactDuplicates();
+        $compactPath = $duplicatesRemoved * 2 > $this->insertedRows ? $this->compactInto() : null;
         $this->insertStatement = null;
         $this->pdo = null;
+
+        if ($compactPath !== null) {
+            @unlink($this->buildingPath);
+            $this->buildingPath = $compactPath;
+        }
 
         if (! @rename($this->buildingPath, $this->finalPath)) {
             @unlink($this->buildingPath);
 
             throw new \RuntimeException("Failed to move EPG programme store into place at {$this->finalPath}");
         }
+
+        return $duplicatesRemoved;
+    }
+
+    /**
+     * Write a compacted copy of the store, so the pages freed by removing
+     * duplicates don't keep the file at its pre-dedupe size. `VACUUM INTO`
+     * streams straight to a new file; a plain `VACUUM` would build its copy in
+     * temp storage, which this connection keeps in memory. Compaction is only an
+     * optimization, so a failure (e.g. disk full) keeps the uncompacted store.
+     * A copy orphaned by a hard crash shares the `.building-*` prefix and is
+     * removed with the rest of the cache dir by the next rebuild's clearCache().
+     *
+     * @return string|null Path of the compacted copy, or null if it failed
+     */
+    private function compactInto(): ?string
+    {
+        $compactPath = $this->buildingPath.'.compact';
+
+        try {
+            $this->pdo->prepare('VACUUM INTO ?')->execute([$compactPath]);
+
+            return $compactPath;
+        } catch (\PDOException) {
+            @unlink($compactPath);
+
+            return null;
+        }
+    }
+
+    /**
+     * Delete rows whose channel, times and full payload exactly match an
+     * earlier row, keeping the first occurrence. Some feeds repeat the same
+     * schedule many times for one channel, and every copy would otherwise be
+     * emitted once per mapped output channel. Anything that differs (title,
+     * desc, episode, artwork, ...) is a different blob and survives.
+     *
+     * Runs after the lookup index exists so each row's duplicate probe is an
+     * index seek on (date, channel_id, start_ts) rather than a full-table sort.
+     */
+    private function removeExactDuplicates(): int
+    {
+        return (int) $this->pdo->exec(
+            'DELETE FROM programmes WHERE EXISTS ('
+            .'SELECT 1 FROM programmes earlier '
+            .'WHERE earlier.date = programmes.date '
+            .'AND earlier.channel_id = programmes.channel_id '
+            .'AND earlier.start_ts = programmes.start_ts '
+            .'AND earlier.stop_ts IS programmes.stop_ts '
+            .'AND earlier.data = programmes.data '
+            .'AND earlier.rowid < programmes.rowid)'
+        );
     }
 
     /**
@@ -232,10 +303,149 @@ class EpgProgrammeStore
         return $store;
     }
 
+    /**
+     * Open an existing store for the enrichment API (paged reads and in-place
+     * row updates).
+     *
+     * Opened read-write WITHOUT the create flag, so a store that vanished
+     * (a rebuild's clearCache() ran after the caller's existence check) fails to
+     * open instead of leaving an empty database file behind. The build's
+     * `journal_mode=OFF` is not persisted, so updates use SQLite's default
+     * rollback journal: no -wal/-shm sidecars, and the journal only exists for
+     * the length of a commit.
+     *
+     * @throws \PDOException when the store does not exist or cannot be opened
+     */
+    public static function openExisting(string $sqlitePath, int $busyTimeoutMs = 5000): self
+    {
+        $store = new self;
+        $store->finalPath = $sqlitePath;
+        $store->pdo = new PDO('sqlite:'.$sqlitePath, null, null, [
+            Sqlite::ATTR_OPEN_FLAGS => Sqlite::OPEN_READWRITE,
+        ]);
+        $store->pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+        $store->pdo->exec('PRAGMA busy_timeout='.(int) $busyTimeoutMs);
+        clearstatcache(true, $sqlitePath);
+        $store->openedInode = @fileinode($sqlitePath);
+
+        return $store;
+    }
+
     public function close(): void
     {
         $this->insertStatement = null;
         $this->pdo = null;
+    }
+
+    /**
+     * Content hash of one stored row, used for optimistic concurrency by the
+     * enrichment API. Covers the columns and the raw blob, so any change to the
+     * row (another enrichment, or a rebuild reusing the rowid for a different
+     * programme) changes the hash.
+     *
+     * @param  array{channel_id: string, start_ts: int|string|null, stop_ts: int|string|null, data: string}  $row
+     */
+    public static function rowHash(array $row): string
+    {
+        return hash('sha256', json_encode([
+            $row['channel_id'],
+            $row['start_ts'] !== null ? (int) $row['start_ts'] : null,
+            $row['stop_ts'] !== null ? (int) $row['stop_ts'] : null,
+            $row['data'],
+        ]));
+    }
+
+    /**
+     * One page of programmes ordered by rowid, as `rowid => [hash, programme]`.
+     *
+     * @return array<int, array{hash: string, programme: array<string, mixed>}>
+     */
+    public function readPage(int $afterRowid, int $limit): array
+    {
+        $statement = $this->pdo->prepare(
+            'SELECT rowid, channel_id, start_ts, stop_ts, data FROM programmes WHERE rowid > ? ORDER BY rowid LIMIT ?'
+        );
+        $statement->execute([$afterRowid, $limit]);
+
+        $page = [];
+        while (($row = $statement->fetch(PDO::FETCH_ASSOC)) !== false) {
+            $page[(int) $row['rowid']] = ['hash' => self::rowHash($row), 'programme' => self::hydrateRow($row)];
+        }
+
+        return $page;
+    }
+
+    /**
+     * Apply programme changes to specific rows, all-or-nothing.
+     *
+     * Runs in one `BEGIN IMMEDIATE` transaction: every targeted row is re-read
+     * and its hash compared with `$expectedHashes` before the first write, so a
+     * row changed since the caller read it aborts the whole batch.
+     *
+     * @param  array<int, string>  $expectedHashes  rowid => hash from {@see readPage()}
+     * @param  array<int, array<string, mixed>>  $changes  rowid => fields to overlay on the programme
+     * @return array<int, bool>|null rowid => whether that row actually changed, or null on a hash mismatch
+     */
+    public function updateRows(array $expectedHashes, array $changes): ?array
+    {
+        $this->pdo->exec('BEGIN IMMEDIATE');
+
+        try {
+            // A rebuild renames a new store over this path. Writing to the
+            // replaced file would be lost, so treat it like a changed row.
+            clearstatcache(true, $this->finalPath);
+            if ($this->openedInode === false || @fileinode($this->finalPath) !== $this->openedInode) {
+                $this->pdo->exec('ROLLBACK');
+
+                return null;
+            }
+
+            $rowids = array_keys($expectedHashes);
+            $select = $this->pdo->prepare(
+                'SELECT rowid, channel_id, start_ts, stop_ts, data FROM programmes WHERE rowid IN ('
+                .implode(',', array_fill(0, count($rowids), '?')).')'
+            );
+            $select->execute($rowids);
+
+            $current = [];
+            while (($row = $select->fetch(PDO::FETCH_ASSOC)) !== false) {
+                $current[(int) $row['rowid']] = $row;
+            }
+
+            foreach ($expectedHashes as $rowid => $hash) {
+                if (! isset($current[$rowid]) || ! hash_equals($hash, self::rowHash($current[$rowid]))) {
+                    $this->pdo->exec('ROLLBACK');
+
+                    return null;
+                }
+            }
+
+            $update = $this->pdo->prepare('UPDATE programmes SET data = ? WHERE rowid = ?');
+            $changed = [];
+            foreach ($changes as $rowid => $fields) {
+                $programme = self::hydrateRow($current[$rowid]);
+                $patched = array_replace($programme, $fields);
+                $changed[$rowid] = $patched !== $programme;
+                if ($changed[$rowid]) {
+                    $update->execute([
+                        json_encode(self::dehydrate($patched), JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE),
+                        $rowid,
+                    ]);
+                }
+            }
+
+            $this->pdo->exec('COMMIT');
+
+            return $changed;
+        } catch (\Throwable $e) {
+            try {
+                $this->pdo->exec('ROLLBACK');
+            } catch (\Throwable) {
+                // SQLite already rolled the transaction back.
+            }
+
+            throw $e;
+        }
     }
 
     /**
@@ -290,6 +500,34 @@ class EpgProgrammeStore
 
         while (($row = $statement->fetch(PDO::FETCH_ASSOC)) !== false) {
             yield [$row['channel_id'], self::hydrateRow($row)];
+        }
+    }
+
+    /**
+     * Stream the title and subtitle of every programme on air at some point in
+     * `($fromTs, $toTs)`, across all channels, without decoding whole payloads.
+     * A programme with no stop time counts as on air from its start.
+     *
+     * @param  list<string>  $dates  Local `Y-m-d` buckets that can hold such a programme
+     * @return Generator<int, array{channel_id: string, start_ts: int, stop_ts: int|null, title: string, subtitle: string}>
+     */
+    public function readAiring(array $dates, int $fromTs, int $toTs): Generator
+    {
+        $statement = $this->pdo->prepare(
+            "SELECT channel_id, start_ts, stop_ts, json_extract(data, '$.title') AS title, json_extract(data, '$.subtitle') AS subtitle "
+            .'FROM programmes WHERE date IN ('.implode(',', array_fill(0, count($dates), '?')).') '
+            .'AND start_ts < ? AND (stop_ts IS NULL OR stop_ts > ?)'
+        );
+        $statement->execute([...$dates, $toTs, $fromTs]);
+
+        while (($row = $statement->fetch(PDO::FETCH_ASSOC)) !== false) {
+            yield [
+                'channel_id' => $row['channel_id'],
+                'start_ts' => (int) $row['start_ts'],
+                'stop_ts' => $row['stop_ts'] !== null ? (int) $row['stop_ts'] : null,
+                'title' => (string) $row['title'],
+                'subtitle' => (string) $row['subtitle'],
+            ];
         }
     }
 

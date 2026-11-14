@@ -7,12 +7,15 @@ use App\Enums\DvrRecordingStatus;
 use App\Enums\DvrRuleType;
 use App\Events\DvrRecordingStatusEvent;
 use App\Notifications\Notification as AppNotification;
+use App\Services\PlaylistUrlService;
 use App\Services\ShowMetadataService;
+use App\Support\EpisodeNumberParser;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasOne;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
@@ -22,6 +25,18 @@ use Symfony\Component\HttpFoundation\StreamedResponse;
 class DvrRecording extends Model
 {
     use HasFactory;
+
+    /**
+     * Bare film genres that EPG providers use as the whole category for movies.
+     * A subtitle alongside one of these is not evidence of an episode. Matched
+     * against the entire category, so "Crime drama" or "Kids animation" don't count.
+     *
+     * @var list<string>
+     */
+    private const FILM_GENRE_CATEGORIES = [
+        'drama', 'action', 'thriller', 'comedy', 'horror', 'romance', 'western',
+        'sci-fi', 'science fiction', 'fantasy', 'adventure', 'crime', 'mystery', 'suspense',
+    ];
 
     /**
      * @return array<string, string>
@@ -40,6 +55,7 @@ class DvrRecording extends Model
             'actual_end' => UtcDateTime::class,
             'duration_seconds' => 'integer',
             'file_size_bytes' => 'integer',
+            'file_missing_since' => UtcDateTime::class,
             'metadata' => 'array',
             'programme_start' => UtcDateTime::class,
             'programme_end' => UtcDateTime::class,
@@ -97,7 +113,14 @@ class DvrRecording extends Model
             }
 
             // Delete the physical file from disk using the storage facade (file_path is relative).
-            if ($recording->file_path) {
+            // Recordings post-processed before output paths were made unique can share one
+            // file with another row (same title, same day); never delete a file another
+            // recording still points at.
+            if ($recording->file_path && $recording->fileIsSharedWithOtherRecordings()) {
+                Log::info("DvrRecording deleting hook: keeping {$recording->file_path}, another recording still uses it", [
+                    'recording_id' => $recording->id,
+                ]);
+            } elseif ($recording->file_path) {
                 $disk = $recording->dvrSetting?->storage_disk ?: config('dvr.storage_disk', 'local');
 
                 try {
@@ -266,6 +289,23 @@ class DvrRecording extends Model
     }
 
     /**
+     * Poster of the library item this recording became: the series cover for
+     * an episode, the movie's poster otherwise. Null until the recording is
+     * in the library. May be a relative path (generated DVR art).
+     */
+    public function libraryPoster(): ?string
+    {
+        $cover = $this->vodEpisode?->series?->cover;
+        if (! empty($cover)) {
+            return $cover;
+        }
+
+        $logo = $this->vodChannel?->logo;
+
+        return ! empty($logo) ? $logo : null;
+    }
+
+    /**
      * Resolve the channel icon URL.
      * Prefers custom EPG icon, then standard EPG icon, then channel logo.
      */
@@ -416,6 +456,37 @@ class DvrRecording extends Model
         return $query->where('status', DvrRecordingStatus::Completed);
     }
 
+    /**
+     * The rows that represent finished library storage: completed recordings with a
+     * file, each file counted once.
+     *
+     * Recordings post-processed before output paths were unique can share one file
+     * (same title, same day). One row stands for each file: the one that recorded the
+     * largest size (a newer row may have a null or smaller figure; the file can't be
+     * smaller than its largest recording). Purged, failed and scheduled rows never
+     * count, nor do files retention found missing from disk. Reads recorded sizes only,
+     * so it does no storage I/O; the quota measures the same files on disk
+     * (DvrRetentionService::libraryUsageBytes).
+     */
+    public function scopeCountedForStorage(Builder $query): Builder
+    {
+        $table = $query->getModel()->getTable();
+
+        return $query
+            ->where("{$table}.status", DvrRecordingStatus::Completed->value)
+            ->whereNotNull("{$table}.file_path")
+            ->whereNull("{$table}.file_missing_since")
+            ->where("{$table}.id", fn ($largest) => $largest
+                ->from("{$table} as largest")
+                ->select('largest.id')
+                ->whereColumn('largest.file_path', "{$table}.file_path")
+                ->whereColumn('largest.dvr_setting_id', "{$table}.dvr_setting_id")
+                ->where('largest.status', DvrRecordingStatus::Completed->value)
+                ->orderByRaw('coalesce(largest.file_size_bytes, -1) desc')
+                ->orderByDesc('largest.id')
+                ->limit(1));
+    }
+
     public function scopeFailed(Builder $query): Builder
     {
         return $query->where('status', DvrRecordingStatus::Failed);
@@ -430,11 +501,141 @@ class DvrRecording extends Model
     }
 
     /**
+     * When this was recorded: the programme's own start, else when recording
+     * actually began, else when it was scheduled to.
+     */
+    public function recordedAt(): ?Carbon
+    {
+        return $this->programme_start ?? $this->actual_start ?? $this->scheduled_start;
+    }
+
+    /**
+     * Display name of the channel this was recorded from.
+     */
+    public function sourceChannelName(): ?string
+    {
+        return $this->channel?->title ?? $this->channel?->name;
+    }
+
+    /**
+     * "Recorded Thu, Nov 12, 2026 7:00 PM on ESPN+ 58." - when (in the app's
+     * timezone) and from which channel this was recorded. Used as the library
+     * synopsis when nothing better exists, and on DVR badges in the panel.
+     */
+    public function recordedNote(): ?string
+    {
+        $recordedAt = $this->recordedAt();
+        if (! $recordedAt) {
+            return null;
+        }
+
+        $date = $recordedAt->copy()->setTimezone(config('app.timezone'))->locale(app()->getLocale())->isoFormat('llll');
+        $channel = $this->sourceChannelName();
+
+        return $channel
+            ? __('Recorded :date on :channel.', ['date' => $date, 'channel' => $channel])
+            : __('Recorded :date.', ['date' => $date]);
+    }
+
+    /**
+     * Decide whether this recording is TV content (series/episode) rather than a movie.
+     *
+     * Priority order (first match wins):
+     *
+     *   1. TMDB metadata type (definitive when present)
+     *   2. season/episode columns
+     *   3. epg_programme_data.episode_num, when it parses as a real season/episode
+     *   4. Gracenote/Schedules Direct programme ID in episode_num (dd_progid):
+     *      "MV..." → movie, "EP..."/"SH..."/"SP..." → TV
+     *   5. EPG category containing movie/film → movie
+     *   6. Recorded by a Series rule
+     *   7. EPG category with TV-ish keywords → TV
+     *   8. Non-movie category with a subtitle → TV. Bare film genres ("Drama", "Action")
+     *      are skipped here, since movies often carry a subtitle (tagline, edition, original title).
+     *
+     * series_key is deliberately not a signal: every recording gets one, including movies.
+     * Neither is a TVMaze match: its singlesearch is fuzzy and returns a show for most movie titles.
+     */
+    public function isTvContent(): bool
+    {
+        $tmdbType = $this->metadata['tmdb']['type'] ?? null;
+
+        if ($tmdbType !== null) {
+            return $tmdbType === 'tv';
+        }
+
+        if ($this->season !== null || $this->episode !== null) {
+            return true;
+        }
+
+        // Covers recordings made before season/episode were parsed at schedule time.
+        $episodeNum = $this->epg_programme_data['episode_num'] ?? null;
+        [$season, $episode] = EpisodeNumberParser::fromRaw($episodeNum);
+
+        if ($season !== null || $episode !== null) {
+            return true;
+        }
+
+        if ($episodeNum !== null && preg_match('/^(MV|EP|SH|SP)\d{6}/i', trim($episodeNum), $programmeId)) {
+            return strtoupper($programmeId[1]) !== 'MV';
+        }
+
+        $category = mb_strtolower(trim((string) ($this->epg_programme_data['category'] ?? '')));
+
+        if (Str::contains($category, ['movie', 'film'])) {
+            return false;
+        }
+
+        if ($this->recordingRule?->type === DvrRuleType::Series) {
+            return true;
+        }
+
+        if ($category === '') {
+            return false;
+        }
+
+        if (Str::contains($category, ['series', 'episode', 'tv', 'show', 'news', 'documentary', 'talk'])) {
+            return true;
+        }
+
+        if (in_array($category, self::FILM_GENRE_CATEGORIES, true)) {
+            return false;
+        }
+
+        return trim((string) $this->subtitle) !== '';
+    }
+
+    /**
      * Whether this recording has a completed file on disk.
      */
     public function hasFilePath(): bool
     {
         return $this->status === DvrRecordingStatus::Completed && ! empty($this->file_path);
+    }
+
+    /**
+     * Whether another recording row points at the same file as this one.
+     *
+     * Only possible for recordings post-processed before output paths were made
+     * unique (same title + same date wrote one file for both). Deleting either row
+     * must not delete the file the other still uses. Failed and cancelled rows don't
+     * use a file, and the same relative path on another disk is a different file.
+     *
+     * @param  list<int>  $exceptIds  Other rows being removed along with this one.
+     */
+    public function fileIsSharedWithOtherRecordings(array $exceptIds = []): bool
+    {
+        if (empty($this->file_path)) {
+            return false;
+        }
+
+        return static::query()
+            ->with('dvrSetting:id,storage_disk')
+            ->where('file_path', $this->file_path)
+            ->whereKeyNot([$this->getKey(), ...$exceptIds])
+            ->whereNotIn('status', [DvrRecordingStatus::Failed->value, DvrRecordingStatus::Cancelled->value])
+            ->get(['id', 'dvr_setting_id'])
+            ->contains(fn (self $other): bool => $other->resolveStorageDisk() === $this->resolveStorageDisk());
     }
 
     /**
@@ -497,21 +698,20 @@ class DvrRecording extends Model
 
     /**
      * Build the attribute array used to open this recording in the floating player.
-     * Mirrors Episode::getFloatingPlayerAttributes() for consistent dispatch shape.
+     * Mirrors Episode::getFloatingPlayerAttributes() for consistent dispatch shape:
+     * the given credentials (e.g. a guest's) when set, otherwise the owner's.
      */
-    public function getFloatingPlayerAttributes(): array
+    public function getFloatingPlayerAttributes(?string $username = null, ?string $password = null): array
     {
         $playlist = $this->dvrSetting?->owner();
-        $username = $this->user->name;
         $format = $this->status === DvrRecordingStatus::Completed
             ? ($this->dvrSetting?->dvr_output_format ?? 'mp4')
             : 'm3u8';
 
-        $routeParams = [
-            'username' => $username,
-            'password' => $playlist->uuid,
-            'uuid' => $this->uuid,
-        ];
+        $routeParams = $username && $password
+            ? ['username' => $username, 'password' => $password]
+            : ['username' => $this->user->name, 'password' => $playlist?->getInternalAuthPassword()];
+        $routeParams['uuid'] = $this->uuid;
 
         return [
             'id' => 'dvr-recording-'.$this->id,
@@ -520,10 +720,10 @@ class DvrRecording extends Model
             'playlist_id' => $playlist?->id,
             'title' => $this->display_title,
             'display_title' => $this->display_title,
-            'url' => route('dvr.recording.stream', array_merge($routeParams, ['format' => $format])),
+            'url' => PlaylistUrlService::credentialRoute('dvr.recording.stream', array_merge($routeParams, ['format' => $format])),
             'format' => $format,
             'type' => 'channel',
-            'edl_url' => route('dvr.recording.edl', $routeParams),
+            'edl_url' => PlaylistUrlService::credentialRoute('dvr.recording.edl', $routeParams),
         ];
     }
 

@@ -13,6 +13,7 @@ use App\Filament\Resources\CustomPlaylists\RelationManagers\ChannelsRelationMana
 use App\Filament\Resources\CustomPlaylists\RelationManagers\GroupsRelationManager;
 use App\Filament\Resources\CustomPlaylists\RelationManagers\SeriesRelationManager;
 use App\Filament\Resources\CustomPlaylists\RelationManagers\VodRelationManager;
+use App\Filament\Support\DefaultAuthFields;
 use App\Filament\Support\DvrRequestsAiostreamsTabs;
 use App\Jobs\DuplicateCustomPlaylist;
 use App\Models\CustomPlaylist;
@@ -320,6 +321,7 @@ class CustomPlaylistResource extends Resource implements CopilotResource
                 ->collapsed($creating)
                 ->columns(2)
                 ->schema([
+                    ...PlaylistFacade::getOutputTogglesSchema(),
                     Toggle::make('disable_m3u_xtream_format')
                         ->label(__('Disable Xtream URL format in M3U output'))
                         ->inline(false)
@@ -398,6 +400,16 @@ class CustomPlaylistResource extends Resource implements CopilotResource
                                 ->type('number')
                                 ->hidden(fn (Get $get): bool => ! $get('auto_channel_increment'))
                                 ->required(),
+                            Toggle::make('sort_by_channel_number')
+                                ->label(__('Sort by channel number'))
+                                ->columnSpan(1)
+                                ->inline(false)
+                                ->default(false)
+                                ->hintIcon(
+                                    'heroicon-m-question-mark-circle',
+                                    tooltip: __('Channels without a number are output last, in the standard group order.')
+                                )
+                                ->helperText(__('Output channels ordered by channel number instead of by group.')),
                         ]),
                 ]),
             Section::make(__('EPG Output'))
@@ -731,6 +743,7 @@ class CustomPlaylistResource extends Resource implements CopilotResource
                                                     }
                                                 })
                                                 ->dehydrated(false), // Don't save this field directly
+                                            ...DefaultAuthFields::schema(),
                                         ]),
                                 ]),
                             Tab::make(__('Processing'))

@@ -4,9 +4,11 @@ use App\Http\Controllers\Api\DeviceAuthorizationController;
 use App\Http\Controllers\Api\DispatcharrController;
 use App\Http\Controllers\Api\EpgApiController;
 use App\Http\Controllers\Api\M3uProxyApiController;
+use App\Http\Controllers\Api\PluginApiController;
 use App\Http\Controllers\Api\TvApiController;
 use App\Http\Controllers\ArrWebhookController;
 use App\Http\Controllers\DvrCallbackController;
+use App\Http\Middleware\ThrottleM3uProxyCallback;
 use Illuminate\Cookie\Middleware\EncryptCookies;
 use Illuminate\Session\Middleware\StartSession;
 use Illuminate\Support\Facades\Route;
@@ -16,13 +18,15 @@ use Illuminate\Support\Facades\Route;
  * Routed by the integration's unique webhook_secret so no additional auth header is needed.
  */
 Route::post('webhooks/arr/{integration:webhook_secret}', [ArrWebhookController::class, 'receive'])
-    ->middleware('throttle:300,1')
+    ->middleware('throttle:300,1,arr-webhook')
     ->name('webhooks.arr');
 
 /*
  * EPG API routes (used by the in-app EPG viewer)
+ * The 60/min limit is shared by the whole group, not per endpoint. If clients
+ * report 429s here, a busy endpoint may be using up the group's allowance.
  */
-Route::middleware(['throttle:60,1'])->prefix('epg')->group(function () {
+Route::middleware(['throttle:60,1,epg-api'])->prefix('epg')->group(function () {
     Route::get('{uuid}/data', [EpgApiController::class, 'getData'])
         ->name('api.epg.data');
     Route::get('playlist/{uuid}/groups', [EpgApiController::class, 'getGroupsForPlaylist'])
@@ -54,7 +58,7 @@ Route::prefix('m3u-proxy')->group(function () {
     // Authenticated by VerifyM3uProxyCallback (see routes below and M3uProxyService,
     // which embeds the shared token in the URL it hands to the proxy).
     Route::post('failover-resolver', [M3uProxyApiController::class, 'resolveFailoverUrl'])
-        ->middleware(['m3u-proxy.callback', 'throttle:300,1'])
+        ->middleware(['m3u-proxy.callback', ThrottleM3uProxyCallback::class.':resolver'])
         ->name('m3u-proxy.failover-resolver');
 
     // Player stream stop - called via sendBeacon when in-app player is closed.
@@ -71,12 +75,12 @@ Route::prefix('m3u-proxy')->group(function () {
     // Proxy webhook endpoint - called by m3u-proxy to notify of events.
     // Relies on `m3u-proxy:register-webhook` to register this endpoint with the proxy.
     Route::post('webhooks', [M3uProxyApiController::class, 'handleWebhook'])
-        ->middleware(['m3u-proxy.callback', 'throttle:300,1'])
+        ->middleware(['m3u-proxy.callback', ThrottleM3uProxyCallback::class.':webhook'])
         ->name('m3u-proxy.webhook');
 
     // Network broadcast callback - called by proxy when broadcast FFmpeg process exits
     Route::post('broadcast/callback', [M3uProxyApiController::class, 'handleBroadcastCallback'])
-        ->middleware(['m3u-proxy.callback', 'throttle:300,1'])
+        ->middleware(['m3u-proxy.callback', ThrottleM3uProxyCallback::class.':broadcast'])
         ->name('m3u-proxy.broadcast.callback');
 });
 
@@ -111,8 +115,20 @@ Route::prefix('vod')->middleware('dispatcharr.auth')->group(function () {
  * Must live in api.php (not web.php) to avoid CSRF verification.
  */
 Route::post('dvr/callback', [DvrCallbackController::class, 'handle'])
-    ->middleware(['m3u-proxy.callback', 'throttle:300,1'])
+    ->middleware(['m3u-proxy.callback', ThrottleM3uProxyCallback::class.':dvr'])
     ->name('dvr.callback');
+
+/*
+ * Plugin API endpoints (the [api_endpoints] plugin capability). Authenticated with an
+ * Xtream login in a Basic header or the JSON body; see PluginApiController.
+ */
+Route::post('plugins/{pluginId}/{endpoint}', PluginApiController::class)
+    ->where([
+        'pluginId' => '[a-z0-9][a-z0-9-]{0,99}',
+        'endpoint' => '[a-z0-9][a-z0-9_-]{0,63}',
+    ])
+    ->middleware('throttle:plugin-api')
+    ->name('api.plugins.endpoint');
 
 /*
  * Device authorization (Trakt-style pairing) - lets the TV app request a
@@ -121,15 +137,17 @@ Route::post('dvr/callback', [DvrCallbackController::class, 'handle'])
  */
 Route::prefix('device')->group(function () {
     Route::post('code', [DeviceAuthorizationController::class, 'requestCode'])
-        ->middleware('throttle:20,1')
+        ->middleware('throttle:20,1,device-code')
         ->name('device.code');
     Route::post('token', [DeviceAuthorizationController::class, 'poll'])
-        ->middleware('throttle:60,1')
+        ->middleware('throttle:60,1,device-token')
         ->name('device.token');
 });
 
 /*
  * TV app API routes (authenticated via Xtream credentials in URL path - no Sanctum)
+ * The 60/min limit is shared by the whole group, not per endpoint. If clients
+ * report 429s here, a busy endpoint may be using up the group's allowance.
  */
 Route::prefix('tv/{username}/{password}')->middleware('throttle:tv-api')->group(function () {
     Route::get('notifications', [TvApiController::class, 'notifications'])
@@ -144,4 +162,7 @@ Route::prefix('tv/{username}/{password}')->middleware('throttle:tv-api')->group(
         ->name('tv.push.unsubscribe');
     Route::post('player-stream/stop', [TvApiController::class, 'stopPlayerStream'])
         ->name('tv.player-stream.stop');
+    Route::post('logs', [TvApiController::class, 'uploadLogs'])
+        ->middleware('throttle:6,1,tv-logs')
+        ->name('tv.logs.upload');
 });

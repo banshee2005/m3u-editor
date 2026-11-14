@@ -28,6 +28,7 @@ use App\Services\DateFormatService;
 use App\Services\EpgCacheService;
 use App\Services\LogoCacheService;
 use App\Services\PlaylistService;
+use App\Support\ChannelNumber;
 use App\Traits\HasUserFiltering;
 use EslamRedaDiv\FilamentCopilot\Contracts\CopilotResource;
 use Exception;
@@ -49,6 +50,7 @@ use Filament\Notifications\Notification;
 use Filament\Resources\Resource;
 use Filament\Schemas\Components\Fieldset;
 use Filament\Schemas\Components\Grid;
+use Filament\Schemas\Components\Group as SchemaGroup;
 use Filament\Schemas\Components\Section;
 use Filament\Schemas\Components\Utilities\Get;
 use Filament\Schemas\Components\Utilities\Set;
@@ -161,9 +163,9 @@ class ChannelResource extends Resource implements CopilotResource
                     'epgChannel' => fn ($q) => $q->select('id', 'epg_id', 'name', 'icon', 'icon_custom')
                         ->with('epg'),
                     'aedProfile' => fn ($q) => $q->select('id', 'name'),
-                    'playlist' => fn ($q) => $q->select('id', 'name', 'uuid', 'auto_sort', 'enable_proxy', 'user_id')
+                    'playlist' => fn ($q) => $q->select('id', 'name', 'uuid', 'auto_sort', 'enable_proxy', 'enable_logo_proxy', 'user_id')
                         ->with(['user' => fn ($uq) => $uq->select('id', 'is_admin', 'permissions')]),
-                    'customPlaylist' => fn ($q) => $q->select('id', 'name', 'uuid', 'enable_proxy', 'user_id')
+                    'customPlaylist' => fn ($q) => $q->select('id', 'name', 'uuid', 'enable_proxy', 'enable_logo_proxy', 'user_id')
                         ->with(['user' => fn ($uq) => $uq->select('id', 'is_admin', 'permissions')]),
                     'streamProfile' => fn ($q) => $q->select('id', 'name'),
                 ])
@@ -180,7 +182,7 @@ class ChannelResource extends Resource implements CopilotResource
             ->toolbarActions(self::getTableBulkActions());
     }
 
-    public static function getTableColumns($showGroup = true, $showPlaylist = true): array
+    public static function getTableColumns($showGroup = true, $showPlaylist = true, $minimal = false): array
     {
         return [
             ImageColumn::make('logo')
@@ -201,17 +203,17 @@ class ChannelResource extends Resource implements CopilotResource
                     return $query->orderByRaw("COALESCE(title_custom, title) {$direction}");
                 })
                 ->getStateUsing(function ($record) {
-                    $info = $record->info;
-                    $title = $record->title_custom ?: $record->title;
+                    $title = e($record->title_custom ?: $record->title, false);
                     $html = "<span class='fi-ta-text-item-label whitespace-normal text-sm leading-6 text-gray-950 dark:text-white'>{$title}</span>";
-                    if (is_array($info)) {
-                        $description = Str::limit($info['description'] ?? $info['plot'] ?? '', 200);
+                    if ($description = static::infoDescription($record)) {
+                        $description = e(Str::limit($description, 200), false);
                         $html .= "<p class='text-sm text-gray-500 dark:text-gray-400 whitespace-normal mt-2'>{$description}</p>";
                     }
 
                     return new HtmlString($html);
                 })
-                ->extraAttributes(['style' => 'min-width: 350px;'])
+                // Only reserve room for a wrapped description; title-only rows (most live channels) size to their content
+                ->extraAttributes(fn ($record): array => static::infoDescription($record) ? ['style' => 'min-width: 350px;'] : [])
                 ->toggleable(),
             TextInputColumn::make('sort')
                 ->label(__('Sort Order'))
@@ -238,7 +240,8 @@ class ChannelResource extends Resource implements CopilotResource
                 ->color(fn (string $state): string => self::resolveScrubberStatusColor($state))
                 ->tooltip(fn ($record): string => self::resolveScrubberStatusTooltip($record))
                 ->toggleable()
-                ->sortable(),
+                ->sortable()
+                ->hidden($minimal),
             TextColumn::make('last_scrubbed_at')
                 ->label(__('Last Scrubbed'))
                 ->formatStateUsing(fn ($state) => app(DateFormatService::class)->format($state))
@@ -246,13 +249,15 @@ class ChannelResource extends Resource implements CopilotResource
                     ? __('Scrubbed').' '.$record->last_scrubbed_at->diffForHumans()
                     : __('Never scrubbed'))
                 ->toggleable()
-                ->sortable(),
+                ->sortable()
+                ->hidden($minimal),
             TextColumn::make('failovers_count')
                 ->label(__('Failovers'))
                 ->counts('failovers')
                 ->badge()
                 ->toggleable()
-                ->sortable(),
+                ->sortable()
+                ->hidden($minimal),
             TextInputColumn::make('stream_id_custom')
                 ->label(__('ID'))
                 ->rules(['min:0', 'max:255'])
@@ -289,12 +294,17 @@ class ChannelResource extends Resource implements CopilotResource
                 })
                 ->toggleable(),
             TextInputColumn::make('channel')
-                ->rules(['numeric', 'min:0'])
-                ->type('number')
+                ->rules(['nullable', 'regex:'.ChannelNumber::PATTERN])
+                ->validationMessages(['regex' => __('Use a whole number, or a sub-channel like 5.1.')])
                 ->placeholder(__('Channel No.'))
+                ->getStateUsing(fn (Channel $record): int|string|null => $record->resolveChannelNumber())
+                ->updateStateUsing(fn (Channel $record, $state) => $record->update(ChannelNumber::toAttributes($state)))
                 ->toggleable()
-                ->sortable(),
+                ->sortable(query: fn (Builder $query, string $direction): Builder => $query
+                    ->orderBy('channels.channel', $direction)
+                    ->orderByRaw('COALESCE(channels.channel_minor, 0) '.($direction === 'desc' ? 'desc' : 'asc'))),
             TextInputColumn::make('url_custom')
+                ->extraInputAttributes(['class' => 'privacy-sensitive'])
                 ->label(__('URL'))
                 ->rules(['url'])
                 ->type('url')
@@ -328,7 +338,8 @@ class ChannelResource extends Resource implements CopilotResource
                             return $query->orWhere(DB::raw('LOWER(group)'), 'LIKE', "%{$search}%");
                     }
                 })
-                ->sortable(),
+                ->sortable()
+                ->hidden($minimal),
             ToggleColumn::make('probe_enabled')
                 ->label(__('Probe Enabled'))
                 ->toggleable()
@@ -358,7 +369,8 @@ class ChannelResource extends Resource implements CopilotResource
                     });
                 })
                 ->limit(40)
-                ->sortable(),
+                ->sortable()
+                ->hidden($minimal),
             TextColumn::make('epgChannel.epg.name')
                 ->label(__('EPG Source'))
                 ->toggleable()
@@ -424,6 +436,7 @@ class ChannelResource extends Resource implements CopilotResource
                 })
                 ->toggleable(isToggledHiddenByDefault: true),
             TextColumn::make('url')
+                ->extraAttributes(['class' => 'privacy-sensitive'])
                 ->label(__('Default URL'))
                 ->sortable()
                 ->searchable(query: function (Builder $query, string $search): Builder {
@@ -442,6 +455,21 @@ class ChannelResource extends Resource implements CopilotResource
                 ->sortable()
                 ->toggleable(isToggledHiddenByDefault: true),
         ];
+    }
+
+    /**
+     * Description/plot text shown under the title in the Info column, if any.
+     */
+    protected static function infoDescription(Channel $record): ?string
+    {
+        $info = $record->info;
+        if (! is_array($info)) {
+            return null;
+        }
+
+        $description = trim((string) ($info['description'] ?? $info['plot'] ?? ''));
+
+        return $description !== '' ? $description : null;
     }
 
     public static function getTableFilters($showPlaylist = true): array
@@ -465,7 +493,7 @@ class ChannelResource extends Resource implements CopilotResource
                 ->query(function ($query) {
                     return $query->where('aed_profile_id', '!=', null);
                 }),
-            Filter::make('un_mapped')
+            Filter::make('aed_profile_not_applied')
                 ->label(__('AED Profile not applied'))
                 ->toggle()
                 ->query(function ($query) {
@@ -782,8 +810,13 @@ class ChannelResource extends Resource implements CopilotResource
                                 $affectedPlaylists->push($custom);
                             }
                         }
+                        // clearPlaylistEpgCacheFile() returns false when there was nothing to
+                        // clear; Collection::each() stops on the first false return, so the
+                        // callback must not forward it or later playlists get silently skipped.
                         $affectedPlaylists->unique(fn ($p) => $p->getTable().'-'.$p->id)
-                            ->each(fn ($p) => EpgCacheService::clearPlaylistEpgCacheFile($p));
+                            ->each(function ($p) {
+                                EpgCacheService::clearPlaylistEpgCacheFile($p);
+                            });
                     })->after(function () {
                         Notification::make()
                             ->success()
@@ -850,7 +883,10 @@ class ChannelResource extends Resource implements CopilotResource
                     ])
                     ->action(function (Collection $records, array $data): void {
                         foreach ($records->chunk(100) as $chunk) {
-                            Channel::whereIn('id', $chunk->pluck('id'))->update(['aed_profile_id' => $data['aed_profile_id']]);
+                            $ids = $chunk->pluck('id')->all();
+                            Channel::whereIn('id', $ids)->update(['aed_profile_id' => $data['aed_profile_id']]);
+                            // A query update skips the Channel::updated cache clear.
+                            EpgCacheService::clearForChannelIds($ids);
                         }
                     })->after(function () {
                         Notification::make()
@@ -870,7 +906,10 @@ class ChannelResource extends Resource implements CopilotResource
                     ->color('warning')
                     ->action(function (Collection $records): void {
                         foreach ($records->chunk(100) as $chunk) {
-                            Channel::whereIn('id', $chunk->pluck('id'))->update(['aed_profile_id' => null]);
+                            $ids = $chunk->pluck('id')->all();
+                            Channel::whereIn('id', $ids)->update(['aed_profile_id' => null]);
+                            // A query update skips the Channel::updated cache clear.
+                            EpgCacheService::clearForChannelIds($ids);
                         }
                     })->after(function () {
                         Notification::make()
@@ -1398,8 +1437,10 @@ class ChannelResource extends Resource implements CopilotResource
                     ->columns(2)
                     ->schema([
                         TextEntry::make('url')
+                            ->extraAttributes(['class' => 'privacy-sensitive'])
                             ->label(__('URL'))->columnSpanFull(),
                         TextEntry::make('proxy_url')
+                            ->extraAttributes(['class' => 'privacy-sensitive'])
                             ->state(fn ($record) => $record?->getProxyUrl())
                             ->label(__('Proxy URL'))->columnSpanFull(),
                         TextEntry::make('stream_id')
@@ -1748,8 +1789,15 @@ class ChannelResource extends Resource implements CopilotResource
                     TextInput::make('channel')
                         ->label(__('Channel No.'))
                         ->hint(__('tvg-chno'))
+                        ->helperText(__('Use a decimal for a sub-channel, e.g. 5.1.'))
                         ->columnSpan(1)
-                        ->rules(['numeric', 'min:0']),
+                        ->rules(['nullable', 'regex:'.ChannelNumber::PATTERN])
+                        ->validationMessages(['regex' => __('Use a whole number, or a sub-channel like 5.1.')])
+                        ->formatStateUsing(fn ($state, ?Channel $record): int|string|null => ChannelNumber::format($state, $record?->channel_minor))
+                        ->dehydrateStateUsing(fn ($state): ?int => ChannelNumber::parse($state)[0]),
+                    // The sub-channel part of the number above ("5.1" => 1), saved alongside it.
+                    Hidden::make('channel_minor')
+                        ->dehydrateStateUsing(fn (Get $get): ?int => ChannelNumber::parse($get('channel'))[1]),
                     TextInput::make('shift')
                         ->label(__('Time Shift'))
                         ->hint(__('timeshift'))
@@ -1768,7 +1816,13 @@ class ChannelResource extends Resource implements CopilotResource
                             Select::make('group_id')
                                 ->label(__('Group'))
                                 ->hint(__('group-title'))
-                                ->options(fn (Get $get) => Group::query()->assignableTarget()->where('playlist_id', $get('playlist_id'))->whereNotNull('name')->get(['name', 'id'])->pluck('name', 'id'))
+                                ->options(fn (Get $get) => Group::query()->assignableTarget()
+                                    ->where('playlist_id', $get('playlist_id'))
+                                    // A group's type is set explicitly on creation ('live'/'vod'); a null
+                                    // type only occurs on legacy/unmigrated rows, which predate the VOD
+                                    // group split and are therefore live groups too.
+                                    ->where(fn ($query) => $query->where('type', 'live')->orWhereNull('type'))
+                                    ->whereNotNull('name')->get(['name', 'id'])->pluck('name', 'id'))
                                 ->columnSpanFull()
                                 ->placeholder(__('Select a group'))
                                 ->searchable()
@@ -1798,6 +1852,7 @@ class ChannelResource extends Resource implements CopilotResource
             Fieldset::make(__('URL Settings'))
                 ->schema([
                     TextInput::make('url')
+                        ->extraInputAttributes(['class' => 'privacy-sensitive'])
                         ->label(fn (Get $get) => $get('is_custom') ? 'URL' : 'Provider URL')
                         ->columnSpan(1)
                         ->prefixIcon('heroicon-m-globe-alt')
@@ -1810,6 +1865,7 @@ class ChannelResource extends Resource implements CopilotResource
                         ->dehydrated(fn (Get $get) => $get('is_custom')) // don't save the value in the database for custom channels
                         ->type('url'),
                     TextInput::make('url_custom')
+                        ->extraInputAttributes(['class' => 'privacy-sensitive'])
                         ->label(__('URL Override'))
                         ->columnSpan(1)
                         ->prefixIcon('heroicon-m-globe-alt')
@@ -1869,6 +1925,7 @@ class ChannelResource extends Resource implements CopilotResource
                         ->url()
                         ->hidden(fn (Get $get) => ! ($get('is_custom') && $get('catchup'))),
                     TextInput::make('proxy_url')
+                        ->extraInputAttributes(['class' => 'privacy-sensitive'])
                         ->label(__('Proxy URL'))
                         ->columnSpan(2)
                         ->prefixIcon('heroicon-m-globe-alt')
@@ -1884,6 +1941,7 @@ class ChannelResource extends Resource implements CopilotResource
                         ->hiddenOn('create')
                         ->hidden(fn () => ! config('proxy.proxy_integration_enabled')),
                     TextInput::make('mediaflow_proxy_url')
+                        ->extraInputAttributes(['class' => 'privacy-sensitive'])
                         ->label(__('MediaFlow Proxy URL'))
                         ->columnSpan(2)
                         ->prefixIcon('heroicon-m-shield-check')
@@ -1917,6 +1975,26 @@ class ChannelResource extends Resource implements CopilotResource
                         ->dehydrated()
                         ->inline(false)
                         ->default(false),
+                    SchemaGroup::make()
+                        ->statePath('proxy_options')
+                        ->columnSpanFull()
+                        ->dehydrateStateUsing(fn ($state, $record): array => array_replace($record?->proxy_options ?? [], $state ?? []))
+                        ->schema([
+                            Select::make('normalize_live_output')
+                                ->label(__('Normalize live MPEG-TS output'))
+                                ->columnSpanFull()
+                                ->options(['1' => __('Enabled'), '0' => __('Disabled')])
+                                ->placeholder(__('Inherit global setting'))
+                                ->nullable()
+                                ->native(false)
+                                ->in(['0', '1'])
+                                ->afterStateHydrated(fn (Select $component, $record) => $component->state(
+                                    ($record?->proxy_options['normalize_live_output'] ?? null) === null
+                                        ? null : ($record->proxy_options['normalize_live_output'] ? '1' : '0')
+                                ))
+                                ->dehydrateStateUsing(fn ($state): ?bool => $state === null || $state === '' ? null : in_array($state, [true, 1, '1'], true))
+                                ->helperText(__('Inherit Settings → Proxy → Failover & Recovery, or explicitly enable/disable normalization for this channel. Uses the global CPU/VAAPI/QSV encoder. Only compatible live MPEG-TS inputs; ignored for VOD, HLS, DASH, catchup and Stream Profiles.')),
+                        ]),
                     Select::make('stream_profile_id')
                         ->label(__('Stream Profile'))
                         ->options(fn () => StreamProfile::where('user_id', auth()->id())->pluck('name', 'id'))

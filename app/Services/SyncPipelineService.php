@@ -8,7 +8,9 @@ use App\Events\SyncCompleted;
 use App\Jobs\AutoSyncGroupsToCustomPlaylist;
 use App\Jobs\CompleteSyncPhase;
 use App\Jobs\FetchTmdbIds;
+use App\Jobs\MatchMediaServerSources;
 use App\Jobs\MergeChannels;
+use App\Jobs\Middleware\SkipIfSyncReset;
 use App\Jobs\ProbeChannelStreams;
 use App\Jobs\ProbeStreams;
 use App\Jobs\ProcessChannelScrubber;
@@ -57,24 +59,34 @@ class SyncPipelineService
                 ->first();
 
             if ($existing) {
-                // If the import phase is already complete the pipeline has moved past
-                // Import. This run is stale — the pipeline died mid-way (queue clear,
-                // worker crash, etc.). Fail it so we can start a fresh run below.
-                if ($existing->isPhaseComplete(SyncRunPhase::Import)) {
+                // The import phase being complete only means the pipeline has moved
+                // past Import — it does not mean the pipeline is dead. A large VOD/series
+                // sync can legitimately sit past Import for hours. Only treat the run as
+                // stale (pipeline died mid-way: queue clear, worker crash, etc.) when it
+                // has also gone quiet: no phase transition on the run itself, and no
+                // progress write on the playlist (chunked jobs touch playlist->updated_at
+                // periodically, e.g. vod_progress every 10 channels) within the heartbeat
+                // window. Otherwise this is a true concurrent dispatch of an actively
+                // running pipeline, so return the existing run.
+                $heartbeatMinutes = (int) config('dev.sync_run_stale_minutes', 20);
+                $lastHeartbeat = $existing->updated_at?->max($playlist->updated_at) ?? $playlist->updated_at;
+                $isStale = $existing->isPhaseComplete(SyncRunPhase::Import)
+                    && (! $lastHeartbeat || $lastHeartbeat->lt(now()->subMinutes($heartbeatMinutes)));
+
+                if ($isStale) {
                     $existing->update([
                         'status' => SyncRunStatus::Failed->value,
                         'finished_at' => now(),
                     ]);
 
-                    Log::info("SyncPipeline: startImport — stale run {$existing->id} detected (import complete, pipeline dead). Failing and creating fresh run.", [
+                    Log::info("SyncPipeline: startImport — stale run {$existing->id} detected (import complete, no heartbeat for {$heartbeatMinutes}+ minutes). Failing and creating fresh run.", [
                         'playlist_id' => $playlist->id,
                         'trigger' => $trigger,
                         'stale_run_id' => $existing->id,
                         'stale_current_phase' => $existing->current_phase,
+                        'last_heartbeat' => $lastHeartbeat?->toIso8601String(),
                     ]);
                 } else {
-                    // Import is not yet complete — a true concurrent dispatch. Return the
-                    // existing run to prevent a duplicate import.
                     Log::info("SyncPipeline: startImport skipped — run {$existing->id} already active for playlist {$playlist->id}.", [
                         'existing_run_id' => $existing->id,
                         'trigger' => $trigger,
@@ -283,6 +295,7 @@ class SyncPipelineService
             SyncRunPhase::LiveProbe => $this->dispatchLiveProbe($run, $playlist),
             SyncRunPhase::CustomPlaylistSync => $this->dispatchCustomPlaylistSync($run, $playlist),
             SyncRunPhase::DynamicGroups => $this->dispatchDynamicGroups($run, $playlist),
+            SyncRunPhase::MediaSourceMatch => $this->dispatchMediaSourceMatch($run, $playlist),
             SyncRunPhase::SyncCompleted => $this->finish($run),
         };
     }
@@ -480,7 +493,7 @@ class SyncPipelineService
                 return ($rule['group_filter'] ?? 'selected') === 'new_only' || ! empty($rule['groups'] ?? []);
             });
 
-        $jobs = $rules->map(function (array $rule) use ($playlist): ?AutoSyncGroupsToCustomPlaylist {
+        $jobs = $rules->map(function (array $rule) use ($playlist, $run): ?AutoSyncGroupsToCustomPlaylist {
             $groupFilter = $rule['group_filter'] ?? 'selected';
 
             if ($groupFilter === 'new_only') {
@@ -488,6 +501,8 @@ class SyncPipelineService
                 $groupIds = Group::where('playlist_id', $playlist->id)
                     ->where('type', $groupType)
                     ->where('new', true)
+                    // Restored groups are flagged new for the sync log, but only groups created this run count here
+                    ->when($run->started_at, fn ($query, $startedAt) => $query->where('created_at', '>=', $startedAt))
                     ->pluck('id')
                     ->map(fn ($id): int => (int) $id)
                     ->all();
@@ -511,6 +526,12 @@ class SyncPipelineService
                 ],
                 type: $rule['type'] === 'series_categories' ? 'series' : 'channel',
                 syncMode: $rule['sync_mode'] ?? 'full_sync',
+                channelIds: $groupFilter === 'new_only' || $rule['type'] === 'series_categories'
+                    ? []
+                    : array_map('intval', (array) ($rule['channels'] ?? [])),
+                channelNamePatterns: $groupFilter === 'new_only' || $rule['type'] === 'series_categories'
+                    ? []
+                    : array_values(array_filter((array) ($rule['channel_name_patterns'] ?? []), 'is_string')),
             );
         })->filter()->values()->all();
 
@@ -528,6 +549,18 @@ class SyncPipelineService
             playlistId: $playlist->id,
             syncRunId: $run->id,
             completionPhase: SyncRunPhase::DynamicGroups,
+        ));
+    }
+
+    private function dispatchMediaSourceMatch(SyncRun $run, Playlist $playlist): void
+    {
+        // MatchMediaServerSources is responsible for signalling completion itself
+        // (handles the toggle-off / no-eligible-integration paths via its finally
+        // block), mirroring SyncDynamicGroups's behaviour.
+        dispatch(new MatchMediaServerSources(
+            playlistId: $playlist->id,
+            syncRunId: $run->id,
+            completionPhase: SyncRunPhase::MediaSourceMatch,
         ));
     }
 
@@ -590,6 +623,24 @@ class SyncPipelineService
         Log::error("SyncPipeline: Run {$run->id} failed — {$reason}");
     }
 
+    /**
+     * Stop a playlist's in-flight sync when the user resets its status. Its
+     * running SyncRun is cancelled, so no further phase is dispatched and the
+     * next sync starts a fresh run, and its queued import jobs are skipped
+     * (see SkipIfSyncReset).
+     */
+    public function cancelActiveRuns(Playlist $playlist): void
+    {
+        SkipIfSyncReset::recordReset($playlist);
+
+        $playlist->syncRuns()
+            ->where('status', SyncRunStatus::Running->value)
+            ->update([
+                'status' => SyncRunStatus::Cancelled->value,
+                'finished_at' => now(),
+            ]);
+    }
+
     // ── Pipeline builder ─────────────────────────────────────────────────────
 
     /** @return SyncRunPhase[] */
@@ -624,19 +675,34 @@ class SyncPipelineService
         // 1. Enabled items exist → metadata + probe via resolvePreStrmPhases (tmdbEnabled: false).
         // 2. No enabled items, but new disabled items were imported → no metadata/probe needed;
         //    TMDB-only path is handled in Group 3 below.
-        if ($hasVod) {
+        //
+        // Each probe phase only probes its own content type (ProbeStreams::$isSeriesProbe). When
+        // only one type has enabled items, the other type's probe phase still runs if it has
+        // probe-eligible items (disabled ones under "include disabled", or enabled episodes of
+        // disabled series), which is what a single combined probe used to cover.
+        $autoProbeVod = (bool) $playlist->auto_probe_vod_streams;
+        $probeIncludesDisabled = (bool) ($playlist->auto_probe_vod_streams_include_disabled ?? false);
+
+        $probeVod = $autoProbeVod && ($hasVod || ($probeIncludesDisabled
+            && $playlist->channels()->where('is_vod', true)->exists()));
+
+        $probeSeries = $autoProbeVod && ($hasSeries || ($hasVod && $playlist->episodes()
+            ->when(! $probeIncludesDisabled, fn ($query) => $query->where('enabled', true))
+            ->exists()));
+
+        if ($hasVod || $probeVod) {
             $phases = array_merge($phases, $this->resolvePreStrmPhases(
-                metadataEnabled: (bool) $playlist->auto_fetch_vod_metadata,
-                probeEnabled: (bool) $playlist->auto_probe_vod_streams,
+                metadataEnabled: $hasVod && (bool) $playlist->auto_fetch_vod_metadata,
+                probeEnabled: $probeVod,
                 metadataPhase: SyncRunPhase::VodMetadata,
                 probePhase: SyncRunPhase::VodProbe,
             ));
         }
 
-        if ($hasSeries) {
+        if ($hasSeries || $probeSeries) {
             $phases = array_merge($phases, $this->resolvePreStrmPhases(
-                metadataEnabled: (bool) $playlist->auto_fetch_series_metadata,
-                probeEnabled: (bool) $playlist->auto_probe_vod_streams,
+                metadataEnabled: $hasSeries && (bool) $playlist->auto_fetch_series_metadata,
+                probeEnabled: $probeSeries,
                 metadataPhase: SyncRunPhase::SeriesMetadata,
                 probePhase: SyncRunPhase::SeriesProbe,
             ));
@@ -681,6 +747,14 @@ class SyncPipelineService
             if ($hasSeries || $hasNewSeries) {
                 $phases[] = SyncRunPhase::SeriesTmdb;
             }
+        }
+
+        // Media-server source matching: needs the provider TMDB ids from
+        // Group 3, and must run before STRM so "original"-url STRM files can
+        // use the matched media source. The job completes the phase itself
+        // when the toggle is off or no eligible integrations exist.
+        if (($hasVod || $hasSeries) && $playlist->prefer_media_server_sources) {
+            $phases[] = SyncRunPhase::MediaSourceMatch;
         }
 
         // Group 4: STRM generation (runs after find-replace so filenames embed corrected titles)

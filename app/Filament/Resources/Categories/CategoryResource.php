@@ -2,8 +2,8 @@
 
 namespace App\Filament\Resources\Categories;
 
-use App\Facades\SortFacade;
 use App\Filament\Actions\FetchTmdbIdsForGroupsAction;
+use App\Filament\Actions\SortSeriesByDateAction;
 use App\Filament\Concerns\HasCopilotSupport;
 use App\Filament\Resources\Categories\Pages\EditCategory;
 use App\Filament\Resources\Categories\Pages\ListCategories;
@@ -42,6 +42,7 @@ use Filament\Tables\Columns\IconColumn;
 use Filament\Tables\Columns\TextColumn;
 use Filament\Tables\Columns\TextInputColumn;
 use Filament\Tables\Columns\ToggleColumn;
+use Filament\Tables\Contracts\HasTable;
 use Filament\Tables\Enums\RecordActionsPosition;
 use Filament\Tables\Filters\TernaryFilter;
 use Filament\Tables\Table;
@@ -136,8 +137,8 @@ class CategoryResource extends Resource implements CopilotResource
     {
         return $table->persistFiltersInSession()
             ->persistSortInSession()
-            ->modifyQueryUsing(function (Builder $query) {
-                $query->with('parent')
+            ->modifyQueryUsing(function (Builder $query, HasTable $livewire) {
+                $query->with(['parent', 'playlist'])
                     ->withCount('series')
                     ->withCount('enabled_series')
                     ->withCount('children')
@@ -145,6 +146,12 @@ class CategoryResource extends Resource implements CopilotResource
                         'descendantSeries as descendant_series_count',
                         'descendantSeries as enabled_descendant_series_count' => fn (Builder $subQuery) => $subQuery->where('series.enabled', true),
                     ]);
+
+                // Filament can't lock single rows from dragging, so sort mode only lists
+                // categories the next sync won't renumber (Category Auto Sort off).
+                if ($livewire->isTableReordering()) {
+                    $query->sortOrderUnlocked();
+                }
             })
             ->filtersTriggerAction(function ($action) {
                 return $action->button()->label(__('Filters'));
@@ -174,12 +181,17 @@ class CategoryResource extends Resource implements CopilotResource
                     ->type('number')
                     ->placeholder(__('Sort Order'))
                     ->sortable()
-                    ->tooltip(__('Category sort order'))
+                    ->disabled(fn (Category $record): bool => $record->isSortOrderLockedToProvider())
+                    ->tooltip(fn (Category $record): string => $record->isSortOrderLockedToProvider()
+                        ? __('Category Auto Sort is on for this playlist, so this category follows the provider order.')
+                        : __('Category sort order'))
                     ->toggleable(),
                 ToggleColumn::make('enabled')
                     ->label(__('Auto Enable'))
                     ->toggleable()
-                    ->tooltip(__('Auto enable newly added category series'))
+                    ->tooltip(fn ($record) => $record->playlist?->enable_series ? __('Playlist "Enable new series" is on, so all new series added to this category will be enabled on sync.') : __('Auto enable newly added category series'))
+                    ->disabled(fn ($record) => (bool) $record->playlist?->enable_series)
+                    ->getStateUsing(fn ($record) => $record->playlist?->enable_series ? true : $record->enabled)
                     ->sortable(),
                 TextColumn::make('name_internal')
                     ->label(__('Default name'))
@@ -273,32 +285,7 @@ class CategoryResource extends Resource implements CopilotResource
                         ->modalIcon('heroicon-o-arrows-right-left')
                         ->modalDescription(__('Move the series to another category.'))
                         ->modalSubmitActionLabel(__('Move now')),
-                    Action::make('sort_release_date')
-                        ->label(__('Sort by Release Date'))
-                        ->icon('heroicon-o-calendar-days')
-                        ->schema([
-                            Select::make('sort')
-                                ->label(__('Sort Order'))
-                                ->options([
-                                    'DESC' => 'Newest first (2026 to 1950)',
-                                    'ASC' => 'Oldest first (1950 to 2026)',
-                                ])
-                                ->default('DESC')
-                                ->required(),
-                        ])
-                        ->action(function (Category $record, array $data): void {
-                            SortFacade::bulkSortCategorySeriesByReleaseDate($record, $data['sort'] ?? 'DESC');
-                        })
-                        ->after(function () {
-                            Notification::make()
-                                ->success()
-                                ->title(__('Series Sorted by Release Date'))
-                                ->body(__('The series in this category have been sorted by release date.'))
-                                ->send();
-                        })
-                        ->requiresConfirmation()
-                        ->modalIcon('heroicon-o-calendar-days')
-                        ->modalDescription(__('Sort all series in this category by release date? This will update the sort order.')),
+                    SortSeriesByDateAction::forCategory(),
                     Action::make('reclassify_tmdb_genres')
                         ->label(__('Reclassify to TMDB Genres'))
                         ->icon('heroicon-o-tag')
@@ -471,35 +458,7 @@ class CategoryResource extends Resource implements CopilotResource
                         ->modalDescription(__('Move the category series to another category.'))
                         ->modalSubmitActionLabel(__('Move now')),
                     MergedGroupService::addToMergedCategoryBulkAction(),
-                    BulkAction::make('sort_release_date_bulk')
-                        ->label(__('Sort by Release Date'))
-                        ->icon('heroicon-o-calendar-days')
-                        ->schema([
-                            Select::make('sort')
-                                ->label(__('Sort Order'))
-                                ->options([
-                                    'DESC' => 'Newest first (2026 to 1950)',
-                                    'ASC' => 'Oldest first (1950 to 2026)',
-                                ])
-                                ->default('DESC')
-                                ->required(),
-                        ])
-                        ->action(function (Collection $records, array $data): void {
-                            foreach ($records as $record) {
-                                SortFacade::bulkSortCategorySeriesByReleaseDate($record, $data['sort'] ?? 'DESC');
-                            }
-                        })
-                        ->after(function () {
-                            Notification::make()
-                                ->success()
-                                ->title(__('Series Sorted by Release Date'))
-                                ->body(__('The series in the selected categories have been sorted by release date.'))
-                                ->send();
-                        })
-                        ->deselectRecordsAfterCompletion()
-                        ->requiresConfirmation()
-                        ->modalIcon('heroicon-o-calendar-days')
-                        ->modalDescription(__('Sort all series in the selected categories by release date? This will update the sort order.')),
+                    SortSeriesByDateAction::forCategoriesBulk(),
                     BulkAction::make('reclassify_tmdb_genres')
                         ->label(__('Reclassify to TMDB Genres'))
                         ->icon('heroicon-o-tag')

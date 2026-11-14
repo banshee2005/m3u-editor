@@ -5,6 +5,7 @@ namespace App\Models;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Support\Str;
 
 class ArrIntegration extends Model
@@ -19,6 +20,10 @@ class ArrIntegration extends Model
         return [
             'enabled' => 'boolean',
             'guest_enabled' => 'boolean',
+            'cache_enabled' => 'boolean',
+            'cache_cleanup' => 'boolean',
+            'cache_failback' => 'boolean',
+            'is_default_cache_target' => 'boolean',
             'api_key' => 'encrypted',
             'last_test_at' => 'datetime',
             'quality_profile_id' => 'integer',
@@ -39,11 +44,32 @@ class ArrIntegration extends Model
                 $model->webhook_secret = (string) Str::uuid();
             }
         });
+
+        // At most one default cache target per user, per integration type.
+        static::saved(function (self $model) {
+            if ($model->is_default_cache_target) {
+                static::query()
+                    ->where('user_id', $model->user_id)
+                    ->where('type', $model->type)
+                    ->whereKeyNot($model->id)
+                    ->where('is_default_cache_target', true)
+                    ->update(['is_default_cache_target' => false]);
+            }
+        });
     }
 
     public function user(): BelongsTo
     {
         return $this->belongsTo(User::class);
+    }
+
+    /**
+     * Cache requests tracking this integration (arr-sourced rows awaiting
+     * failback or delivery).
+     */
+    public function cachedContentFiles(): HasMany
+    {
+        return $this->hasMany(CachedContentFile::class);
     }
 
     public function isSonarr(): bool
@@ -84,5 +110,15 @@ class ArrIntegration extends Model
     public function scopeGuestEnabled($query)
     {
         return $query->where('guest_enabled', true);
+    }
+
+    public function scopeCacheEnabled($query)
+    {
+        return $query->where('cache_enabled', true);
+    }
+
+    public function scopeCacheFailback($query)
+    {
+        return $query->where('cache_failback', true);
     }
 }

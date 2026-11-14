@@ -73,26 +73,10 @@ class ProcessM3uImportChunk implements ShouldQueue
                 $bulk[] = $row;
             }
 
-            // Assign source_id via collision-relative hashing.
-            // M3U channels carry a raw `source_key`; the first occurrence keeps the base md5
-            // hash (backwards-compatible), each subsequent duplicate in the same payload gets
-            // a :dup:N suffix so all entries survive as distinct channel records.
-            // Xtream channels have no `source_key` and their source_id is already set.
-            $seen = [];
-            $bulk = collect($bulk)
-                ->map(function ($item) use (&$seen) {
-                    if (! empty($item['source_key'])) {
-                        $key = $item['source_key'].($item['playlist_id'] ?? '');
-                        $count = $seen[$key] ?? 0;
-                        $item['source_id'] = $count === 0
-                            ? md5($item['source_key'])
-                            : md5($item['source_key'].':dup:'.$count);
-                        $seen[$key] = $count + 1;
-                    }
-                    unset($item['source_key']);
-
-                    return $item;
-                })
+            // source_id is assigned per group in ProcessM3uImport before chunking, so new
+            // payloads arrive without a `source_key` and pass straight through. This only
+            // hashes payloads queued before that change shipped.
+            $bulk = ProcessM3uImport::assignCollisionSourceIds(collect($bulk))
                 // Deduplicate on (source_id, playlist_id) so PostgreSQL's upsert does not
                 // encounter the same conflict target twice in one statement. This guards
                 // against Xtream providers that return duplicate stream_ids in their catalog.
@@ -131,7 +115,7 @@ class ProcessM3uImportChunk implements ShouldQueue
                 'catchup_source',
                 'shift',
                 // 'tvg_shift', // new field for TVG shift (don't update user overridden value)
-                'is_vod', // new field for VOD
+                // 'is_vod', // part of the upsert key
                 'container_extension', // new field for container extension
                 'year', // new field for year
                 'rating', // new field for rating
@@ -142,8 +126,19 @@ class ProcessM3uImportChunk implements ShouldQueue
                 $updateColumns[] = 'sort';
             }
 
+            // `group_id` is not in the update list, so re-home channels the provider moved here first
+            if ($groupId) {
+                $bulk = ProcessM3uImport::applyProviderGroupMoves(
+                    (int) $job->variables['playlistId'],
+                    (int) $groupId,
+                    $groupName,
+                    $bulk,
+                    $job->batch_no,
+                );
+            }
+
             // Upsert the channels
-            Channel::upsert($bulk, uniqueBy: ['source_id', 'playlist_id'], update: $updateColumns);
+            Channel::upsert($bulk, uniqueBy: ['source_id', 'playlist_id', 'is_vod'], update: $updateColumns);
         }
     }
 }

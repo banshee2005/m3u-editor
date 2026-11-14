@@ -974,6 +974,33 @@ it('picks the language-ranked clearlogo from getMovieDetails', function () {
     expect($details['logo_url'])->toBe('https://image.tmdb.org/t/p/w500/en-high.png');
 });
 
+it('picks the PNG rendition of an SVG clearlogo', function () {
+    Cache::flush();
+    Http::fake([
+        'https://api.themoviedb.org/3/movie/793447*' => Http::response([
+            'id' => 793447,
+            'title' => 'The Moon and Back',
+            'credits' => ['cast' => [], 'crew' => []],
+            'videos' => ['results' => []],
+            'external_ids' => [],
+            'images' => ['logos' => [['file_path' => '/vector.svg', 'iso_639_1' => 'en', 'vote_average' => 5.0]]],
+        ], 200),
+    ]);
+
+    $details = (new TmdbService($this->settings))->getMovieDetails(793447);
+
+    expect($details['logo_url'])->toBe('https://image.tmdb.org/t/p/w500/vector.png');
+});
+
+it('swaps only TMDB SVG logo URLs for their PNG rendition', function (?string $url, ?string $expected) {
+    expect(TmdbService::rasterLogoUrl($url))->toBe($expected);
+})->with([
+    'tmdb svg' => ['https://image.tmdb.org/t/p/w500/logo.svg', 'https://image.tmdb.org/t/p/w500/logo.png'],
+    'tmdb png' => ['https://image.tmdb.org/t/p/w500/logo.png', 'https://image.tmdb.org/t/p/w500/logo.png'],
+    'other host svg' => ['https://logos.example.com/logo.svg', 'https://logos.example.com/logo.svg'],
+    'null' => [null, null],
+]);
+
 it('returns a null clearlogo when TMDB carries no logos', function () {
     Cache::flush();
     Http::fake([
@@ -1033,4 +1060,194 @@ it('fetches and normalizes now-playing movies from TMDB', function () {
             'genre_ids' => [28, 12],
         ])
         ->and($results[0]['poster_url'])->toBe('https://image.tmdb.org/t/p/w500/abc.jpg');
+});
+
+it('picks the US certification from movie release dates', function (array $releaseDates, ?string $expected) {
+    Http::fake([
+        'https://api.themoviedb.org/3/movie/603*' => Http::response([
+            'id' => 603,
+            'title' => 'The Matrix',
+            'release_dates' => ['results' => $releaseDates],
+        ], 200),
+    ]);
+
+    $details = (new TmdbService($this->settings))->getMovieDetails(603);
+
+    expect($details['certification'])->toBe($expected);
+
+    Http::assertSent(fn ($request) => str_contains($request['append_to_response'] ?? '', 'release_dates'));
+})->with([
+    'US over other countries' => [[
+        ['iso_3166_1' => 'GB', 'release_dates' => [['certification' => '15', 'type' => 3]]],
+        ['iso_3166_1' => 'US', 'release_dates' => [['certification' => 'R', 'type' => 3]]],
+    ], 'R'],
+    'skips blank certifications' => [[
+        ['iso_3166_1' => 'US', 'release_dates' => [
+            ['certification' => '', 'type' => 3],
+            ['certification' => ' ', 'type' => 1],
+            ['certification' => 'PG-13', 'type' => 4],
+        ]],
+    ], 'PG-13'],
+    'prefers theatrical over other release types' => [[
+        ['iso_3166_1' => 'US', 'release_dates' => [
+            ['certification' => 'NR', 'type' => 1],
+            ['certification' => 'Unrated', 'type' => 4],
+            ['certification' => 'R', 'type' => 3],
+        ]],
+    ], 'R'],
+    'no US release' => [[
+        ['iso_3166_1' => 'DE', 'release_dates' => [['certification' => '16', 'type' => 3]]],
+    ], null],
+    'no release dates' => [[], null],
+]);
+
+it('picks the US content rating and reshapes networks from series details', function (array $payload, ?string $expectedRating, array $expectedNetworks) {
+    Http::fake([
+        'https://api.themoviedb.org/3/tv/1396*' => Http::response(['id' => 1396, 'name' => 'Breaking Bad'] + $payload, 200),
+    ]);
+
+    $details = (new TmdbService($this->settings))->getTvSeriesDetails(1396);
+
+    expect($details['certification'])->toBe($expectedRating)
+        ->and($details['networks'])->toBe($expectedNetworks);
+
+    Http::assertSent(fn ($request) => str_contains($request['append_to_response'] ?? '', 'content_ratings'));
+})->with([
+    'US rating and networks' => [[
+        'content_ratings' => ['results' => [
+            ['iso_3166_1' => 'GB', 'rating' => '15'],
+            ['iso_3166_1' => 'US', 'rating' => 'TV-MA'],
+        ]],
+        'networks' => [
+            ['id' => 174, 'name' => 'AMC', 'logo_path' => '/amc.png', 'origin_country' => 'US'],
+            ['id' => 213, 'name' => 'Netflix', 'logo_path' => null, 'origin_country' => ''],
+        ],
+    ], 'TV-MA', [
+        ['id' => 174, 'name' => 'AMC', 'logo' => 'https://image.tmdb.org/t/p/w300/amc.png'],
+        ['id' => 213, 'name' => 'Netflix', 'logo' => null],
+    ]],
+    'blank US rating' => [[
+        'content_ratings' => ['results' => [['iso_3166_1' => 'US', 'rating' => ' ']]],
+    ], null, []],
+    'no US rating' => [[
+        'content_ratings' => ['results' => [['iso_3166_1' => 'DE', 'rating' => '16']]],
+    ], null, []],
+    'no content ratings or networks' => [[], null, []],
+]);
+
+it('reshapes movie production companies into studios', function (array $companies, array $expected) {
+    Http::fake([
+        'https://api.themoviedb.org/3/movie/603*' => Http::response([
+            'id' => 603,
+            'title' => 'The Matrix',
+            'production_companies' => $companies,
+        ], 200),
+    ]);
+
+    $details = (new TmdbService($this->settings))->getMovieDetails(603);
+
+    expect($details['studios'])->toBe($expected);
+})->with([
+    'companies with and without logos' => [[
+        ['id' => 79, 'name' => 'Village Roadshow Pictures', 'logo_path' => '/vr.png', 'origin_country' => 'US'],
+        ['id' => 372, 'name' => 'Groucho II Film Partnership', 'logo_path' => null, 'origin_country' => ''],
+    ], [
+        ['id' => 79, 'name' => 'Village Roadshow Pictures', 'logo' => 'https://image.tmdb.org/t/p/w300/vr.png'],
+        ['id' => 372, 'name' => 'Groucho II Film Partnership', 'logo' => null],
+    ]],
+    'skips entries without an id or name' => [[
+        ['id' => 0, 'name' => 'No Id'],
+        ['id' => 5, 'name' => ''],
+    ], []],
+    'no production companies' => [[], []],
+]);
+
+it('does not accept a year-only match whose title is unrelated to the search', function () {
+    // Neither candidate is a confident title match, and there's more than one
+    // result, so searchMovie must fall through its fallback strategies instead
+    // of blindly accepting whichever one happens to share the search year
+    // (issue #1590 - a shared year alone used to be enough to match).
+    Http::fake([
+        'https://api.themoviedb.org/3/search/movie*' => Http::response([
+            'results' => [
+                ['id' => 200, 'title' => 'Completely Different Name', 'release_date' => '2019-01-01', 'popularity' => 5.0],
+                ['id' => 300, 'title' => 'Another Random Thing', 'release_date' => '2020-01-01', 'popularity' => 5.0],
+            ],
+        ], 200),
+    ]);
+
+    $service = new TmdbService($this->settings);
+    $result = $service->searchMovie('Totally Unrelated Picture', 2020);
+
+    expect($result)->toBeNull();
+});
+
+it('still accepts a year-only match when the title is at least loosely similar', function () {
+    Http::fake([
+        'https://api.themoviedb.org/3/search/movie*' => Http::response([
+            'results' => [
+                ['id' => 400, 'title' => 'The Great Escape', 'release_date' => '2020-01-01', 'popularity' => 5.0],
+                ['id' => 500, 'title' => 'The Great Escape Part Two', 'release_date' => '2020-06-01', 'popularity' => 5.0],
+            ],
+        ], 200),
+        'https://api.themoviedb.org/3/movie/*/external_ids*' => Http::response([], 200),
+    ]);
+
+    $service = new TmdbService($this->settings);
+    $result = $service->searchMovie('The Great Escape Part Two', 2020);
+
+    expect($result)->not->toBeNull()
+        ->and($result['tmdb_id'])->toBe(500);
+});
+
+it('falls back to the TV endpoint when a VOD tmdb_id turns out to be a TV series', function () {
+    // Movie and TV series have separate id numbering on TMDB - a tmdb_id that
+    // was actually matched as a TV series returns nothing from /movie/{id}.
+    // getMovieDetailsWithTvFallback() must then try /tv/{id} instead of
+    // silently giving up (issue #1590).
+    Http::fake([
+        'https://api.themoviedb.org/3/movie/334430*' => Http::response([], 404),
+        'https://api.themoviedb.org/3/tv/334430*' => Http::response([
+            'id' => 334430,
+            'name' => 'Toxic',
+            'overview' => 'A toxic situation unfolds.',
+            'first_air_date' => '2026-01-01',
+            'credits' => ['cast' => [], 'crew' => []],
+            'videos' => ['results' => []],
+            'external_ids' => [],
+            'content_ratings' => ['results' => []],
+            'networks' => [],
+            'recommendations' => ['results' => []],
+        ], 200),
+    ]);
+
+    $details = (new TmdbService($this->settings))->getMovieDetailsWithTvFallback(334430);
+
+    expect($details)->not->toBeNull()
+        ->and($details['title'])->toBe('Toxic')
+        ->and($details['overview'])->toBe('A toxic situation unfolds.')
+        ->and($details['release_date'])->toBe('2026-01-01')
+        ->and($details['media_type'])->toBe('tv');
+});
+
+it('skips straight to the TV endpoint when the media type is already known', function () {
+    Http::fake([
+        'https://api.themoviedb.org/3/movie/334430*' => Http::response([], 404),
+        'https://api.themoviedb.org/3/tv/334430*' => Http::response([
+            'id' => 334430,
+            'name' => 'Toxic',
+            'overview' => 'A toxic situation unfolds.',
+            'credits' => ['cast' => [], 'crew' => []],
+            'videos' => ['results' => []],
+            'external_ids' => [],
+            'content_ratings' => ['results' => []],
+            'networks' => [],
+            'recommendations' => ['results' => []],
+        ], 200),
+    ]);
+
+    $details = (new TmdbService($this->settings))->getMovieDetailsWithTvFallback(334430, 'tv');
+
+    Http::assertNotSent(fn ($request) => str_contains($request->url(), '/movie/334430'));
+    expect($details['media_type'])->toBe('tv');
 });

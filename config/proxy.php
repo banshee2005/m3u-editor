@@ -24,6 +24,7 @@ return [
     'm3u_proxy_host' => env('M3U_PROXY_HOST', 'localhost'), // Host for proxy (embedded and external)
     'm3u_proxy_port' => env('M3U_PROXY_PORT', 8085), // Port for proxy (embedded and external)
     'm3u_proxy_token' => env('M3U_PROXY_TOKEN'), // API token for authenticating with the proxy service
+    'normalize_live_output' => filter_var(env('M3U_PROXY_NORMALIZE_LIVE_OUTPUT', false), FILTER_VALIDATE_BOOLEAN),
     'm3u_proxy_public_url' => env('M3U_PROXY_PUBLIC_URL'), // Public URL for the proxy (auto-set in start-container)
     'm3u_resolver_url' => env('M3U_PROXY_FAILOVER_RESOLVER_URL', null), // Base URL for the editor that the proxy can use to resolve URLs if needed (for smart failover with capacity checks)
 
@@ -34,21 +35,33 @@ return [
     // from outside — it re-enables the old accept-all behavior for those routes.
     'allow_unauthenticated_callbacks' => env('M3U_PROXY_ALLOW_UNAUTHENTICATED_CALLBACKS', false),
 
+    // Opt in to separate per-route/IP callback buckets. False keeps the existing
+    // shared throttle:120,1 policy. Invalid per-minute values fall back to 120.
+    'isolated_callback_rate_limits' => filter_var(env('M3U_PROXY_ISOLATED_CALLBACK_RATE_LIMITS', false), FILTER_VALIDATE_BOOLEAN),
+    'callback_rate_limits' => [
+        'resolver' => env('M3U_PROXY_CALLBACK_RESOLVER_PER_MINUTE', 120),
+        'webhook' => env('M3U_PROXY_CALLBACK_WEBHOOK_PER_MINUTE', 120),
+        'broadcast' => env('M3U_PROXY_CALLBACK_BROADCAST_PER_MINUTE', 120),
+        'dvr' => env('M3U_PROXY_CALLBACK_DVR_PER_MINUTE', 120),
+    ],
+
     // Logo Proxy Configuration
     'url_override' => env('PROXY_URL_OVERRIDE', null),
     'url_override_include_logos' => env('PROXY_URL_OVERRIDE_INCLUDE_LOGOS', default: null),
 
-    // Logo/artwork proxy on-the-fly downscaling. When enabled, a `?w=`/`?h=`
-    // query on a /logo-proxy URL makes the editor return an aspect-preserved,
-    // never-upscaled copy at that size (cached per size), so TV clients pull a
-    // poster-sized file instead of a multi-MB source image. The API layer bakes
-    // role-based sizes into artwork URLs (config keys below); a client can still
-    // override with its own `?w=`.
-    'image_resize_enabled' => env('PROXY_IMAGE_RESIZE_ENABLED', true),
+    // Artwork image optimization. Logo proxy, media server and Schedules Direct
+    // artwork is cached as an aspect-preserved, never-upscaled copy sized for its
+    // role (poster, backdrop, title logo, cast photo), so clients pull a right-sized
+    // file instead of a multi-MB source image. Sizes are configured under
+    // Settings > Assets; these env vars override the saved settings when set
+    // (null = use the setting). `image_resize_max` caps every configured width.
+    'image_resize_enabled' => env('PROXY_IMAGE_RESIZE_ENABLED'),
     'image_resize_max' => (int) env('PROXY_IMAGE_RESIZE_MAX', 1920),
-    'image_resize_poster_width' => (int) env('PROXY_IMAGE_RESIZE_POSTER_WIDTH', 600),
-    'image_resize_backdrop_width' => (int) env('PROXY_IMAGE_RESIZE_BACKDROP_WIDTH', 1280),
-    'image_resize_photo_width' => (int) env('PROXY_IMAGE_RESIZE_PHOTO_WIDTH', 300),
+    'image_resize_poster_width' => env('PROXY_IMAGE_RESIZE_POSTER_WIDTH'),
+    'image_resize_backdrop_width' => env('PROXY_IMAGE_RESIZE_BACKDROP_WIDTH'),
+    'image_resize_title_logo_width' => env('PROXY_IMAGE_RESIZE_TITLE_LOGO_WIDTH'),
+    'image_resize_photo_width' => env('PROXY_IMAGE_RESIZE_PHOTO_WIDTH'),
+    'image_resize_quality' => env('PROXY_IMAGE_RESIZE_QUALITY'),
 
     // Media Server (Plex/Emby/Jellyfin/local/WebDAV) proxy URLs are signed but
     // non-expiring — they're stored on the Channel record and must stay valid

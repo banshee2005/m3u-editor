@@ -6,8 +6,10 @@ use App\Enums\PlaylistSourceType;
 use App\Enums\Status;
 use App\Enums\SyncRunPhase;
 use App\Events\SyncCompleted;
+use App\Jobs\Middleware\SkipIfSyncReset;
 use App\Models\Bouquet;
 use App\Models\Category;
+use App\Models\Channel;
 use App\Models\Group;
 use App\Models\Job;
 use App\Models\MediaServerIntegration;
@@ -20,6 +22,7 @@ use App\Services\AlertService;
 use App\Services\SyncPipelineService;
 use App\Services\XtreamHealthService;
 use App\Settings\GeneralSettings;
+use App\Support\ChannelNumber;
 use App\Traits\ProviderRequestDelay;
 use Carbon\Carbon;
 use Exception;
@@ -28,7 +31,9 @@ use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Queue\Queueable;
 use Illuminate\Http\Client\RequestException;
 use Illuminate\Support\Collection;
+use Illuminate\Support\Enumerable;
 use Illuminate\Support\Facades\Bus;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
@@ -94,8 +99,14 @@ class ProcessM3uImport implements ShouldQueue
     // Included category prefixes for import
     public array $includedCategoryPrefixes;
 
-    // Groups we should auto-enable channels for
+    // Groups we should auto-enable channels for (M3U, any type)
     public Collection $enabledGroups;
+
+    // Live groups we should auto-enable channels for (Xtream API only)
+    public Collection $enabledLiveGroups;
+
+    // VOD groups we should auto-enable channels for (Xtream API only)
+    public Collection $enabledVodGroups;
 
     // Enabled URL find & replace rules for this playlist, applied to provider URLs during import
     public Collection $urlFindReplaceRules;
@@ -120,6 +131,9 @@ class ProcessM3uImport implements ShouldQueue
     // M3U Parser instance
     public $m3uParser = null;
 
+    // When the import was queued (microtime); null for jobs queued before this was tracked
+    public ?float $queuedAt = null;
+
     /**
      * Create a new job instance.
      */
@@ -129,6 +143,8 @@ class ProcessM3uImport implements ShouldQueue
         public ?bool $isNew = false,
         public ?int $syncRunId = null,
     ) {
+        $this->queuedAt = microtime(true);
+
         // General processing settings
         $this->maxItems = config('dev.max_channels') + 1; // Maximum number of channels allowed for m3u import
         $this->preprocess = $playlist->import_prefs['preprocess'] ?? false;
@@ -164,13 +180,39 @@ class ProcessM3uImport implements ShouldQueue
             $this->canMergeVodEnabled = $vodCanMergeEnabled !== null ? $vodCanMergeEnabled : true;
         }
 
-        // Get the enabled groups and categories for this playlist
-        $this->enabledGroups = $playlist->groups()->where('enabled', true)->get('name')->pluck('name');
-        $this->enabledCategories = $playlist->categories()->where('enabled', true)->get('name')->pluck('name');
+        // Get the enabled groups and categories for this playlist. Match on the provider
+        // name (name_internal), not the user-editable display name, so renamed groups and
+        // categories still auto-enable. Legacy rows without name_internal fall back to name.
+        $enabledGroups = $playlist->groups()->where('enabled', true)->get(['name', 'name_internal', 'type']);
+        $providerName = fn ($record): ?string => $record->name_internal ?: $record->name;
+        $this->enabledGroups = $enabledGroups->map($providerName)->filter()->values();
+        $this->enabledLiveGroups = $enabledGroups->where('type', 'live')->map($providerName)->filter()->values();
+        $this->enabledVodGroups = $enabledGroups->where('type', 'vod')->map($providerName)->filter()->values();
+        $this->enabledCategories = $playlist->categories()->where('enabled', true)->get(['name', 'name_internal'])->map($providerName)->filter()->values();
 
         // URL find & replace rules, applied to provider stream URLs before they're saved
         $this->urlFindReplaceRules = collect($playlist->url_find_replace_rules ?? [])
             ->filter(fn (array $rule): bool => ($rule['enabled'] ?? false) && filled($rule['find'] ?? null));
+    }
+
+    /**
+     * Skip the import, and the chain it starts, once the user resets the
+     * playlist after it was queued.
+     *
+     * @return array<int, object>
+     */
+    public function middleware(): array
+    {
+        return $this->queuedAt !== null ? [$this->syncResetGuard()] : [];
+    }
+
+    /**
+     * Guard for this import's jobs. Imports queued before queuedAt was tracked
+     * only guard the chain they start, from now on.
+     */
+    private function syncResetGuard(): SkipIfSyncReset
+    {
+        return new SkipIfSyncReset(Playlist::class, $this->playlist->id, $this->queuedAt ?? microtime(true));
     }
 
     /**
@@ -603,6 +645,7 @@ class ProcessM3uImport implements ShouldQueue
                 'logo' => null,
                 'logo_internal' => null, // internal logo path
                 'channel' => null,
+                'channel_minor' => null,
                 'group' => '',
                 'group_internal' => '',
                 'stream_id' => null,
@@ -622,6 +665,7 @@ class ProcessM3uImport implements ShouldQueue
                 'year' => null, // new field for year
                 'rating' => null, // new field for rating
                 'rating_5based' => null, // new field for 5-based rating
+                'source_added_at' => null, // provider `added` (VOD only)
                 'source_id' => null, // source ID for the channel
                 'can_merge' => $this->canMergeEnabled,
                 'epg_map_enabled' => $this->epgMapEnabled,
@@ -684,7 +728,7 @@ class ProcessM3uImport implements ShouldQueue
                             'group_internal' => $category['category_name'] ?? '',
                             'stream_id' => $item->epg_channel_id ?? $item->stream_id, // prefer EPG id for mapping, if set
                             'source_id' => $item->stream_id, // source ID for the channel
-                            'channel' => $item->num ?? null,
+                            ...ChannelNumber::toAttributes($item->num ?? null),
                             'catchup' => $item->tv_archive ?? null,
                             'shift' => (int) ($item->tv_archive_duration ?? 0) * 24,
                             // 'tvg_shift' => $item->tvg_shift ?? null, // @TODO: check if this is on Xtream API, not seeing it as a deffinition in the API docs
@@ -692,7 +736,7 @@ class ProcessM3uImport implements ShouldQueue
                         if ($autoSort) {
                             $channel['sort'] = $localChannelNo;
                         }
-                        if ($liveEnabledByDefault || $this->enabledGroups->contains($category['category_name'] ?? '')) {
+                        if ($liveEnabledByDefault || $this->enabledLiveGroups->contains($category['category_name'] ?? '')) {
                             $channel['enabled'] = true;
                         }
                         yield $channel;
@@ -738,17 +782,20 @@ class ProcessM3uImport implements ShouldQueue
                             'group_internal' => $category['category_name'] ?? '',
                             'stream_id' => $item->stream_id,
                             'source_id' => $item->stream_id, // source ID for the channel
-                            'channel' => $item->num ?? null,
+                            ...ChannelNumber::toAttributes($item->num ?? null),
                             'is_vod' => true, // mark as VOD
                             'container_extension' => $extension, // store the container extension
                             'year' => $item->year ?? null, // new field for year
                             'rating' => $item->rating ?? null, // new field for rating
                             'rating_5based' => $item->rating_5based ?? null, // new field for 5-based rating
+                            'source_added_at' => is_numeric($item->added ?? null) && (int) $item->added > 0
+                                ? Carbon::createFromTimestamp((int) $item->added, config('app.timezone'))->toDateTimeString()
+                                : null, // provider `added` (unix timestamp)
                         ];
                         if ($autoSort) {
                             $channel['sort'] = $localChannelNo;
                         }
-                        if ($vodEnabledByDefault || $this->enabledGroups->contains($category['category_name'] ?? '')) {
+                        if ($vodEnabledByDefault || $this->enabledVodGroups->contains($category['category_name'] ?? '')) {
                             $channel['enabled'] = true;
                         }
                         yield $channel;
@@ -877,6 +924,7 @@ class ProcessM3uImport implements ShouldQueue
                     'logo' => null,
                     'logo_internal' => null,
                     'channel' => null,
+                    'channel_minor' => null,
                     'group' => '',
                     'group_internal' => '',
                     'stream_id' => null,
@@ -974,7 +1022,10 @@ class ProcessM3uImport implements ShouldQueue
                                 foreach ($attributes as $key => $attribute) {
                                     if ($extTag->hasAttribute($attribute)) {
                                         if ($attribute === 'tvg-chno') {
-                                            $channel[$key] = (int) $extTag->getAttribute($attribute);
+                                            // Over-the-air sub-channels ("5.1") keep their minor part. An
+                                            // empty value still imports as 0, as the plain int cast did.
+                                            [$major, $channel['channel_minor']] = ChannelNumber::parse($extTag->getAttribute($attribute));
+                                            $channel['channel'] = $major ?? 0;
                                         } elseif ($attribute === 'tvg-logo') {
                                             $channel[$key] = Str::replace(' ', '%20', trim($extTag->getAttribute($attribute)));
                                         } else {
@@ -987,17 +1038,18 @@ class ProcessM3uImport implements ShouldQueue
                                     }
                                 }
 
-                                // Catch-up window in hours. Providers use different attributes for this:
-                                // 'timeshift'/'tvg-shift' are already in hours, while 'catchup-days'/
-                                // 'tvg-rec' express it in days. Xtream's 'tv_archive_duration' is also
-                                // days (see XtreamApiController::resolveTvArchiveDuration, #1389) and is
-                                // converted days→hours at the Xtream ingest site. Check in precedence
-                                // order and stop at the first one present.
+                                // Catch-up window, stored in hours. Providers use different attributes
+                                // for it, all in days: 'catchup-days', 'tvg-rec' and the older SIPTV
+                                // 'timeshift' (as read by Kodi IPTV Simple, TiviMate and IPTVnator).
+                                // 'tvg-shift' is the EPG time offset (tvg_shift above), not catchup.
+                                // Xtream's 'tv_archive_duration' is also days (see
+                                // XtreamApiController::resolveTvArchiveDuration, #1389) and is
+                                // converted days→hours at the Xtream ingest site. Check in Kodi's
+                                // precedence order and stop at the first one present.
                                 foreach ([
-                                    'timeshift' => 1,
-                                    'tvg-shift' => 1,
                                     'catchup-days' => 24,
                                     'tvg-rec' => 24,
+                                    'timeshift' => 24,
                                 ] as $shiftAttribute => $hoursPerUnit) {
                                     if ($extTag->hasAttribute($shiftAttribute)) {
                                         $channel['shift'] = (int) trim($extTag->getAttribute($shiftAttribute)) * $hoursPerUnit;
@@ -1049,7 +1101,7 @@ class ProcessM3uImport implements ShouldQueue
                                     continue;
                                 }
 
-                                // Set the source key — hashing and collision detection happen in ProcessM3uImportChunk
+                                // Set the source key - hashing and collision detection happen in assignCollisionSourceIds()
                                 $channel['source_key'] = $channel['title'].$channel['name'].$chGroup;
 
                                 // Update group name to the singular name and return the channel
@@ -1088,7 +1140,7 @@ class ProcessM3uImport implements ShouldQueue
                                 continue;
                             }
 
-                            // Set the source key — hashing and collision detection happen in ProcessM3uImportChunk
+                            // Set the source key - hashing and collision detection happen in assignCollisionSourceIds()
                             $channel['source_key'] = $channel['title'].$channel['name'].$channel['group'];
 
                             // Set channel number, if auto sort is enabled
@@ -1177,6 +1229,7 @@ class ProcessM3uImport implements ShouldQueue
 
             // Fire the playlist synced event
             event(new SyncCompleted($this->playlist));
+            self::failSyncRunIfPresent($this->syncRunId, $e->getMessage());
         }
 
     }
@@ -1203,17 +1256,32 @@ class ProcessM3uImport implements ShouldQueue
         // SourceGroup rename detection + upsert + stale cleanup runs before the lazy
         // generators are iterated so shouldIncludeChannel() / shouldIncludeVod() see
         // post-rename selected-group names on the first sync after a provider rename.
-        [$this->selectedGroups, $liveGroupsByName] = $this->syncSourceGroupType(
+        [$this->selectedGroups, $liveGroupsByName, $liveRenames] = $this->syncSourceGroupType(
             $liveGroups ?? collect(), 'live', 'selected_groups', $this->selectedGroups, $playlist
         );
-        [$this->selectedVodGroups, $vodGroupsByName] = $this->syncSourceGroupType(
+        [$this->selectedVodGroups, $vodGroupsByName, $vodRenames] = $this->syncSourceGroupType(
             $vodGroups ?? collect(), 'vod', 'selected_vod_groups', $this->selectedVodGroups, $playlist
         );
 
+        // The enabled-groups snapshot (built in the constructor, before this sync's
+        // provider data was even fetched) is still keyed by each group's pre-rename
+        // name. Without this, a group renamed by the provider in this same sync would
+        // still be enabled in the database, but its new VOD/live channels would fail
+        // the enabled-group name match below and come in disabled (issue #1649).
+        $this->applyRenamesToEnabledGroupSnapshot($liveRenames, 'live');
+        $this->applyRenamesToEnabledGroupSnapshot($vodRenames, 'vod');
+
         // Setup group sort, if Playlist auto sort is enabled
+        // Xtream groups take their position from the provider's category order; the counter
+        // only numbers groups the provider list does not cover (after the provider range).
         $groupOrder = null;
+        $livePositions = [];
+        $vodPositions = [];
         if ($playlist->auto_sort_groups) {
-            $groupOrder = 1;
+            $liveGroupCount = ($liveGroups ?? collect())->count();
+            $livePositions = $this->providerCategoryPositions($liveGroups ?? collect());
+            $vodPositions = $this->providerCategoryPositions($vodGroups ?? collect(), $liveGroupCount);
+            $groupOrder = $liveGroupCount + ($vodGroups ?? collect())->count() + 1;
         }
         $autoSort = $playlist->auto_sort;
 
@@ -1224,8 +1292,8 @@ class ProcessM3uImport implements ShouldQueue
 
         // Process live streams collection
         if ($liveStreamsEnabled && $liveCollection) {
-            $liveCollection->groupBy('group')->chunk(10)->each(function (LazyCollection $grouped) use ($userId, $playlistId, $batchNo, $preProcessingLive, &$groupOrder, $liveGroupsByName, $autoSort) {
-                $grouped->each(function ($channels, $groupName) use ($userId, $playlistId, $batchNo, $preProcessingLive, &$groupOrder, $liveGroupsByName, $autoSort) {
+            $liveCollection->groupBy('group')->chunk(10)->each(function (LazyCollection $grouped) use ($userId, $playlistId, $batchNo, $preProcessingLive, &$groupOrder, $liveGroupsByName, $autoSort, $livePositions) {
+                $grouped->each(function ($channels, $groupName) use ($userId, $playlistId, $batchNo, $preProcessingLive, &$groupOrder, $liveGroupsByName, $autoSort, $livePositions) {
                     // Add group and associated channels
                     if (! $preProcessingLive) {
                         // For Xtream, try matching by stable source_group_id first so groups
@@ -1261,8 +1329,9 @@ class ProcessM3uImport implements ShouldQueue
                                 'new' => true,
                                 'type' => 'live', // Set group type to live
                             ];
-                            if ($groupOrder !== null) {
-                                $data['sort_order'] = $groupOrder++;
+                            $sortOrder = $this->resolveGroupSortOrder($sourceGroupId, $livePositions, $groupOrder);
+                            if ($sortOrder !== null) {
+                                $data['sort_order'] = $sortOrder;
                             }
                             $group = Group::create($data);
                         } else {
@@ -1283,8 +1352,9 @@ class ProcessM3uImport implements ShouldQueue
                                 $group->restore();
                                 $data['new'] = true; // if restoring, mark as new to trigger any new group logic in downstream processing
                             }
-                            if ($groupOrder !== null) {
-                                $data['sort_order'] = $groupOrder++;
+                            $sortOrder = $this->resolveGroupSortOrder($sourceGroupId, $livePositions, $groupOrder);
+                            if ($sortOrder !== null) {
+                                $data['sort_order'] = $sortOrder;
                             }
                             $group->update($data);
                         }
@@ -1314,8 +1384,8 @@ class ProcessM3uImport implements ShouldQueue
 
         // Process VOD streams collection
         if ($vodStreamsEnabled && $vodCollection) {
-            $vodCollection->groupBy('group')->chunk(10)->each(function (LazyCollection $grouped) use ($userId, $playlistId, $batchNo, $preProcessingVod, &$groupOrder, $vodGroupsByName, $autoSort) {
-                $grouped->each(function ($channels, $groupName) use ($userId, $playlistId, $batchNo, $preProcessingVod, &$groupOrder, $vodGroupsByName, $autoSort) {
+            $vodCollection->groupBy('group')->chunk(10)->each(function (LazyCollection $grouped) use ($userId, $playlistId, $batchNo, $preProcessingVod, &$groupOrder, $vodGroupsByName, $autoSort, $vodPositions) {
+                $grouped->each(function ($channels, $groupName) use ($userId, $playlistId, $batchNo, $preProcessingVod, &$groupOrder, $vodGroupsByName, $autoSort, $vodPositions) {
                     // Add group and associated channels
                     if (! $preProcessingVod) {
                         // For Xtream, try matching by stable source_group_id first so groups
@@ -1351,8 +1421,9 @@ class ProcessM3uImport implements ShouldQueue
                                 'new' => true,
                                 'type' => 'vod', // Set group type to vod
                             ];
-                            if ($groupOrder !== null) {
-                                $data['sort_order'] = $groupOrder++;
+                            $sortOrder = $this->resolveGroupSortOrder($sourceGroupId, $vodPositions, $groupOrder);
+                            if ($sortOrder !== null) {
+                                $data['sort_order'] = $sortOrder;
                             }
                             $group = Group::create($data);
                         } else {
@@ -1373,8 +1444,9 @@ class ProcessM3uImport implements ShouldQueue
                                 $group->restore();
                                 $data['new'] = true; // if restoring, mark as new to trigger any new group logic in downstream processing
                             }
-                            if ($groupOrder !== null) {
-                                $data['sort_order'] = $groupOrder++;
+                            $sortOrder = $this->resolveGroupSortOrder($sourceGroupId, $vodPositions, $groupOrder);
+                            if ($sortOrder !== null) {
+                                $data['sort_order'] = $sortOrder;
                             }
                             $group->update($data);
                         }
@@ -1397,35 +1469,31 @@ class ProcessM3uImport implements ShouldQueue
             });
         }
 
+        // The batch the provider categories carry before this sync stamps them: the previous
+        // series sync's. ProcessM3uImportComplete only counts series that sync still listed
+        // toward the removed-series threshold.
+        $previousSeriesBatchNo = Category::where('playlist_id', $playlist->id)
+            ->whereNotNull('source_category_id')
+            ->where('import_batch_no', '!=', $batchNo)
+            ->max('import_batch_no');
+
         // Create the series categories (needed for pre-processing)
         if ($seriesCategories && $seriesCategories->count() > 0) {
-            foreach ($seriesCategories as $category) {
-                // Need to create a source category entry
-                $sc = SourceCategory::where([
-                    'playlist_id' => $playlist->id,
-                    'source_category_id' => $category['category_id'],
-                ])->first();
-                if (! $sc) {
-                    SourceCategory::create([
-                        'playlist_id' => $playlist->id,
-                        'name' => $category['category_name'],
-                        'source_category_id' => $category['category_id'],
-                    ]);
-                } else {
-                    // Update name in case it has changed
-                    // NOTE: this could cause pre-processing to remove previously selected categories if the name changes,
-                    //       which means this now works the same as Source Categories in that regard...
-                    $sc->update([
-                        'name' => $category['category_name'],
-                    ]);
-                }
+            // Source categories first, so renames reach the selections before they are checked below
+            $this->syncSourceCategories($seriesCategories, $playlist);
 
+            $seriesPositions = $playlist->auto_sort_categories
+                ? $this->providerCategoryPositions($seriesCategories)
+                : [];
+
+            foreach ($seriesCategories as $category) {
                 // Only create category if not preprocessing, or if the category is selected
                 if (! $this->preprocess || $this->shouldIncludeSeries($category['category_name'] ?? '')) {
                     $cat = Category::where([
                         'playlist_id' => $playlist->id,
                         'source_category_id' => $category['category_id'],
                     ])->first();
+                    $sortOrder = $seriesPositions[(string) $category['category_id']] ?? null;
                     if (! $cat) {
                         $cat = Category::create([
                             'playlist_id' => $playlist->id,
@@ -1434,11 +1502,13 @@ class ProcessM3uImport implements ShouldQueue
                             'source_category_id' => $category['category_id'],
                             'user_id' => $playlist->user_id,
                             'import_batch_no' => $batchNo,
+                            ...($sortOrder !== null ? ['sort_order' => $sortOrder] : []),
                         ]);
                     } else {
                         $cat->update([
                             'name_internal' => $category['category_name'],
                             'import_batch_no' => $batchNo,
+                            ...($sortOrder !== null ? ['sort_order' => $sortOrder] : []),
                         ]);
                     }
                 }
@@ -1482,9 +1552,7 @@ class ProcessM3uImport implements ShouldQueue
         }
 
         // Flag any previously marked new items as not new
-        $playlist->groups()->where('new', true)->update(['new' => false]);
-        $playlist->channels()->where('new', true)->update(['new' => false]);
-        $playlist->series()->where('new', true)->update(['new' => false]);
+        $this->clearPreviousNewFlags($playlist, $batchNo);
 
         // Create the jobs array
         $jobs = [];
@@ -1570,6 +1638,7 @@ class ProcessM3uImport implements ShouldQueue
             // (0) so the UI does not show a completed phase that never ran.
             runningSeriesImport: $seriesCategoryCount > 0,
             syncRunId: $this->syncRunId,
+            previousSeriesBatchNo: $previousSeriesBatchNo,
         );
 
         // Start the chain!
@@ -1578,7 +1647,7 @@ class ProcessM3uImport implements ShouldQueue
         // job (including parsed channel collections) into the chain's catch handler
         // and OOM the worker during closure serialization.
         $syncRunId = $this->syncRunId;
-        Bus::chain($jobs)
+        Bus::chain($this->syncResetGuard()->guard($jobs))
             ->onConnection('redis') // force to use redis connection
             ->onQueue('import')
             ->catch(function (Throwable $e) use ($playlist, $syncRunId) {
@@ -1630,6 +1699,70 @@ class ProcessM3uImport implements ShouldQueue
     }
 
     /**
+     * Sync the playlist's source categories with the provider's series categories, the
+     * same way syncSourceGroupType() does for live and VOD groups: rows the provider no
+     * longer lists are pruned, and a category the provider renamed (same id, new name) has
+     * its new name carried into the selections that stored the old one.
+     *
+     * Only called with a non-empty feed, so a provider that answers with nothing never
+     * wipes the list.
+     *
+     * @param  Collection<int, array<string, mixed>>  $categories  the provider's get_series_categories entries
+     */
+    private function syncSourceCategories(Collection $categories, Playlist $playlist): void
+    {
+        $playlistId = $playlist->id;
+        $categories = $categories
+            ->filter(fn ($category) => ($category['category_id'] ?? null) !== null && ($category['category_name'] ?? null) !== null)
+            ->unique('category_id')
+            ->values();
+
+        SourceCategory::where('playlist_id', $playlistId)
+            ->whereNotIn('source_category_id', $categories->pluck('category_id'))
+            ->delete();
+
+        $existingNames = SourceCategory::where('playlist_id', $playlistId)
+            ->pluck('name', 'source_category_id');
+
+        $renames = [];
+        foreach ($categories as $category) {
+            $oldName = $existingNames->get($category['category_id']);
+            if ($oldName !== null && $oldName !== $category['category_name']) {
+                $renames[$oldName] = $category['category_name'];
+            }
+        }
+
+        foreach ($categories->chunk(50) as $chunk) {
+            SourceCategory::upsert(
+                $chunk->map(fn ($category) => [
+                    'name' => $category['category_name'],
+                    'playlist_id' => $playlistId,
+                    'source_category_id' => $category['category_id'],
+                ])->all(),
+                uniqueBy: ['source_category_id', 'playlist_id'],
+                update: ['name'],
+            );
+        }
+
+        if (empty($renames)) {
+            return;
+        }
+
+        $this->selectedCategories = array_values(array_map(
+            fn ($name) => $renames[$name] ?? $name,
+            $this->selectedCategories
+        ));
+        $importPrefs = $playlist->import_prefs ?? [];
+        if (isset($importPrefs['selected_categories'])) {
+            $playlist->update(['import_prefs' => array_merge($importPrefs, ['selected_categories' => $this->selectedCategories])]);
+            $playlist->refresh();
+        }
+
+        Bouquet::applyProviderRenames($playlistId, 'series', $renames);
+        PlaylistAlias::applyProviderGroupRenames($playlistId, 'series', $renames);
+    }
+
+    /**
      * Sync SourceGroup rows for one stream type ('live' or 'vod').
      *
      * - Detects provider-side renames via stable source_group_id and propagates them
@@ -1645,7 +1778,13 @@ class ProcessM3uImport implements ShouldQueue
      * @param  string  $type  'live' or 'vod'.
      * @param  string  $selectedKey  import_prefs key ('selected_groups' or 'selected_vod_groups').
      * @param  array  $currentSelected  Current value of $this->selectedGroups or $this->selectedVodGroups.
-     * @return array{0: list<string>, 1: Collection} Updated selected-groups array, and a category_name-keyed map for O(1) lookup.
+     * @return array{0: list<string>, 1: Collection, 2: array<string, string>} Updated selected-groups array, a
+     *                                                                         category_name-keyed map for O(1)
+     *                                                                         lookup, and the old-name => new-name
+     *                                                                         rename map (callers also use this to
+     *                                                                         keep any other old-name snapshot, such
+     *                                                                         as $this->enabledGroups, in sync - see
+     *                                                                         issue #1649).
      */
     private function syncSourceGroupType(
         Collection $groups,
@@ -1656,6 +1795,38 @@ class ProcessM3uImport implements ShouldQueue
     ): array {
         $playlistId = $playlist->id;
         $categoryIds = $groups->pluck('category_id')->filter(fn ($id) => $id !== null)->unique();
+        $currentNames = $groups->pluck('category_name');
+
+        // Names known before this sync, captured ahead of the prune: a category the
+        // provider re-issued under a new category_id loses its row to the prune, and
+        // must not then count as "new" and be re-appended to auto-include bouquets
+        // (undoing a user's manual removal on every such sync).
+        $namesBeforeSync = SourceGroup::where('playlist_id', $playlistId)
+            ->where('type', $type)
+            ->pluck('name')
+            ->flip();
+
+        // Prune stale rows *before* rename/upsert runs, not after. Doing this first frees up
+        // any name a doomed row is squatting on, so a genuine rename below can claim it directly
+        // instead of hitting a same-run name collision (issue #1530: a renamed category colliding
+        // with a stale row's old name left the stale row behind forever - see the conflict branch below).
+        // Guard against wiping everything if the provider temporarily returns an empty response.
+        if ($groups->isNotEmpty()) {
+            SourceGroup::where('playlist_id', $playlistId)
+                ->where('type', $type)
+                ->where(function ($query) use ($categoryIds, $currentNames) {
+                    $query->where(function ($q) use ($categoryIds) {
+                        // Rows tracked by source_group_id that are no longer in the feed.
+                        $q->whereNotNull('source_group_id')
+                            ->whereNotIn('source_group_id', $categoryIds);
+                    })->orWhere(function ($q) use ($currentNames) {
+                        // Legacy null-id rows whose name no longer appears in the feed.
+                        $q->whereNull('source_group_id')
+                            ->whereNotIn('name', $currentNames);
+                    });
+                })
+                ->delete();
+        }
 
         $existingBySourceId = $categoryIds->isNotEmpty()
             ? SourceGroup::where('playlist_id', $playlistId)
@@ -1665,30 +1836,55 @@ class ProcessM3uImport implements ShouldQueue
                 ->keyBy('source_group_id')
             : collect();
 
-        // Pre-load all name→id pairs so rename-collision checks are O(1) instead of one EXISTS query per rename.
+        // Pre-load name→row pairs (id + source_group_id) so rename-collision checks are O(1)
+        // instead of one EXISTS query per rename, and so we can tell apart the two kinds of
+        // name collision below.
         $nameIndex = SourceGroup::where('playlist_id', $playlistId)
             ->where('type', $type)
-            ->pluck('id', 'name');
+            ->get(['id', 'name', 'source_group_id'])
+            ->keyBy('name');
 
         $renames = [];
-        $groups->each(function ($group) use ($existingBySourceId, &$nameIndex, &$renames) {
+        $conflictedCategoryIds = [];
+        $groups->each(function ($group) use ($existingBySourceId, &$nameIndex, &$renames, &$conflictedCategoryIds) {
             $categoryId = $group['category_id'] ?? null;
             if ($categoryId === null) {
                 return;
             }
             $existing = $existingBySourceId->get($categoryId);
             if ($existing && $existing->name !== $group['category_name']) {
-                // If a different row already owns the target name, skip the in-place rename
-                // and let the upsert assign source_group_id to that row instead.
-                $conflictId = $nameIndex->get($group['category_name']);
-                if ($conflictId !== null && $conflictId !== $existing->id) {
+                $conflict = $nameIndex->get($group['category_name']);
+                if ($conflict !== null && $conflict->id !== $existing->id) {
+                    // The early prune above only clears rows the feed no longer references, so
+                    // any row still standing is either currently valid (non-null source_group_id,
+                    // guaranteed present in $categoryIds) or a legacy null-id row.
+                    if ($conflict->source_group_id === null) {
+                        // Legacy row is being absorbed by this rename: the id-tracked row under
+                        // the old name is superseded and, left alone, would become an orphaned
+                        // duplicate sharing this category's source_group_id forever (issue #1530,
+                        // since its own source_group_id would still be in $categoryIds every run).
+                        // Delete it and let the upsert below claim the name onto the legacy row.
+                        $oldName = $existing->name;
+                        $existing->delete();
+                        $renames[$oldName] = $group['category_name'];
+                        $nameIndex->forget($oldName);
+
+                        return;
+                    }
+
+                    // A different, still-current category already owns the target name - a
+                    // genuine same-run collision the provider itself created. Skip the rename
+                    // AND skip upserting this category this run, rather than letting the upsert
+                    // silently steal source_group_id from the row that legitimately owns the name.
+                    $conflictedCategoryIds[] = $categoryId;
+
                     return;
                 }
                 $renames[$existing->name] = $group['category_name'];
                 // Keep $nameIndex current so subsequent iterations see this rename,
                 // preventing a second category from targeting the same name and
                 // hitting the DB unique constraint on (name, playlist_id, type).
-                $nameIndex->put($group['category_name'], $existing->id);
+                $nameIndex->put($group['category_name'], $existing);
                 $nameIndex->forget($existing->name);
                 $existing->update(['name' => $group['category_name']]);
             }
@@ -1711,6 +1907,7 @@ class ProcessM3uImport implements ShouldQueue
         foreach ($groups->chunk(50) as $chunk) {
             $rows = collect($chunk)
                 ->filter(fn ($item) => ($item['category_id'] ?? null) !== null)
+                ->reject(fn ($item) => in_array($item['category_id'], $conflictedCategoryIds, true))
                 ->unique(fn ($item) => $item['category_name'].$playlistId.$type)
                 ->map(fn ($item) => [
                     'name' => $item['category_name'],
@@ -1730,33 +1927,416 @@ class ProcessM3uImport implements ShouldQueue
             }
         }
 
-        // Guard against wiping everything if the provider temporarily returns an empty response.
-        if ($groups->isNotEmpty()) {
-            $currentNames = $groups->pluck('category_name');
-            SourceGroup::where('playlist_id', $playlistId)
-                ->where('type', $type)
-                ->where(function ($query) use ($categoryIds, $currentNames) {
-                    $query->where(function ($q) use ($categoryIds) {
-                        // Rows tracked by source_group_id that are no longer in the feed.
-                        $q->whereNotNull('source_group_id')
-                            ->whereNotIn('source_group_id', $categoryIds);
-                    })->orWhere(function ($q) use ($currentNames) {
-                        // Legacy null-id rows whose name no longer appears in the feed.
-                        $q->whereNull('source_group_id')
-                            ->whereNotIn('name', $currentNames);
-                    });
-                })
-                ->delete();
-        }
-
         $newNames = $groups->pluck('category_name')
             ->unique()
-            ->reject(fn ($name) => $name === null || $nameIndex->has($name))
+            ->reject(fn ($name) => $name === null || $nameIndex->has($name) || $namesBeforeSync->has($name))
             ->values()
             ->all();
         Bouquet::appendNewGroupNames($playlistId, $type, $newNames);
 
-        return [$currentSelected, $groups->unique('category_name')->keyBy('category_name')];
+        return [$currentSelected, $groups->unique('category_name')->keyBy('category_name'), $renames];
+    }
+
+    /**
+     * Rewrite a provider-name rename map (old name => new name, from
+     * syncSourceGroupType()) onto the enabled-groups snapshots built in the
+     * constructor, so a group renamed by the provider during this same sync
+     * still matches when deciding whether its new channels auto-enable
+     * (issue #1649 - without this, an already-enabled group that the
+     * provider happened to rename this run would silently stop matching its
+     * own new channels for the rest of this sync).
+     *
+     * @param  array<string, string>  $renames
+     * @param  'live'|'vod'  $type
+     */
+    private function applyRenamesToEnabledGroupSnapshot(array $renames, string $type): void
+    {
+        if (empty($renames)) {
+            return;
+        }
+
+        $rename = fn ($name) => $renames[$name] ?? $name;
+
+        $this->enabledGroups = $this->enabledGroups->map($rename);
+
+        if ($type === 'live') {
+            $this->enabledLiveGroups = $this->enabledLiveGroups->map($rename);
+        } else {
+            $this->enabledVodGroups = $this->enabledVodGroups->map($rename);
+        }
+    }
+
+    /**
+     * Assign source_id via collision-relative hashing.
+     *
+     * M3U channels carry a raw `source_key` (title + name + group). A key that occurs only
+     * once gets the base md5 hash. For a key that collides (several entries share the same
+     * title/name/group), each entry's own tvg-id - when the feed provides one - is folded into
+     * the hash instead of the entry's position in the file, so a reorder-only reimport can't
+     * swap which row a duplicate-named entry's URL/config lands on. Entries with no tvg-id
+     * fall back to the :dup:N encounter-order numbering. Because the key includes the group,
+     * duplicates can only occur within one group, so this only needs to span the group being
+     * chunked. Channels without a `source_key` (Xtream) pass through with their existing
+     * source_id.
+     *
+     * Those hashes are only used for entries that don't already own a row: when the existing
+     * rows of a key are given, each entry keeps the row it was imported into (see
+     * matchExistingSourceIds()). Otherwise rows hashed by an older scheme, or by this one
+     * before a duplicate appeared or disappeared, would be replaced by new rows and lose
+     * their enabled state, EPG mapping, numbers and custom playlist membership.
+     *
+     * @param  iterable<array{source_key: string, source_id: string, stream_id: ?string, url: ?string, is_vod: bool}>  $existingRows
+     */
+    public static function assignCollisionSourceIds(Enumerable $channels, iterable $existingRows = []): Enumerable
+    {
+        $items = $channels->all();
+
+        $families = [];
+        foreach ($items as $index => $item) {
+            $sourceKey = (string) ($item['source_key'] ?? '');
+            if ($sourceKey !== '') {
+                $families[$sourceKey][] = $index;
+            }
+        }
+
+        $rowsByFamily = [];
+        foreach ($existingRows as $row) {
+            if (isset($families[$row['source_key']])) {
+                $rowsByFamily[$row['source_key']][] = $row;
+            }
+        }
+
+        foreach ($families as $sourceKey => $indexes) {
+            $entries = array_map(fn (int|string $index): array => $items[$index], $indexes);
+            $sourceIds = self::freshCollisionSourceIds((string) $sourceKey, $entries);
+
+            $rows = $rowsByFamily[$sourceKey] ?? [];
+            $alreadyOwned = count($entries) === 1 && count($rows) === 1 && $rows[0]['source_id'] === $sourceIds[0];
+            if ($rows !== [] && ! $alreadyOwned) {
+                $sourceIds = self::matchExistingSourceIds((string) $sourceKey, $entries, $sourceIds, $rows);
+            }
+
+            foreach ($indexes as $position => $index) {
+                $items[$index]['source_id'] = $sourceIds[$position];
+            }
+        }
+
+        foreach (array_keys($items) as $index) {
+            unset($items[$index]['source_key']);
+        }
+
+        return collect($items);
+    }
+
+    /**
+     * The hashes a key's entries get when none of them owns a row yet (see
+     * assignCollisionSourceIds()), in entry order.
+     *
+     * @param  list<array<string, mixed>>  $entries
+     * @return list<string>
+     */
+    private static function freshCollisionSourceIds(string $sourceKey, array $entries): array
+    {
+        if (count($entries) === 1) {
+            return [md5($sourceKey)];
+        }
+
+        $sourceIds = [];
+        $ordinal = 0;
+        $stableSeen = [];
+        foreach ($entries as $entry) {
+            $tvgId = (string) ($entry['stream_id'] ?? '');
+
+            if ($tvgId !== '') {
+                $compositeKey = $sourceKey.'|sid:'.$tvgId;
+                $count = $stableSeen[$compositeKey] ?? 0;
+                $sourceIds[] = $count === 0 ? md5($compositeKey) : md5($compositeKey.':dup:'.$count);
+                $stableSeen[$compositeKey] = $count + 1;
+            } else {
+                $sourceIds[] = $ordinal === 0 ? md5($sourceKey) : md5($sourceKey.':dup:'.$ordinal);
+                $ordinal++;
+            }
+        }
+
+        return $sourceIds;
+    }
+
+    /**
+     * Give each entry of a key the source_id of the existing row it was imported into, so
+     * it keeps that row whatever hashing scheme created it. Rows are matched on the same
+     * tvg-id and URL, then the same tvg-id, then the same URL, then the hash the entry would
+     * get anyway, then in order where the tvg-ids don't say they differ. Entries left over
+     * are new and take their fresh hash, moved past any id already in use.
+     *
+     * @param  list<array<string, mixed>>  $entries
+     * @param  list<string>  $freshIds  freshCollisionSourceIds() for $entries
+     * @param  list<array{source_id: string, stream_id: ?string, url: ?string, is_vod: bool}>  $rows
+     * @return list<string>
+     */
+    private static function matchExistingSourceIds(string $sourceKey, array $entries, array $freshIds, array $rows): array
+    {
+        $tvgId = fn (array $value): string => (string) ($value['stream_id'] ?? '');
+        $url = fn (array $value): string => (string) ($value['url'] ?? '');
+        $isVod = fn (array $value): bool => (bool) ($value['is_vod'] ?? false);
+        $typedSourceId = fn (string $sourceId, array $value): string => $sourceId.'|'.(int) $isVod($value);
+
+        $passes = [
+            fn (array $entry, array $row, int $position): bool => $tvgId($entry) !== '' && $tvgId($entry) === $tvgId($row) && $url($entry) === $url($row),
+            fn (array $entry, array $row, int $position): bool => $tvgId($entry) !== '' && $tvgId($entry) === $tvgId($row),
+            fn (array $entry, array $row, int $position): bool => $url($entry) !== '' && $url($entry) === $url($row),
+            fn (array $entry, array $row, int $position): bool => $row['source_id'] === $freshIds[$position],
+            fn (array $entry, array $row, int $position): bool => $tvgId($entry) === '' || $tvgId($row) === '' || $tvgId($entry) === $tvgId($row),
+        ];
+
+        $sourceIds = array_fill(0, count($entries), null);
+        foreach ($passes as $matches) {
+            foreach ($entries as $position => $entry) {
+                if ($sourceIds[$position] !== null) {
+                    continue;
+                }
+                foreach ($rows as $rowKey => $row) {
+                    if ($isVod($entry) === $isVod($row) && $matches($entry, $row, $position)) {
+                        $sourceIds[$position] = $row['source_id'];
+                        unset($rows[$rowKey]);
+
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Unmatched rows belong to entries the provider dropped; new entries must not take them over
+        $taken = [];
+        foreach ($entries as $position => $entry) {
+            if ($sourceIds[$position] !== null) {
+                $taken[$typedSourceId($sourceIds[$position], $entry)] = true;
+            }
+        }
+        foreach ($rows as $row) {
+            $taken[$typedSourceId($row['source_id'], $row)] = true;
+        }
+
+        foreach ($entries as $position => $entry) {
+            if ($sourceIds[$position] !== null) {
+                continue;
+            }
+            $sourceId = $freshIds[$position];
+            for ($n = 1; isset($taken[$typedSourceId($sourceId, $entry)]); $n++) {
+                $sourceId = md5($sourceKey.':dup:'.$n);
+            }
+            $sourceIds[$position] = $sourceId;
+            $taken[$typedSourceId($sourceId, $entry)] = true;
+        }
+
+        return $sourceIds;
+    }
+
+    /**
+     * The imported channels the entries of one M3U group may already own, for
+     * assignCollisionSourceIds(): every channel in the group, plus channels of a
+     * duplicate name the user moved out to another group (found by the ids that name
+     * can hash to). Each carries the source_key the import builds (title + name + group).
+     *
+     * @return list<array{source_key: string, source_id: string, stream_id: ?string, url: ?string, is_vod: bool}>
+     */
+    private static function existingCollisionRows(int $playlistId, int $groupId, string $groupName, Enumerable $channels): array
+    {
+        $counts = $channels->pluck('source_key')->filter(fn ($sourceKey): bool => (string) $sourceKey !== '')->countBy()->all();
+
+        $candidateIds = [];
+        foreach ($counts as $sourceKey => $count) {
+            if ($count < 2) {
+                continue;
+            }
+            $candidateIds[md5((string) $sourceKey)] = true;
+            for ($n = 1; $n <= $count + 5; $n++) {
+                $candidateIds[md5($sourceKey.':dup:'.$n)] = true;
+            }
+        }
+        foreach ($channels as $channel) {
+            $sourceKey = (string) ($channel['source_key'] ?? '');
+            $tvgId = (string) ($channel['stream_id'] ?? '');
+            if ($tvgId === '' || ($counts[$sourceKey] ?? 0) < 2) {
+                continue;
+            }
+            $candidateIds[md5($sourceKey.'|sid:'.$tvgId)] = true;
+            $candidateIds[md5($sourceKey.'|sid:'.$tvgId.':dup:1')] = true;
+        }
+
+        $query = fn () => DB::table('channels')
+            ->where('playlist_id', $playlistId)
+            ->where('is_custom', false)
+            ->whereNotNull('source_id')
+            ->select(['source_id', 'title', 'name', 'stream_id', 'url', 'is_vod']);
+
+        $rows = [];
+        $collect = function (object $row) use (&$rows, $groupName): void {
+            $rows[$row->source_id.'|'.(int) (bool) $row->is_vod] = [
+                'source_key' => $row->title.$row->name.$groupName,
+                'source_id' => $row->source_id,
+                'stream_id' => $row->stream_id,
+                'url' => $row->url,
+                'is_vod' => (bool) $row->is_vod,
+            ];
+        };
+
+        foreach ($query()->where('group_id', $groupId)->cursor() as $row) {
+            $collect($row);
+        }
+        foreach (array_chunk(array_keys($candidateIds), 1000) as $ids) {
+            foreach ($query()->whereIn('source_id', $ids)->get() as $row) {
+                $collect($row);
+            }
+        }
+
+        return array_values($rows);
+    }
+
+    /**
+     * Prepare a chunk's upsert rows for channels the provider moved between categories.
+     *
+     * Xtream channels are keyed by stream_id, so a channel moved by the provider keeps its
+     * row, and `group_id` is left out of the upsert so manual moves survive a sync.
+     *
+     * - Streams an earlier category already imported this run are dropped from the rows, so
+     *   the first category listing a stream owns its row and `group_internal` names it.
+     * - Any other existing row in a different group is moved here when that group is missing,
+     *   soft-deleted, still the provider group it was last imported into, or a provider group
+     *   of the other type (live vs VOD). A channel the user moved to another group fails that
+     *   check and stays put.
+     * - Rows are matched on the chunk's type as well as stream_id, since providers can reuse
+     *   the same stream_id for a live stream and a movie.
+     * - Nothing is moved into a blank category: it can't be told apart from a failed or
+     *   partial category lookup, which would pull every channel into one group.
+     *
+     * @param  list<array<string, mixed>>  $rows
+     * @return list<array<string, mixed>>
+     */
+    public static function applyProviderGroupMoves(
+        int $playlistId,
+        int $groupId,
+        ?string $groupName,
+        array $rows,
+        string $batchNo,
+    ): array {
+        $sourceIds = array_values(array_filter(
+            array_map(fn (array $row): string => (string) ($row['source_id'] ?? ''), $rows),
+            fn (string $sourceId): bool => $sourceId !== '',
+        ));
+        if ($sourceIds === []) {
+            return $rows;
+        }
+
+        // A chunk only ever holds one type, live or VOD
+        $isVod = (bool) ($rows[0]['is_vod'] ?? false);
+
+        $existing = Channel::query()
+            ->leftJoin('groups', 'groups.id', '=', 'channels.group_id')
+            ->where('channels.playlist_id', $playlistId)
+            ->where('channels.is_custom', false)
+            ->where('channels.is_vod', $isVod)
+            ->whereIn('channels.source_id', $sourceIds)
+            ->get([
+                'channels.id',
+                'channels.source_id',
+                'channels.group_id',
+                'channels.group_internal',
+                'channels.import_batch_no',
+                'groups.id as current_group_id',
+                'groups.deleted_at as group_deleted_at',
+                'groups.custom as group_custom',
+                'groups.name_internal as group_name_internal',
+                'groups.type as group_type',
+            ]);
+
+        $importedThisRun = $existing->where('import_batch_no', $batchNo)
+            ->map(fn (Channel $channel): string => (string) $channel->source_id)
+            ->all();
+        if ($importedThisRun !== []) {
+            $rows = array_values(array_filter(
+                $rows,
+                fn (array $row): bool => ! in_array((string) ($row['source_id'] ?? ''), $importedThisRun, true),
+            ));
+        }
+
+        if (($rows[0]['group_internal'] ?? '') === '') {
+            return $rows;
+        }
+
+        $movedIds = $existing
+            ->filter(fn (Channel $channel): bool => $channel->import_batch_no !== $batchNo
+                && $channel->group_id !== $groupId
+                && ($channel->current_group_id === null
+                    || $channel->group_deleted_at !== null
+                    || (! $channel->group_custom && $channel->group_name_internal === $channel->group_internal)
+                    || (! $channel->group_custom && $channel->group_type === ($isVod ? 'live' : 'vod'))))
+            ->pluck('id');
+        if ($movedIds->isNotEmpty()) {
+            Channel::whereIn('id', $movedIds)->update([
+                'group_id' => $groupId,
+                'group' => $groupName,
+            ]);
+        }
+
+        return $rows;
+    }
+
+    /**
+     * Map each provider category_id to its 1-based position in the provider's category list.
+     *
+     * @param  Collection<int, array<string, mixed>>  $categories  Provider categories, in provider order.
+     * @param  int  $offset  Added to every position (VOD groups follow the live range).
+     * @return array<string, int>
+     */
+    private function providerCategoryPositions(Collection $categories, int $offset = 0): array
+    {
+        $positions = [];
+        foreach ($categories->values() as $index => $category) {
+            $categoryId = $category['category_id'] ?? null;
+            if ($categoryId !== null) {
+                $positions[(string) $categoryId] = $offset + $index + 1;
+            }
+        }
+
+        return $positions;
+    }
+
+    /**
+     * Resolve a group's sort_order when Group Auto Sort is enabled.
+     *
+     * Groups the provider lists keep the provider's category position. Any other group
+     * (e.g. no stable category id) takes the next counter value after the provider range.
+     *
+     * @param  array<string, int>  $positions  Result of providerCategoryPositions().
+     * @param  int|null  $groupOrder  Fallback counter; null when Group Auto Sort is off.
+     */
+    private function resolveGroupSortOrder(mixed $sourceGroupId, array $positions, ?int &$groupOrder): ?int
+    {
+        if ($groupOrder === null) {
+            return null;
+        }
+
+        if ($sourceGroupId !== null && isset($positions[(string) $sourceGroupId])) {
+            return $positions[(string) $sourceGroupId];
+        }
+
+        return $groupOrder++;
+    }
+
+    /**
+     * Clear the `new` flag left over from the previous sync.
+     *
+     * Groups are created or restored (new = true) before this runs, and every group seen
+     * this run already carries the current batch number, so those are left alone.
+     */
+    private function clearPreviousNewFlags(Playlist $playlist, string $batchNo): void
+    {
+        $playlist->groups()
+            ->where('new', true)
+            ->where(fn ($query) => $query->whereNull('import_batch_no')->orWhere('import_batch_no', '!=', $batchNo))
+            ->update(['new' => false]);
+        $playlist->channels()->where('new', true)->update(['new' => false]);
+        $playlist->series()->where('new', true)->update(['new' => false]);
     }
 
     /**
@@ -1775,9 +2355,9 @@ class ProcessM3uImport implements ShouldQueue
         // Update progress
         $playlist->update(['progress' => 15]);
 
-        // Setup group sort, if Playlist auto sort is enabled
+        // Setup group sort, if Playlist Group Auto Sort is enabled
         $groupOrder = null;
-        if ($playlist->auto_sort) {
+        if ($playlist->auto_sort_groups) {
             $groupOrder = 1;
         }
         $autoSort = $playlist->auto_sort;
@@ -1827,6 +2407,13 @@ class ProcessM3uImport implements ShouldQueue
                         }
                         $group->update($data);
                     }
+                    // Hash before chunking so duplicate counters span the whole group,
+                    // not just a single 50-item Job payload. The group's existing rows let
+                    // duplicate-named entries keep the rows they were imported into.
+                    $channels = self::assignCollisionSourceIds(
+                        $channels,
+                        self::existingCollisionRows($playlistId, $group->id, (string) $groupName, $channels),
+                    );
                     $channels->chunk(50)->each(function ($chunk) use ($playlistId, $batchNo, $group, $autoSort) {
                         Job::create([
                             'title' => "Processing channel import for group: {$group->name}",
@@ -1918,9 +2505,7 @@ class ProcessM3uImport implements ShouldQueue
 
         // Flag any previously marked new items as not new, so only genuinely
         // new channels (inserted, not updated) carry new=true after this run.
-        $playlist->groups()->where('new', true)->update(['new' => false]);
-        $playlist->channels()->where('new', true)->update(['new' => false]);
-        $playlist->series()->where('new', true)->update(['new' => false]);
+        $this->clearPreviousNewFlags($playlist, $batchNo);
 
         // Create the jobs array
         $jobs = [];
@@ -1956,7 +2541,7 @@ class ProcessM3uImport implements ShouldQueue
         // NOTE: see comment on the other Bus::chain catch — capture scalars only,
         // never $this, or closure serialization will OOM the worker.
         $syncRunId = $this->syncRunId;
-        Bus::chain($jobs)
+        Bus::chain($this->syncResetGuard()->guard($jobs))
             ->onConnection('redis') // force to use redis connection
             ->onQueue('import')
             ->catch(function (Throwable $e) use ($playlist, $syncRunId) {

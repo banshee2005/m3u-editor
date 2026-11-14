@@ -38,8 +38,11 @@ class Epg extends Model
         'source_type' => EpgSourceType::class,
         'sd_token_expires_at' => 'datetime',
         'sd_login_cooldown_until' => 'datetime',
+        'sd_auth_blocked_code' => 'integer',
+        'sd_backoff_attempts' => 'integer',
         'sd_last_sync' => 'datetime',
         'sd_station_ids' => 'array',
+        'sd_lineup_ids' => 'array',
         'sd_errors' => 'array',
         'sd_days_to_import' => 'integer',
         'sd_metadata' => 'array',
@@ -110,6 +113,15 @@ class Epg extends Model
     }
 
     /**
+     * A SchedulesDirect EPG while SCHEDULES_DIRECT_ENABLED is off: it can't sync,
+     * but the guide data it already imported keeps being served.
+     */
+    public function isSchedulesDirectDisabled(): bool
+    {
+        return $this->isSchedulesDirect() && ! config('services.schedules_direct.enabled', true);
+    }
+
+    /**
      * A stored Schedules Direct token is usable when it exists and still has a
      * safety margin left before its real expiry. Schedules Direct tokens are
      * valid for 24 hours; the small margin absorbs clock skew and keeps a
@@ -131,6 +143,16 @@ class Epg extends Model
     {
         return $this->sd_login_cooldown_until
             && $this->sd_login_cooldown_until->isFuture();
+    }
+
+    /**
+     * True when Schedules Direct permanently rejected this account's login
+     * (expired, invalid user, application disabled or inactive). No /token
+     * request is made until the credentials change or the user retries.
+     */
+    public function isSchedulesDirectAuthBlocked(): bool
+    {
+        return $this->sd_auth_blocked_code !== null;
     }
 
     /**
@@ -173,7 +195,7 @@ class Epg extends Model
 
     public function hasSchedulesDirectLineup(): bool
     {
-        return ! empty($this->sd_lineup_id);
+        return ! empty($this->sd_lineup_ids);
     }
 
     public function isMerged(): bool
@@ -251,6 +273,116 @@ class Epg extends Model
     public function mergedByEpgs(): BelongsToMany
     {
         return $this->belongsToMany(self::class, 'merged_epg_epg', 'epg_id', 'merged_epg_id');
+    }
+
+    /**
+     * Resolve which Playlist/CustomPlaylist owners have an enabled DVR setting.
+     * MergedPlaylist owners are expanded to their member playlist ids, since
+     * channels are only ever linked to the underlying playlists.
+     *
+     * Resolve once and pass to {@see hasDvrEnabled()} when checking many EPGs
+     * (e.g. a table render) to avoid repeating the lookup per row.
+     *
+     * @return array{playlist_ids: list<int>, custom_playlist_ids: list<int>}
+     */
+    public static function resolveDvrEnabledOwners(): array
+    {
+        $settings = DvrSetting::where('enabled', true)
+            ->get(['playlist_id', 'custom_playlist_id', 'merged_playlist_id']);
+
+        $playlistIds = $settings->pluck('playlist_id')->filter();
+        $mergedPlaylistIds = $settings->pluck('merged_playlist_id')->filter();
+
+        if ($mergedPlaylistIds->isNotEmpty()) {
+            $playlistIds = $playlistIds->concat(
+                Playlist::join('merged_playlist_playlist', 'merged_playlist_playlist.playlist_id', '=', 'playlists.id')
+                    ->whereIn('merged_playlist_playlist.merged_playlist_id', $mergedPlaylistIds)
+                    ->pluck('playlists.id')
+            );
+        }
+
+        return [
+            'playlist_ids' => $playlistIds->unique()->values()->all(),
+            'custom_playlist_ids' => $settings->pluck('custom_playlist_id')->filter()->unique()->values()->all(),
+        ];
+    }
+
+    /**
+     * Whether any Playlist/CustomPlaylist/MergedPlaylist with channels mapped to
+     * this EPG has DVR enabled (i.e. a cache regen also populates epg_programmes).
+     *
+     * @param  array{playlist_ids: list<int>, custom_playlist_ids: list<int>}|null  $dvrOwners  from {@see resolveDvrEnabledOwners()}
+     */
+    public function hasDvrEnabled(?array $dvrOwners = null): bool
+    {
+        // Already resolved in bulk via the withHasDvr() scope (e.g. a table render)
+        if (array_key_exists('has_dvr', $this->attributes)) {
+            return (bool) $this->attributes['has_dvr'];
+        }
+
+        return static::dvrEnabledChannelsQuery($dvrOwners ?? static::resolveDvrEnabledOwners())
+            ->where('epg_channels.epg_id', $this->id)
+            ->exists();
+    }
+
+    /**
+     * Add a `has_dvr` boolean column to the query (see {@see hasDvrEnabled()}),
+     * resolved in the same query so listing many EPGs needs no per-row lookups.
+     *
+     * @param  array{playlist_ids: list<int>, custom_playlist_ids: list<int>}|null  $dvrOwners  from {@see resolveDvrEnabledOwners()}
+     */
+    public function scopeWithHasDvr(Builder $query, ?array $dvrOwners = null): Builder
+    {
+        $dvrOwners ??= static::resolveDvrEnabledOwners();
+
+        return $query->withExists([
+            'channels as has_dvr' => fn (Builder $epgChannels) => $epgChannels->whereHas(
+                'channels',
+                fn (Builder $channels) => static::constrainToDvrOwners($channels, $dvrOwners)
+            ),
+        ]);
+    }
+
+    /**
+     * Channels mapped to an EPG channel that belong to one of the DVR-enabled owners.
+     *
+     * @param  array{playlist_ids: list<int>, custom_playlist_ids: list<int>}  $dvrOwners
+     */
+    protected static function dvrEnabledChannelsQuery(array $dvrOwners): Builder
+    {
+        return static::constrainToDvrOwners(
+            Channel::join('epg_channels', 'epg_channels.id', '=', 'channels.epg_channel_id'),
+            $dvrOwners
+        );
+    }
+
+    /**
+     * Limit a channels query to channels belonging to one of the DVR-enabled owners.
+     *
+     * @param  array{playlist_ids: list<int>, custom_playlist_ids: list<int>}  $dvrOwners
+     */
+    protected static function constrainToDvrOwners(Builder $channels, array $dvrOwners): Builder
+    {
+        $playlistIds = $dvrOwners['playlist_ids'];
+        $customPlaylistIds = $dvrOwners['custom_playlist_ids'];
+
+        if (empty($playlistIds) && empty($customPlaylistIds)) {
+            return $channels->whereRaw('1 = 0');
+        }
+
+        return $channels->where(function (Builder $query) use ($playlistIds, $customPlaylistIds): void {
+            if (! empty($playlistIds)) {
+                $query->orWhereIn('channels.playlist_id', $playlistIds);
+            }
+            if (! empty($customPlaylistIds)) {
+                $query->orWhereIn('channels.custom_playlist_id', $customPlaylistIds)
+                    ->orWhereIn('channels.id', function ($subQuery) use ($customPlaylistIds): void {
+                        $subQuery->select('channel_id')
+                            ->from('channel_custom_playlist')
+                            ->whereIn('custom_playlist_id', $customPlaylistIds);
+                    });
+            }
+        });
     }
 
     /**

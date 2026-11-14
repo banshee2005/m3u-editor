@@ -82,20 +82,6 @@ class DvrRequestsAiostreamsTabs
                                     ->minValue(1)
                                     ->maxValue(20)
                                     ->default(2),
-                                TextInput::make('dvr_default_start_early_seconds')
-                                    ->label(__('Start Early (seconds)'))
-                                    ->helperText(__('Start recordings this many seconds before the scheduled start time.'))
-                                    ->numeric()
-                                    ->minValue(0)
-                                    ->maxValue(600)
-                                    ->default(30),
-                                TextInput::make('dvr_default_end_late_seconds')
-                                    ->label(__('End Late (seconds)'))
-                                    ->helperText(__('Continue recording this many seconds after the scheduled end time.'))
-                                    ->numeric()
-                                    ->minValue(0)
-                                    ->maxValue(600)
-                                    ->default(60),
                                 TextInput::make('dvr_retention_days')
                                     ->label(__('Retention (days)'))
                                     ->helperText(__('Automatically delete recordings older than this many days. Set to 0 to disable automatic deletion.'))
@@ -108,6 +94,27 @@ class DvrRequestsAiostreamsTabs
                                     ->numeric()
                                     ->minValue(0)
                                     ->default(0),
+                                Grid::make()
+                                    ->columns(2)
+                                    ->columnSpanFull()
+                                    ->schema([
+                                        DvrPaddingFields::make(
+                                            field: 'dvr_default_start_early_seconds',
+                                            label: __('Start Early'),
+                                            isStart: true,
+                                            allowNegative: false,
+                                            maxSeconds: 600,
+                                            defaultSeconds: 30,
+                                        )->columnSpan(1),
+                                        DvrPaddingFields::make(
+                                            field: 'dvr_default_end_late_seconds',
+                                            label: __('End Late'),
+                                            isStart: false,
+                                            allowNegative: false,
+                                            maxSeconds: 600,
+                                            defaultSeconds: 60,
+                                        )->columnSpan(1),
+                                    ]),
                             ]),
                         Grid::make()
                             ->columns(2)
@@ -189,6 +196,12 @@ class DvrRequestsAiostreamsTabs
                                     ->numeric()
                                     ->minValue(1)
                                     ->placeholder(__('Keep all')),
+                                TextInput::make('dvr_sports_dedup_days')
+                                    ->label(__('Sports Dedup Window (Days)'))
+                                    ->helperText(__('How many days a sports airing without season/episode data is treated as a replay of a recent game (skipped). A same-title airing beyond this window is a new event and is recorded. Blank uses the 2-day default.'))
+                                    ->numeric()
+                                    ->minValue(0)
+                                    ->placeholder('2'),
                             ]),
                     ]),
             ])
@@ -199,7 +212,8 @@ class DvrRequestsAiostreamsTabs
     {
         return Tab::make(__('Requests'))
             ->icon('heroicon-m-squares-plus')
-            ->hidden(fn () => ! auth()->user()->canUseIntegrations())
+            // One closure: hiddenOn() would replace an earlier hidden() predicate.
+            ->hidden(fn (string $operation): bool => $operation === 'create' || ! auth()->user()->canUseIntegrations())
             ->schema([
                 Section::make(__('Content Requests'))
                     ->icon('heroicon-m-squares-plus')
@@ -211,8 +225,7 @@ class DvrRequestsAiostreamsTabs
                             ->default(false)
                             ->inline(false),
                     ]),
-            ])
-            ->hiddenOn('create');
+            ]);
     }
 
     public static function aiostreamsTab(): Tab
@@ -226,10 +239,13 @@ class DvrRequestsAiostreamsTabs
 
         return Tab::make(__('AIOStreams'))
             ->icon('heroicon-m-film')
-            ->hidden(fn () => MediaServerIntegration::where('user_id', auth()->id())
-                ->where('type', 'aiostreams')
-                ->where('enabled', true)
-                ->doesntExist()
+            // One closure: hiddenOn() would replace an earlier hidden() predicate.
+            ->hidden(fn (string $operation): bool => $operation === 'create'
+                || ! config('services.aiostreams.enabled', true)
+                || MediaServerIntegration::where('user_id', auth()->id())
+                    ->where('type', 'aiostreams')
+                    ->where('enabled', true)
+                    ->doesntExist()
             )
             ->schema([
                 Section::make(__('AIOStreams Access'))
@@ -243,7 +259,6 @@ class DvrRequestsAiostreamsTabs
                             ->nullable()
                             ->helperText(__('Select which AIOStreams integration to expose on this playlist. Leave blank to disable AIOStreams for this playlist.')),
                     ]),
-            ])
-            ->hiddenOn('create');
+            ]);
     }
 }

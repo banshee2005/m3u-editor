@@ -2,6 +2,7 @@
 
 namespace App\Filament\Resources\Series;
 
+use App\Enums\CachedContentFileStatus;
 use App\Facades\LogoFacade;
 use App\Filament\Actions\AssetPickerAction;
 use App\Filament\Actions\BulkModalActionGroup;
@@ -13,11 +14,13 @@ use App\Filament\Resources\Series\Pages\EditSeries;
 use App\Filament\Resources\Series\Pages\ListSeries;
 use App\Filament\Resources\Series\Pages\ViewSeries;
 use App\Filament\Resources\Series\RelationManagers\EpisodesRelationManager;
+use App\Filament\Tables\DvrSourceColumn;
 use App\Forms\Components\TmdbSearchResults;
 use App\Jobs\FetchTmdbIds;
 use App\Jobs\ProbeStreamsChunk;
 use App\Jobs\ProbeStreamsComplete;
 use App\Jobs\ProcessM3uImportSeriesEpisodes;
+use App\Jobs\QueueCachedContentDownloads;
 use App\Jobs\SeriesFindAndReplace;
 use App\Jobs\SyncSeriesStrmFiles;
 use App\Models\Category;
@@ -25,6 +28,7 @@ use App\Models\Episode;
 use App\Models\Playlist;
 use App\Models\Series;
 use App\Rules\CheckIfUrlOrLocalPath;
+use App\Services\CachedContentDispatchService;
 use App\Services\DateFormatService;
 use App\Services\LogoCacheService;
 use App\Services\PlaylistService;
@@ -155,6 +159,7 @@ class SeriesResource extends Resource implements CopilotResource
                     return $query->orWhereRaw('LOWER(series.name) LIKE ?', ['%'.strtolower($search).'%']);
                 })
                 ->sortable(),
+            DvrSourceColumn::make(fn ($record): bool => $record->import_batch_no === 'dvr'),
             TextInputColumn::make('sort')
                 ->label(__('Sort Order'))
                 ->rules(['min:0'])
@@ -203,6 +208,18 @@ class SeriesResource extends Resource implements CopilotResource
                 ->label(__('Episodes'))
                 ->counts('episodes')
                 ->badge()
+                ->toggleable()
+                ->sortable(),
+            TextColumn::make('cached_episodes_count')
+                ->label(__('Cached'))
+                ->visible(fn (): bool => app(CachedContentDispatchService::class)->isEnabled())
+                ->counts(['episodes as cached_episodes_count' => fn ($q) => $q->whereHas(
+                    'cachedContentFile',
+                    fn ($file) => $file->where('status', CachedContentFileStatus::Completed),
+                )])
+                ->badge()
+                ->color(fn ($state) => $state > 0 ? 'success' : 'gray')
+                ->tooltip(__('Episodes with a local cache file'))
                 ->toggleable()
                 ->sortable(),
             TextColumn::make('probe_enabled_episodes_count')
@@ -315,6 +332,54 @@ class SeriesResource extends Resource implements CopilotResource
                 ->toggle()
                 ->query(fn ($query) => $query->whereDoesntHave('episodes', fn ($q) => $q->whereNotNull('stream_stats_probed_at'))),
         ];
+    }
+
+    public static function getCacheAllEpisodesAction(): Action
+    {
+        return Action::make('cache_all_episodes')
+            ->label(__('Cache all episodes'))
+            ->icon('heroicon-o-arrow-down-tray')
+            ->color('gray')
+            ->visible(fn (Series $record): bool => app(CachedContentDispatchService::class)->isEnabled()
+                && filled($record->playlist_id))
+            ->requiresConfirmation()
+            ->modalIcon('heroicon-o-arrow-down-tray')
+            ->modalHeading(__('Cache all episodes?'))
+            ->modalDescription(fn (Series $record): string => __('Queue background downloads of every episode of ":name" to local storage, or add the series to Sonarr if Sonarr is set up for caching. Episodes that are already cached or queued are skipped.', ['name' => $record->name]))
+            ->modalSubmitActionLabel(__('Cache all episodes'))
+            ->action(function (Series $record): void {
+                $counts = app(CachedContentDispatchService::class)->dispatchSeries($record);
+                CachedContentDispatchService::summaryNotification($counts)->send();
+            });
+    }
+
+    /**
+     * Bulk variant of `getCacheAllEpisodesAction()`. The episodes are queued
+     * from a background job (see `QueueCachedContentDownloads`), which sends
+     * one summary notification across every selected series when it finishes.
+     */
+    public static function getCacheAllEpisodesBulkAction(): BulkAction
+    {
+        return BulkAction::make('cache_all_episodes')
+            ->label(__('Cache all episodes'))
+            ->icon('heroicon-o-arrow-down-tray')
+            ->color('gray')
+            ->visible(fn (): bool => app(CachedContentDispatchService::class)->isEnabled())
+            ->requiresConfirmation()
+            ->modalIcon('heroicon-o-arrow-down-tray')
+            ->modalHeading(__('Cache all episodes from selected series?'))
+            ->modalDescription(__('Queue background downloads of every episode of every selected series to local storage, or add each series to Sonarr if Sonarr is set up for caching. Episodes that are already cached, queued, or have no cacheable source URL are skipped.'))
+            ->modalSubmitActionLabel(__('Cache all episodes'))
+            ->action(function (Collection $records): void {
+                QueueCachedContentDownloads::dispatch('series', $records->modelKeys(), auth()->id());
+            })->after(function () {
+                Notification::make()
+                    ->success()
+                    ->title(__('Caching started'))
+                    ->body(__('Cache downloads are being queued in the background. You will be notified once the process is complete.'))
+                    ->send();
+            })
+            ->deselectRecordsAfterCompletion();
     }
 
     public static function getTableActions(): array
@@ -572,6 +637,7 @@ class SeriesResource extends Resource implements CopilotResource
                     ->modalIcon('heroicon-o-signal')
                     ->modalDescription(__('Probe all episodes of this series with ffprobe to collect stream metadata (codec, resolution, bitrate, HDR). This data enables Trash Guide naming with stream-stat-based detection.'))
                     ->modalSubmitActionLabel(__('Start probing')),
+                self::getCacheAllEpisodesAction(),
                 DeleteAction::make()
                     ->modalIcon('heroicon-o-trash')
                     ->modalDescription(__('Are you sure you want to delete this series? This will delete all episodes and seasons for this series. This action cannot be undone.'))
@@ -1008,6 +1074,11 @@ class SeriesResource extends Resource implements CopilotResource
                     ->modalDescription(__('Probe the episodes of the selected series with ffprobe to collect stream metadata (codec, resolution, bitrate, HDR). This data enables Trash Guide naming with stream-stat-based detection.'))
                     ->modalSubmitActionLabel(__('Start probing')),
             ]),
+
+            // -- Caching --
+            BulkModalActionGroup::section('Caching', [
+                self::getCacheAllEpisodesBulkAction(),
+            ])->visible(fn (): bool => app(CachedContentDispatchService::class)->isEnabled()),
 
             // -- Enable / Disable --
             BulkModalActionGroup::section('Enable / Disable', [

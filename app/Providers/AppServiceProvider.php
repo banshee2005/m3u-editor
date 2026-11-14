@@ -15,9 +15,8 @@ use App\Events\PlaylistUpdated;
 use App\Http\Middleware\EnsureUserCanUseCopilot;
 use App\Jobs\ProcessChannelScrubber;
 use App\Jobs\SyncMediaServer;
-use App\Listeners\AlertOnJobFailed;
-use App\Listeners\PersistUserLocale;
 use App\Livewire\BackupDestinationListRecords;
+use App\Livewire\CopilotChat;
 use App\Livewire\TmdbSearch;
 use App\Models\Bouquet;
 use App\Models\Channel;
@@ -47,8 +46,11 @@ use App\Services\ProxyService;
 use App\Services\SortService;
 use App\Services\TagRenamePropagationService;
 use App\Settings\GeneralSettings;
+use App\Support\ApiDocs\DocumentDvrAuthenticationErrors;
+use App\Support\ApiDocs\DocumentXtreamApiResponses;
+use App\Support\ApiDocs\MergeSameStatusResponses;
+use App\Support\ApiDocs\PruneUnreferencedSchemas;
 use App\Support\CopilotProvider;
-use CraftForge\FilamentLanguageSwitcher\Events\LocaleChanged;
 use Dedoc\Scramble\Scramble;
 use Dedoc\Scramble\Support\Generator\OpenApi;
 use Dedoc\Scramble\Support\Generator\SecurityScheme;
@@ -69,7 +71,6 @@ use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\Relation;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Http\Request;
-use Illuminate\Queue\Events\JobFailed;
 use Illuminate\Queue\Events\JobProcessing;
 use Illuminate\Routing\Route;
 use Illuminate\Support\Facades\DB;
@@ -101,17 +102,17 @@ class AppServiceProvider extends ServiceProvider
     {
         $this->app->bind(FilamentNotification::class, AppNotification::class);
 
-        // Override the Laravel AI manager to fix a strict-mode tool schema bug
-        // where tools with no parameters are missing the required `parameters`
-        // object, causing OpenAI to return a 400 invalid_function_parameters error.
+        // Override the Laravel AI manager so Gemini tools with no required
+        // parameters omit `required` instead of sending an empty array, which
+        // Gemini rejects with a 400 INVALID_ARGUMENT error.
         $this->app->scoped(AiManager::class, fn ($app) => new PatchedAiManager($app));
 
         $this->app->singleton(GitInfoService::class);
 
         // Detect HTTPS before any provider boot() runs, so package providers
-        // calling asset() during their boot() (e.g. filament-copilot) get the
-        // correct scheme. We can't rely on TrustProxies middleware here — it
-        // runs after all providers have booted.
+        // calling asset() during their boot() get the correct scheme. We can't
+        // rely on TrustProxies middleware here, since it runs after all
+        // providers have booted.
         $this->app->booting(function () {
             if (! $this->app->runningInConsole()) {
                 $this->configureDynamicHttpsDetection();
@@ -207,12 +208,6 @@ class AppServiceProvider extends ServiceProvider
 
         // Register the OIDC Socialite driver (when enabled)
         $this->registerOidcProvider();
-
-        // Persist user locale preference when changed via the language switcher
-        $this->registerLocaleListener();
-
-        // Forward failed queue jobs to Discord/Slack when configured
-        $this->registerJobFailedAlertListener();
 
         // Livewire components
         $this->registerLivewireComponents();
@@ -369,6 +364,31 @@ class AppServiceProvider extends ServiceProvider
             return Limit::perMinute(240)->by($credentialKey);
         });
 
+        // Plugin API endpoints: keyed by client IP only. Not by submitted username (a client
+        // could spread guesses across logins) and not by plugin id (logins are checked before
+        // the plugin is looked up, so any id in the URL would buy a fresh allowance).
+        RateLimiter::for('plugin-api', function (Request $request) {
+            return Limit::perMinute(max(1, (int) config('plugins.api.rate_limit_per_minute', 120)))
+                ->by('plugin-api|'.$request->ip());
+        });
+
+        // Named separately as well as keyed by route class: even callbacks from
+        // the same proxy IP/token cannot consume another callback's allowance.
+        foreach (['resolver', 'webhook', 'broadcast', 'dvr'] as $callback) {
+            RateLimiter::for('m3u-proxy-callback-'.$callback, function (Request $request) use ($callback) {
+                $configured = config('proxy.callback_rate_limits.'.$callback, 120);
+                $limit = is_int($configured) || is_string($configured)
+                    ? filter_var($configured, FILTER_VALIDATE_INT, [
+                        'options' => ['min_range' => 1, 'max_range' => 60000],
+                    ])
+                    : false;
+
+                return Limit::perMinute($limit === false ? 120 : $limit)
+                    ->by($callback.'|'.$request->route()->getDomain().'|'.$request->ip());
+            });
+        }
+
+
         // Note: Proxy rate limiting is handled by ProxyRateLimitMiddleware for better performance
 
         // Gate the copilot stream endpoint behind the use_ai_copilot permission.
@@ -518,6 +538,7 @@ class AppServiceProvider extends ServiceProvider
                 if ($playlist->isDirty($fields)) {
                     EpgCacheService::clearPlaylistEpgCacheFile($playlist);
                 }
+                EpgCacheService::clearIfTvgIdsRenumbered($playlist);
 
                 // Keep auto-generated EPG map names in sync when the playlist is renamed
                 if ($playlist->wasChanged('name')) {
@@ -630,6 +651,18 @@ class AppServiceProvider extends ServiceProvider
                 if (! $epg->sync_interval) {
                     $epg->sync_interval = '0 */6 * * *';
                 }
+                // New Schedules Direct credentials lift a recorded permanent login
+                // rejection, so the next sync tries them. A different username is a
+                // different provider account, so its login cooldown no longer applies.
+                if ($epg->isDirty(['sd_username', 'sd_password'])) {
+                    $epg->sd_auth_blocked_code = null;
+                    $epg->sd_auth_blocked_message = null;
+                }
+                if ($epg->isDirty('sd_username')) {
+                    $epg->sd_login_cooldown_until = null;
+                    $epg->sd_cooldown_reason = null;
+                    $epg->sd_backoff_attempts = 0;
+                }
 
                 return $epg;
             });
@@ -686,6 +719,7 @@ class AppServiceProvider extends ServiceProvider
 
                 return $mergedPlaylist;
             });
+            MergedPlaylist::updated(fn (MergedPlaylist $mergedPlaylist) => EpgCacheService::clearIfTvgIdsRenumbered($mergedPlaylist));
             MergedPlaylist::deleting(function (MergedPlaylist $mergedPlaylist) {
                 // Remove short URLs
                 $mergedPlaylist->removeShortUrls();
@@ -736,6 +770,7 @@ class AppServiceProvider extends ServiceProvider
 
                 return $customPlaylist;
             });
+            CustomPlaylist::updated(fn (CustomPlaylist $customPlaylist) => EpgCacheService::clearIfTvgIdsRenumbered($customPlaylist));
             CustomPlaylist::deleting(function (CustomPlaylist $customPlaylist) {
                 // Remove short URLs
                 $customPlaylist->removeShortUrls();
@@ -767,6 +802,12 @@ class AppServiceProvider extends ServiceProvider
                     $group->channels()
                         ->update(['group' => $group->name]);
                 }
+
+                // Channels without their own AED profile inherit the group's, and AED
+                // programmes are built into the cached EPG output files.
+                if (array_key_exists('aed_profile_id', $changes) && $group->playlist_id) {
+                    EpgCacheService::clearForGroup($group->id, (int) $group->playlist_id);
+                }
             });
 
             // Custom playlist group/category tags: propagate renames into bouquets
@@ -778,6 +819,20 @@ class AppServiceProvider extends ServiceProvider
                 if (empty($channel->uuid)) {
                     $channel->uuid = Str::orderedUuid()->toString();
                 }
+            });
+
+            // A changed EPG mapping or AED profile is saved immediately, but the generated
+            // XMLTV/gzip output files are served from an output cache that is otherwise only
+            // invalidated by the sync/mapping job chains. Without this, a manual EPG
+            // reassignment or AED profile change through the Channel edit form or the EPG
+            // viewer leaves stale output files with the old programmes until that cache's
+            // own TTL expires.
+            Channel::updated(function (Channel $channel) {
+                if (! $channel->wasChanged(['epg_channel_id', 'aed_profile_id'])) {
+                    return;
+                }
+
+                EpgCacheService::clearForChannelIds([$channel->id]);
             });
 
             // Failover channels
@@ -827,6 +882,16 @@ class AppServiceProvider extends ServiceProvider
                     // The alias now points at a different playlist/custom playlist, so its
                     // cached EPG XML (generated against the previous target) is stale.
                     EpgCacheService::clearPlaylistEpgCacheFile($playlistAlias);
+
+                    // Bouquets only apply to aliases of their own playlist (see the
+                    // BouquetPlaylistAlias attach guard), so the previous target's
+                    // bouquets would otherwise keep filtering the new one.
+                    $staleBouquetIds = $playlistAlias->bouquets()->get()
+                        ->reject(fn (Bouquet $bouquet): bool => $bouquet->appliesTo($playlistAlias))
+                        ->modelKeys();
+                    if ($staleBouquetIds !== []) {
+                        $playlistAlias->bouquets()->detach($staleBouquetIds);
+                    }
                 }
 
                 return $playlistAlias;
@@ -864,6 +929,8 @@ class AppServiceProvider extends ServiceProvider
                     // Auto-include is a provider-sync concept; custom playlists never sync.
                     $bouquet->auto_include_new_live = false;
                     $bouquet->auto_include_new_vod = false;
+                    $bouquet->auto_include_live_patterns = null;
+                    $bouquet->auto_include_vod_patterns = null;
                 }
 
                 // The hidden target FK is otherwise a name-existence oracle for other
@@ -947,8 +1014,14 @@ class AppServiceProvider extends ServiceProvider
                     $network->schedule_type = 'sequential';
                 }
             });
+            // Keep the network's channel projection current (issue #1303).
+            Network::created(fn (Network $network) => app(NetworkChannelSyncService::class)->syncNetwork($network));
             Network::updated(function (Network $network) {
-                app(NetworkChannelSyncService::class)->refreshNetworkChannel($network);
+                // Broadcast state saves don't touch any projected attribute, so
+                // they skip this entirely.
+                if ($network->wasChanged(NetworkChannelSyncService::PROJECTED_ATTRIBUTES)) {
+                    app(NetworkChannelSyncService::class)->syncNetwork($network);
+                }
             });
             Network::deleting(function (Network $network) {
                 // Ensure any running broadcast is stopped and HLS files are removed
@@ -961,7 +1034,7 @@ class AppServiceProvider extends ServiceProvider
                     ]);
                 }
 
-                Channel::where('network_id', $network->id)->delete();
+                app(NetworkChannelSyncService::class)->removeNetwork($network);
             });
 
             // ChannelScrubber
@@ -1025,6 +1098,20 @@ class AppServiceProvider extends ServiceProvider
             PanelsRenderHook::FOOTER,
             fn () => view('footer')
         );
+
+        // Privacy mode: blur URLs and credentials marked with .privacy-sensitive
+        FilamentView::registerRenderHook(
+            PanelsRenderHook::HEAD_END,
+            function (): string {
+                try {
+                    return app(GeneralSettings::class)->privacy_mode
+                        ? view('components.privacy-mode-styles')->render()
+                        : '';
+                } catch (Throwable $e) {
+                    return '';
+                }
+            }
+        );
     }
 
     /**
@@ -1050,9 +1137,12 @@ class AppServiceProvider extends ServiceProvider
             ->routes(function (Route $route) {
                 return ! Str::startsWith($route->uri, 'playlist/v/') && Str::startsWith($route->uri, [
                     'playlist/',
+                    'custom-playlist/',
                     'epg/',
                     'user/',
                     'channel/',
+                    'recordings',
+                    'series-rules',
                     'proxy/',
                     'group/',
                     'player_api.php',
@@ -1062,7 +1152,15 @@ class AppServiceProvider extends ServiceProvider
                 $openApi->secure(
                     SecurityScheme::http('bearer')
                 );
-            });
+
+                if (blank(config('scramble.info.version'))) {
+                    $openApi->info->setVersion((string) config('dev.version'));
+                }
+            })
+            ->withDocumentTransformers(DocumentXtreamApiResponses::class)
+            ->withDocumentTransformers(PruneUnreferencedSchemas::class)
+            ->withOperationTransformers(DocumentDvrAuthenticationErrors::class)
+            ->withOperationTransformers(MergeSameStatusResponses::class);
     }
 
     /**
@@ -1169,6 +1267,8 @@ class AppServiceProvider extends ServiceProvider
 
         // Register the TMDB search component
         Livewire::component('tmdb-search', TmdbSearch::class);
+        // Replaces the package's registration; package providers boot before this one.
+        Livewire::component('filament-copilot-chat', CopilotChat::class);
     }
 
     /**
@@ -1183,22 +1283,6 @@ class AppServiceProvider extends ServiceProvider
         Event::listen(
             SocialiteWasCalled::class,
             [OIDCExtendSocialite::class, 'handle'],
-        );
-    }
-
-    private function registerLocaleListener(): void
-    {
-        Event::listen(
-            LocaleChanged::class,
-            PersistUserLocale::class,
-        );
-    }
-
-    private function registerJobFailedAlertListener(): void
-    {
-        Event::listen(
-            JobFailed::class,
-            AlertOnJobFailed::class,
         );
     }
 

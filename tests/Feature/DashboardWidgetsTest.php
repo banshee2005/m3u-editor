@@ -50,7 +50,7 @@ it('exposes quick actions in the dashboard header, gated by role', function () {
     $this->actingAs(User::factory()->create());
 
     Livewire::test(CustomDashboard::class)
-        ->assertActionExists('new_playlist')
+        ->assertActionExists('manage_playlists')
         ->assertActionExists('playlists')
         ->assertActionExists('epgs')
         ->assertActionDoesNotExist('backups')
@@ -60,7 +60,7 @@ it('exposes quick actions in the dashboard header, gated by role', function () {
     $this->actingAs(User::factory()->admin()->create());
 
     Livewire::test(CustomDashboard::class)
-        ->assertActionExists('new_playlist')
+        ->assertActionExists('manage_playlists')
         ->assertActionExists('backups')
         ->assertActionExists('logs')
         ->assertActionExists('settings');
@@ -265,18 +265,18 @@ it('flags debug mode only when it is on in production', function () {
 
     config(['app.debug' => false]);
     app()->detectEnvironment(fn () => 'production');
-    Cache::forget('dashboard_system_health');
+    Cache::forget('dashboard_system_health_checks');
     expect($row()['ok'])->toBeTrue()
         ->and($row()['detail'])->toBe('Disabled');
 
     config(['app.debug' => true]);
     app()->detectEnvironment(fn () => 'production');
-    Cache::forget('dashboard_system_health');
+    Cache::forget('dashboard_system_health_checks');
     expect($row()['ok'])->toBeFalse()
         ->and($row()['detail'])->toBe('Enabled');
 
     config(['app.debug' => true]);
     app()->detectEnvironment(fn () => 'local');
-    Cache::forget('dashboard_system_health');
+    Cache::forget('dashboard_system_health_checks');
     expect($row()['ok'])->toBeTrue();
 });

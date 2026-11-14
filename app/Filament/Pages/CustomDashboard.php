@@ -41,11 +41,17 @@ class CustomDashboard extends Dashboard
         $isAdmin = $user?->isAdmin() ?? false;
 
         $actions = [
-            Action::make('new_playlist')
-                ->label(__('New Playlist'))
-                ->icon('heroicon-m-plus')
-                ->url(PlaylistResource::getUrl('create'))
+            Action::make('manage_playlists')
+                ->label(__('Easy Editor'))
+                ->icon('heroicon-m-sparkles')
+                ->url(EasyEditor::getUrl())
                 ->color('primary'),
+            Action::make('sports_games')
+                ->label(__('Sports'))
+                ->icon('heroicon-m-trophy')
+                ->url(SportsGames::getUrl())
+                ->color('danger')
+                ->visible(fn (): bool => SportsGames::canAccess()),
             Action::make('playlists')
                 ->label(__('Playlists'))
                 ->icon('heroicon-m-play-pause')

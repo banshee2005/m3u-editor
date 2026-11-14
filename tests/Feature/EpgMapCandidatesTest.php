@@ -86,6 +86,23 @@ it('builds candidate rows for unresolved channels via the job', function () {
         ->and($map->refresh()->candidates_built_at)->not->toBeNull();
 });
 
+it('uses the default quality indicators when the custom list is left empty, like the mapping job', function () {
+    candidatesEpgChannel([
+        'name' => 'Sports Central',
+        'display_name' => 'Sports Central',
+        'channel_id' => 'sports-central.us',
+    ]);
+    $channel = candidatesChannel('Sports Central HD');
+
+    // An empty TagsInput saves [], which the form documents as "use the
+    // built-in defaults" rather than "strip nothing"
+    $map = candidatesMap(['remove_quality_indicators' => true, 'quality_indicators' => []]);
+
+    (new BuildEpgMapCandidatesJob($map->id))->handle();
+
+    expect($map->candidates()->where('channel_id', $channel->id)->value('normalized_name'))->toBe('sports central');
+});
+
 it('clears candidates_building on the early-return path when the map is no longer reviewable', function () {
     $map = candidatesMap(['remove_quality_indicators' => true]);
     $map->update(['candidates_building' => true]);
@@ -363,6 +380,55 @@ it('applies the top candidate for a row via the apply action', function () {
         ->and($rows->first()->refresh()->status)->toBe(EpgMapCandidateStatus::Applied)
         ->and($channelB->refresh()->epg_channel_id)->toBeNull()
         ->and($rows->last()->refresh()->status)->toBe(EpgMapCandidateStatus::Pending);
+});
+
+it('applies a candidate offered from a merged epg source by saving its channel mapping', function () {
+    $this->actingAs($this->user);
+
+    $sourceEpg = Epg::withoutEvents(fn () => Epg::factory()->for($this->user)->create(['is_merged' => false]));
+    $mergedEpg = Epg::withoutEvents(fn () => Epg::factory()->for($this->user)->create(['is_merged' => true]));
+    $mergedEpg->sourceEpgs()->attach($sourceEpg->id, ['sort_order' => 0]);
+
+    $match = EpgChannel::factory()->for($sourceEpg)->for($this->user)->create([
+        'name' => 'ESPN News',
+        'display_name' => 'ESPN News',
+        'channel_id' => 'espnews.us',
+    ]);
+
+    $channel = Channel::factory()
+        ->for($this->playlist)
+        ->for($this->user)
+        ->for($this->group)
+        ->create([
+            'name' => 'ESPN News HD',
+            'title' => 'ESPN News HD',
+            'stream_id' => 'espn-news-hd',
+            'epg_map_enabled' => true,
+            'is_vod' => false,
+        ]);
+
+    $map = EpgMap::factory()->create([
+        'user_id' => $this->user->id,
+        'epg_id' => $mergedEpg->id,
+        'playlist_id' => $this->playlist->id,
+        'status' => 'completed',
+        'settings' => ['remove_quality_indicators' => true],
+    ]);
+
+    (new BuildEpgMapCandidatesJob($map->id))->handle();
+
+    $row = $map->candidates()->orderBy('id')->first();
+    expect($row->epg_channel_id)->toBe($match->id);
+
+    Livewire::test(CandidatesRelationManager::class, [
+        'ownerRecord' => $map,
+        'pageClass' => ViewEpgMap::class,
+    ])
+        ->callAction(TestAction::make('apply')->table($row))
+        ->assertNotified();
+
+    expect($channel->refresh()->epg_channel_id)->toBe($match->id)
+        ->and($row->refresh()->status)->toBe(EpgMapCandidateStatus::Applied);
 });
 
 it('mounts the candidates relation manager for a different-user map without throwing', function () {

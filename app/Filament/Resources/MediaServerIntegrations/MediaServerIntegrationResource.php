@@ -5,6 +5,7 @@ namespace App\Filament\Resources\MediaServerIntegrations;
 use App\Exceptions\MediaServerException;
 use App\Facades\PlaylistFacade;
 use App\Facades\ProxyFacade;
+use App\Filament\Clusters\MediaServers\MediaServersCluster;
 use App\Filament\Concerns\HasCopilotSupport;
 use App\Filament\Resources\MediaServerIntegrations\Pages\CreateMediaServerIntegration;
 use App\Filament\Resources\MediaServerIntegrations\Pages\EditMediaServerIntegration;
@@ -23,6 +24,7 @@ use App\Models\Playlist;
 use App\Models\Season;
 use App\Models\Series;
 use App\Services\AIOStreamsService;
+use App\Services\EmbyJellyfinService;
 use App\Services\MediaServerService;
 use App\Services\PlexManagementService;
 use App\Services\TmdbService;
@@ -45,6 +47,7 @@ use Filament\Forms\Components\Select;
 use Filament\Forms\Components\TagsInput;
 use Filament\Forms\Components\TextInput;
 use Filament\Forms\Components\Toggle;
+use Filament\Forms\Components\ToggleButtons;
 use Filament\Notifications\Notification;
 use Filament\Resources\Resource;
 use Filament\Schemas\Components\Actions;
@@ -57,6 +60,7 @@ use Filament\Schemas\Components\Utilities\Get;
 use Filament\Schemas\Components\Utilities\Set;
 use Filament\Schemas\Components\Wizard\Step;
 use Filament\Schemas\Schema;
+use Filament\Support\Exceptions\Halt;
 use Filament\Tables;
 use Filament\Tables\Columns\TextColumn;
 use Filament\Tables\Columns\ToggleColumn;
@@ -78,27 +82,25 @@ class MediaServerIntegrationResource extends Resource implements CopilotResource
 
     protected static ?string $recordTitleAttribute = 'name';
 
+    protected static ?string $cluster = MediaServersCluster::class;
+
+    // Prefixed by the cluster: the admin URL is /media-server-integrations/servers.
+    protected static ?string $slug = 'servers';
+
     public static function getNavigationLabel(): string
     {
-        return __('Servers');
+        return __('Media Servers');
     }
 
     public static function getModelLabel(): string
     {
-        return __('Server');
+        return __('Media Server');
     }
 
     public static function getPluralModelLabel(): string
     {
-        return __('Servers');
+        return __('Media Servers');
     }
-
-    public static function getNavigationGroup(): ?string
-    {
-        return __('Integrations');
-    }
-
-    protected static ?int $navigationSort = 100;
 
     /**
      * Check if the user can access this page.
@@ -241,14 +243,7 @@ class MediaServerIntegrationResource extends Resource implements CopilotResource
 
                             Select::make('type')
                                 ->label(__('Server Type'))
-                                ->options([
-                                    'emby' => 'Emby',
-                                    'jellyfin' => 'Jellyfin',
-                                    'plex' => 'Plex',
-                                    'local' => 'Local Media',
-                                    'webdav' => 'WebDAV',
-                                    'aiostreams' => 'AIOStreams',
-                                ])
+                                ->options(self::typeOptions())
                                 ->required()
                                 ->default('emby')
                                 ->live()
@@ -267,6 +262,7 @@ class MediaServerIntegrationResource extends Resource implements CopilotResource
                         // Network server configuration (hidden for local media)
                         Grid::make(3)->schema([
                             TextInput::make('host')
+                                ->extraInputAttributes(['class' => 'privacy-sensitive'])
                                 ->label(__('Host / IP Address'))
                                 ->prefix(fn (callable $get) => $get('ssl') ? 'https://' : 'http://')
                                 ->placeholder(fn (callable $get) => $get('type') === 'webdav'
@@ -312,6 +308,7 @@ class MediaServerIntegrationResource extends Resource implements CopilotResource
 
                         // AIOStreams manifest URL
                         TextInput::make('manifest_url')
+                            ->extraInputAttributes(['class' => 'privacy-sensitive'])
                             ->label(__('Manifest URL'))
                             ->url()
                             ->placeholder('https://your-aiostreams-instance.com/stremio/uuid/token/manifest.json')
@@ -328,6 +325,7 @@ class MediaServerIntegrationResource extends Resource implements CopilotResource
                         // WebDAV authentication (username/password)
                         Grid::make(2)->schema([
                             TextInput::make('webdav_username')
+                                ->extraInputAttributes(['class' => 'privacy-sensitive'])
                                 ->label(__('WebDAV Username'))
                                 ->placeholder(__('username'))
                                 ->afterStateHydrated(fn ($component, $record) => $component->state($record?->webdav_username))
@@ -360,14 +358,48 @@ class MediaServerIntegrationResource extends Resource implements CopilotResource
                             ->visible(fn (callable $get) => $get('type') === 'webdav')
                             ->fullWidth(),
 
+                        ToggleButtons::make('auth_method')
+                            ->label(__('Authentication'))
+                            ->grouped()
+                            ->options([
+                                'api_key' => __('API Key'),
+                                'user' => __('Username & Password'),
+                            ])
+                            ->default('api_key')
+                            ->inline()
+                            ->live()
+                            ->helperText(fn (callable $get) => $get('auth_method') === 'user'
+                                ? __('Sign in with any server user account. Syncing and scheduled syncs work fully with a regular user. An admin API key is only needed for Managed Libraries and for the "Scan media server library after sync" option in Stream File Settings.')
+                                : __('Use an API key created by a server administrator.'))
+                            ->visible(fn (callable $get) => in_array($get('type'), ['emby', 'jellyfin'], true)),
+
+                        Grid::make(2)->schema([
+                            TextInput::make('server_username')
+                                ->label(__('Username'))
+                                ->required()
+                                ->maxLength(255)
+                                ->autocomplete('off'),
+
+                            TextInput::make('server_password')
+                                ->label(__('Password'))
+                                ->password()
+                                ->revealable()
+                                ->autocomplete('new-password')
+                                ->required(fn (callable $get, ?MediaServerIntegration $record): bool => self::requiresServerPassword($get('server_username'), $record))
+                                ->helperText(fn (?MediaServerIntegration $record) => $record?->usesUserLogin()
+                                    ? __('Leave blank to keep the current session. The password is only used to sign in and is never stored.')
+                                    : __('Only used to sign in. The password is never stored.')),
+                        ])->visible(fn (callable $get) => self::isUserLoginSelected($get)),
+
                         TextInput::make('api_key')
                             ->label(__('API Key/Token'))
                             ->password()
                             ->revealable()
-                            ->required(fn (string $operation, callable $get): bool => $operation === 'create' && ! in_array($get('type'), ['local', 'webdav', 'aiostreams']))
+                            ->required(fn (string $operation, callable $get, ?MediaServerIntegration $record): bool => ! in_array($get('type'), ['local', 'webdav', 'aiostreams'])
+                                && ($operation === 'create' || (bool) $record?->usesUserLogin()))
                             ->dehydrateStateUsing(fn ($state, $record) => filled($state) ? $state : $record?->api_key)
-                            ->helperText(function (string $operation, callable $get) {
-                                if ($operation === 'edit') {
+                            ->helperText(function (string $operation, callable $get, ?MediaServerIntegration $record) {
+                                if ($operation === 'edit' && ! $record?->usesUserLogin()) {
                                     return 'Leave blank to keep existing API key';
                                 }
 
@@ -376,7 +408,8 @@ class MediaServerIntegrationResource extends Resource implements CopilotResource
                                     'local', 'webdav' => 'Not required for local media or WebDAV',
                                     default => 'Generate an API key in your media server\'s dashboard under Settings → API Keys',
                                 };
-                            })->visible(fn (callable $get) => ! in_array($get('type'), ['local', 'webdav', 'aiostreams'])),
+                            })->visible(fn (callable $get) => ! in_array($get('type'), ['local', 'webdav', 'aiostreams'])
+                                && ! self::isUserLoginSelected($get)),
 
                         Actions::make(self::getServerActions())
                             ->visible(fn (callable $get) => ! in_array($get('type'), ['local', 'webdav', 'aiostreams']))
@@ -573,7 +606,11 @@ class MediaServerIntegrationResource extends Resource implements CopilotResource
 
                                 $options = [];
                                 foreach ($libraries as $library) {
-                                    $typeLabel = $library['type'] === 'movies' ? 'Movies' : 'TV Shows';
+                                    $typeLabel = match ($library['type'] ?? null) {
+                                        'movies' => __('Movies'),
+                                        'tvshows' => __('TV Shows'),
+                                        default => __('Mixed'),
+                                    };
                                     $itemCount = $library['item_count'] > 0 ? " ({$library['item_count']} items)" : '';
                                     $options[$library['id']] = "{$library['name']} [{$typeLabel}]{$itemCount}";
                                 }
@@ -656,7 +693,7 @@ class MediaServerIntegrationResource extends Resource implements CopilotResource
                             ->afterStateUpdated(function (bool $state, callable $get, callable $set, $record) {
                                 if (! $state) {
                                     $catalogs = $get('aiostreams_catalogs') ?? $record?->aiostreams_catalogs ?? [];
-                                    $set('aiostreams_selected_catalog_ids', collect($catalogs)->pluck('id', 'type')->map(fn ($id, $type) => "{$id}_{$type}")->all());
+                                    $set('aiostreams_selected_catalog_ids', collect($catalogs)->map(MediaServerIntegration::aiostreamsCatalogKey(...))->values()->all());
                                 } else {
                                     $set('aiostreams_selected_catalog_ids', null);
                                 }
@@ -670,7 +707,7 @@ class MediaServerIntegrationResource extends Resource implements CopilotResource
                                 $options = [];
                                 foreach ($catalogs as $catalog) {
                                     $typeLabel = $catalog['type'] === 'series' ? 'Series' : 'Movie';
-                                    $composite = $catalog['id'].'_'.$catalog['type'];
+                                    $composite = MediaServerIntegration::aiostreamsCatalogKey($catalog);
                                     $options[$composite] = "{$catalog['name']} [{$typeLabel}]";
                                 }
 
@@ -960,11 +997,11 @@ class MediaServerIntegrationResource extends Resource implements CopilotResource
                                                     $baseUrl = ProxyFacade::getBaseUrl();
                                                     $uuid = $playlist->uuid;
 
-                                                    $playlistAuth = method_exists($playlist, 'playlistAuths')
-                                                        ? $playlist->playlistAuths()->where('enabled', true)->first()
-                                                        : null;
-                                                    $hdhrAuthPath = $playlistAuth
-                                                        ? '/'.rawurlencode($playlistAuth->username).'/'.rawurlencode($playlistAuth->password)
+                                                    // Same credentials the playlist's own HDHR URL carries
+                                                    // (a Playlist Auth, or the Custom Password login)
+                                                    $credentials = PlaylistFacade::getOutputCredentials($playlist);
+                                                    $hdhrAuthPath = $credentials
+                                                        ? '/'.rawurlencode($credentials->username).'/'.rawurlencode($credentials->password)
                                                         : '';
 
                                                     $set('hdhr_base_url', $baseUrl."/{$uuid}/hdhr{$hdhrAuthPath}");
@@ -986,10 +1023,12 @@ class MediaServerIntegrationResource extends Resource implements CopilotResource
                                                     return $playlist && $value !== 'number';
                                                 }),
                                             TextInput::make('hdhr_base_url')
+                                                ->extraInputAttributes(['class' => 'privacy-sensitive'])
                                                 ->label(__('HDHR Base URL'))
                                                 ->helperText(__('This URL must be reachable from your Plex server. Uses the Proxy URL Override or APP_URL. Adjust if Plex reaches m3u-editor via a different address (e.g. Docker internal IP).'))
                                                 ->required(),
                                             TextInput::make('epg_url')
+                                                ->extraInputAttributes(['class' => 'privacy-sensitive'])
                                                 ->label(__('EPG URL'))
                                                 ->helperText(__('XMLTV EPG guide URL. Must also be reachable from Plex. Adjust if needed.'))
                                                 ->required(),
@@ -1199,6 +1238,7 @@ class MediaServerIntegrationResource extends Resource implements CopilotResource
                     ->description(__('Create live TV channels from your media server content'))
                     ->schema([
                         TextInput::make('networks_playlist_url')
+                            ->extraInputAttributes(['class' => 'privacy-sensitive'])
                             ->label(__('Networks Playlist URL'))
                             ->disabled()
                             ->dehydrated(false)
@@ -1221,6 +1261,7 @@ class MediaServerIntegrationResource extends Resource implements CopilotResource
                             ->helperText(__('M3U playlist containing all your Networks as live channels')),
 
                         TextInput::make('networks_epg_url')
+                            ->extraInputAttributes(['class' => 'privacy-sensitive'])
                             ->label(__('Networks EPG URL'))
                             ->disabled()
                             ->dehydrated(false)
@@ -1261,10 +1302,27 @@ class MediaServerIntegrationResource extends Resource implements CopilotResource
         ];
     }
 
+    /**
+     * Integration types and their labels, shared by the form, the table's
+     * type badge and its filter so the three can't drift apart.
+     *
+     * @return array<string, string>
+     */
+    public static function typeOptions(): array
+    {
+        return array_filter([
+            'emby' => 'Emby',
+            'jellyfin' => __('Jellyfin (and compatible APIs)'),
+            'plex' => 'Plex',
+            'local' => 'Local Media',
+            'webdav' => 'WebDAV',
+            'aiostreams' => config('services.aiostreams.enabled', true) ? 'AIOStreams' : null,
+        ]);
+    }
+
     public static function table(Table $table): Table
     {
         return $table
-            ->heading(__('Media Servers'))
             ->headerActions([
                 CreateAction::make()
                     ->label(__('Add Media Server')),
@@ -1314,12 +1372,7 @@ class MediaServerIntegrationResource extends Resource implements CopilotResource
                 TextColumn::make('type')
                     ->label(__('Type'))
                     ->badge()
-                    ->formatStateUsing(fn (string $state): string => match ($state) {
-                        'local' => 'Local Media',
-                        'webdav' => 'WebDAV',
-                        'aiostreams' => 'AIOStreams',
-                        default => ucfirst($state),
-                    })
+                    ->formatStateUsing(fn (string $state): string => self::typeOptions()[$state] ?? ucfirst($state))
                     ->color(fn (string $state): string => match ($state) {
                         'emby' => 'success',
                         'jellyfin' => 'info',
@@ -1331,6 +1384,7 @@ class MediaServerIntegrationResource extends Resource implements CopilotResource
                     }),
 
                 TextColumn::make('host')
+                    ->extraAttributes(['class' => 'privacy-sensitive'])
                     ->label(__('Server'))
                     ->getStateUsing(function ($record): string {
                         if ($record->type === 'local') {
@@ -1427,12 +1481,7 @@ class MediaServerIntegrationResource extends Resource implements CopilotResource
             ])
             ->filters([
                 Tables\Filters\SelectFilter::make('type')
-                    ->options([
-                        'emby' => 'Emby',
-                        'jellyfin' => 'Jellyfin',
-                        'plex' => 'Plex',
-                        'local' => 'Local Media',
-                    ]),
+                    ->options(self::typeOptions()),
                 Tables\Filters\TernaryFilter::make('enabled')
                     ->label(__('Enabled')),
             ])
@@ -1635,9 +1684,9 @@ class MediaServerIntegrationResource extends Resource implements CopilotResource
                             // Optionally delete the associated playlist
                             // For now, we leave the playlist intact (sidecar philosophy)
                         }),
-                ])->button()->hiddenLabel()->size('sm'),
+                ])->button()->hiddenLabel()->size('sm')->tooltip(__('Open action menu')),
                 EditAction::make()
-                    ->button()->hiddenLabel()->size('sm'),
+                    ->button()->hiddenLabel()->size('sm')->tooltip(__('Edit media server')),
             ], position: RecordActionsPosition::BeforeCells)
             ->toolbarActions([
                 BulkActionGroup::make([
@@ -1717,7 +1766,8 @@ class MediaServerIntegrationResource extends Resource implements CopilotResource
     public static function getEloquentQuery(): Builder
     {
         return parent::getEloquentQuery()
-            ->where('user_id', Auth::id());
+            ->where('user_id', Auth::id())
+            ->when(! config('services.aiostreams.enabled', true), fn (Builder $query) => $query->where('type', '!=', 'aiostreams'));
     }
 
     public static function flushLibraryContent(MediaServerIntegration $record): void
@@ -1997,6 +2047,23 @@ class MediaServerIntegrationResource extends Resource implements CopilotResource
                         'api_key' => $isWebDav ? null : ($get('api_key') ?: $livewire->record?->api_key),
                     ];
 
+                    if (self::isUserLoginSelected($get)) {
+                        $login = self::resolveUserLogin(
+                            $values,
+                            $get('server_username'),
+                            $get('server_password'),
+                            $livewire->record instanceof MediaServerIntegration ? $livewire->record : null,
+                        );
+
+                        if (! $login['success']) {
+                            self::notifySignInFailed($login['message']);
+
+                            return;
+                        }
+
+                        $values = array_merge($values, $login['attributes']);
+                    }
+
                     if (! $isWebDav && array_filter($values, fn ($value) => empty($value) && ! is_bool($value))) {
                         Notification::make()
                             ->danger()
@@ -2065,6 +2132,137 @@ class MediaServerIntegrationResource extends Resource implements CopilotResource
         ];
     }
 
+    /**
+     * Whether the form has an Emby/Jellyfin integration set to sign in with
+     * a username and password.
+     */
+    private static function isUserLoginSelected(callable $get): bool
+    {
+        return in_array($get('type'), ['emby', 'jellyfin'], true) && $get('auth_method') === 'user';
+    }
+
+    private static function notifySignInFailed(string $message): void
+    {
+        Notification::make()
+            ->danger()
+            ->title(__('Sign In Failed'))
+            ->body($message)
+            ->send();
+    }
+
+    /**
+     * Whether a password must be entered to save an Emby/Jellyfin user
+     * login: always for a new login, and again when the username changes or
+     * the stored session token is missing.
+     */
+    public static function requiresServerPassword(?string $username, ?MediaServerIntegration $record): bool
+    {
+        return ! $record?->usesUserLogin()
+            || blank($record->api_key)
+            || mb_strtolower((string) $username) !== mb_strtolower((string) $record->server_username);
+    }
+
+    /**
+     * Sign in to Emby/Jellyfin as a server user, or reuse the record's
+     * existing session when no new password is needed. Returns the model
+     * attributes to store; the password itself is never included.
+     *
+     * @param  array{type: string, host: mixed, port: mixed, ssl: mixed}  $connection
+     * @return array{success: bool, message: string, attributes: array<string, string>}
+     */
+    public static function resolveUserLogin(array $connection, ?string $username, ?string $password, ?MediaServerIntegration $record): array
+    {
+        if (blank($username)) {
+            return ['success' => false, 'message' => __('Enter the server username.'), 'attributes' => []];
+        }
+
+        if (blank($password)) {
+            if (self::requiresServerPassword($username, $record)) {
+                return ['success' => false, 'message' => __('Enter the password to sign in.'), 'attributes' => []];
+            }
+
+            return [
+                'success' => true,
+                'message' => '',
+                'attributes' => [
+                    'api_key' => (string) $record->api_key,
+                    'auth_method' => 'user',
+                    'server_username' => (string) $record->server_username,
+                    'server_user_id' => (string) $record->server_user_id,
+                ],
+            ];
+        }
+
+        $connectionIntegration = (new MediaServerIntegration)->forceFill(array_merge($connection, ['id' => $record?->id]));
+        $login = EmbyJellyfinService::authenticateByName($connectionIntegration, $username, $password);
+
+        if (! $login['success']) {
+            return ['success' => false, 'message' => $login['message'], 'attributes' => []];
+        }
+
+        return [
+            'success' => true,
+            'message' => $login['message'],
+            'attributes' => [
+                'api_key' => $login['access_token'],
+                'auth_method' => 'user',
+                'server_username' => $username,
+                'server_user_id' => $login['user_id'],
+            ],
+        ];
+    }
+
+    /**
+     * Normalize the authentication fields before an integration is saved.
+     * API-key integrations clear any user-login state. User-login
+     * integrations exchange the entered password for a session token, and
+     * the save is halted with a notification if sign-in fails.
+     *
+     * @param  array<string, mixed>  $data
+     * @return array<string, mixed>
+     *
+     * @throws Halt
+     */
+    public static function applyAuthMethod(array $data, ?MediaServerIntegration $record = null): array
+    {
+        $password = $data['server_password'] ?? null;
+        unset($data['server_password']);
+
+        $type = $data['type'] ?? $record?->type;
+
+        if (! in_array($type, ['emby', 'jellyfin'], true)) {
+            return $data;
+        }
+
+        if (($data['auth_method'] ?? 'api_key') !== 'user') {
+            $data['auth_method'] = 'api_key';
+            $data['server_username'] = null;
+            $data['server_user_id'] = null;
+
+            return $data;
+        }
+
+        $login = self::resolveUserLogin(
+            [
+                'type' => $type,
+                'host' => $data['host'] ?? $record?->host,
+                'port' => $data['port'] ?? $record?->port,
+                'ssl' => $data['ssl'] ?? $record?->ssl ?? false,
+            ],
+            $data['server_username'] ?? null,
+            $password,
+            $record,
+        );
+
+        if (! $login['success']) {
+            self::notifySignInFailed($login['message']);
+
+            throw new Halt;
+        }
+
+        return array_merge($data, $login['attributes']);
+    }
+
     private static function getAIOStreamsTestAction(string $label = 'Test Connection & Fetch Catalogs'): array
     {
         return [
@@ -2098,7 +2296,7 @@ class MediaServerIntegrationResource extends Resource implements CopilotResource
                         $set('aiostreams_catalogs', $catalogs);
 
                         // Auto-select any catalog IDs not already in the selection
-                        $newIds = collect($catalogs)->pluck('id', 'type')->map(fn ($id, $type) => "{$id}_{$type}")->all();
+                        $newIds = collect($catalogs)->map(MediaServerIntegration::aiostreamsCatalogKey(...))->values()->all();
                         $existingSelected = $get('aiostreams_selected_catalog_ids') ?? [];
                         $merged = array_values(array_unique(array_merge($existingSelected, $newIds)));
                         $set('aiostreams_selected_catalog_ids', $merged);

@@ -11,8 +11,11 @@ use App\Models\Playlist;
 use App\Models\PlaylistProfile;
 use App\Models\StreamProfile;
 use App\Services\M3uProxyService;
+use App\Services\MediaSourcePreferenceService;
 use App\Services\NetworkBroadcastService;
+use App\Services\PlaylistService;
 use App\Services\ProfileService;
+use App\Services\StreamHistoryRecorder;
 use App\Services\StreamProfileRuleEvaluator;
 use App\Settings\GeneralSettings;
 use Exception;
@@ -39,6 +42,8 @@ class M3uProxyApiController extends Controller
             'customPlaylist',
             'streamProfile',
         ])->findOrFail($id);
+
+        [$channel, $uuid] = $this->preferMediaServerSource($request, $channel, $uuid);
 
         $username = $request->input('username', $request->header('X-Username'));
         $playlistAuthId = $request->input('playlist_auth_id') ? (int) $request->input('playlist_auth_id') : null;
@@ -92,7 +97,15 @@ class M3uProxyApiController extends Controller
                 $playlistAuthId
             );
 
-        return redirect($url);
+        $response = redirect($this->appendClientId($url, $request));
+
+        // Seeking catchup players re-request this URL for every Range probe; let them reuse
+        // the redirect briefly so those probes go straight to the proxy stream.
+        if (PlaylistService::isTimeshiftRequest($request)) {
+            $response->setPrivate()->setMaxAge(M3uProxyService::TIMESHIFT_REDIRECT_MAX_AGE);
+        }
+
+        return $response;
     }
 
     /**
@@ -107,6 +120,8 @@ class M3uProxyApiController extends Controller
         $episode = Episode::query()->with([
             'playlist',
         ])->findOrFail($id);
+
+        [$episode, $uuid] = $this->preferMediaServerSource($request, $episode, $uuid);
 
         $username = $request->input('username', $request->header('X-Username'));
         $playlistAuthId = $request->input('playlist_auth_id') ? (int) $request->input('playlist_auth_id') : null;
@@ -152,7 +167,7 @@ class M3uProxyApiController extends Controller
                 $playlistAuthId
             );
 
-        return redirect($url);
+        return redirect($this->appendClientId($url, $request));
     }
 
     /**
@@ -169,6 +184,8 @@ class M3uProxyApiController extends Controller
             'customPlaylist',
             'streamProfile',
         ])->findOrFail($id);
+
+        [$channel, $uuid] = $this->preferMediaServerSource($request, $channel, $uuid);
 
         if ($uuid) {
             $playlist = PlaylistFacade::resolvePlaylistByUuid($uuid);
@@ -216,6 +233,8 @@ class M3uProxyApiController extends Controller
         $episode = Episode::query()->with([
             'playlist',
         ])->findOrFail($id);
+
+        [$episode, $uuid] = $this->preferMediaServerSource($request, $episode, $uuid);
 
         if ($uuid) {
             $playlist = PlaylistFacade::resolvePlaylistByUuid($uuid);
@@ -351,6 +370,9 @@ class M3uProxyApiController extends Controller
         if (isset($metadata['provider_profile_id'])) {
             $this->handleProfileConnectionTracking($eventType, $streamId, $metadata);
         }
+
+        // Proxy > Watch History (a no-op unless turned on in Settings > Proxy)
+        app(StreamHistoryRecorder::class)->handleWebhook($eventType, $streamId, $data);
 
         // Invalidate caches based on event type
         switch ($eventType) {
@@ -820,13 +842,17 @@ class M3uProxyApiController extends Controller
     /**
      * Append a client_id query parameter to a URL if the request contains one.
      *
-     * Each browser tab supplies a unique client_id so the proxy can maintain a
-     * separate stream_clients entry per tab, preventing collisions when multiple
-     * tabs on the same machine watch the same stream.
+     * Each browser tab (and each m3u-tv playback session) supplies a unique client_id
+     * so the proxy can maintain a separate stream_clients entry per player, preventing
+     * collisions when several players on the same machine watch the same stream, and
+     * so the player can later stop exactly its own stream (see stopPlayerStream()).
+     * Only IDs in the format the stop endpoints accept are forwarded.
      */
     private function appendClientId(string $url, Request $request): string
     {
-        if ($clientId = $request->input('client_id')) {
+        $clientId = $request->input('client_id');
+
+        if (is_string($clientId) && preg_match('/^[\w-]{1,128}$/', $clientId)) {
             $separator = str_contains($url, '?') ? '&' : '?';
             $url .= $separator.'client_id='.rawurlencode($clientId);
         }
@@ -880,5 +906,39 @@ class M3uProxyApiController extends Controller
         }
 
         return response()->noContent();
+    }
+
+    /**
+     * Media-server source preference: swap a provider VOD movie / episode for
+     * its matched media-server item, streamed with its own playlist context.
+     * The swap must happen before anything reaches M3uProxyService so no
+     * provider connection slot is consumed; the request uuid is dropped
+     * because alias/merged-playlist transforms don't apply to the media item.
+     *
+     * The item the client asked for is recorded on the request first, since the
+     * TV app stops its stream by that id (see M3uProxyService::getChannelUrl's
+     * requested_channel_id). The timeshift route records its own before swapping
+     * to a catchup failover, so an existing value is kept.
+     *
+     * @return array{0: Channel|Episode, 1: string|null}
+     */
+    private function preferMediaServerSource(Request $request, Channel|Episode $item, ?string $uuid): array
+    {
+        $requestedKey = $item instanceof Channel ? 'requested_channel_id' : 'requested_episode_id';
+        if (! $request->attributes->has($requestedKey)) {
+            $request->attributes->set($requestedKey, $item->id);
+        }
+
+        $media = app(MediaSourcePreferenceService::class)->resolveForStreaming($item);
+
+        if ($media === $item) {
+            return [$item, $uuid];
+        }
+
+        if ($media instanceof Channel) {
+            $media->loadMissing(['customPlaylist', 'streamProfile']);
+        }
+
+        return [$media, null];
     }
 }

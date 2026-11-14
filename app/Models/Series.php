@@ -8,6 +8,7 @@ use App\Jobs\FetchTmdbIds;
 use App\Jobs\SyncSeriesStrmFiles;
 use App\Services\XtreamService;
 use App\Settings\GeneralSettings;
+use App\Support\TmdbEnrichment;
 use Carbon\Carbon;
 use Filament\Notifications\Notification;
 use Illuminate\Database\Eloquent\Builder;
@@ -115,6 +116,29 @@ class Series extends Model
     }
 
     /**
+     * Season metadata after a provider refresh: the provider's season info when it sent
+     * any, keeping the TMDB season trailer the provider doesn't carry. FetchTmdbIds only
+     * revisits a season while its episodes still lack TMDB ids, so a trailer dropped here
+     * would otherwise never come back.
+     *
+     * @param  array<string, mixed>|null  $existing
+     * @param  array<string, mixed>  $seasonInfo
+     * @return array<string, mixed>|null
+     */
+    private static function mergeSeasonMetadata(?array $existing, array $seasonInfo): ?array
+    {
+        if ($seasonInfo === []) {
+            return $existing;
+        }
+
+        if (blank($seasonInfo['youtube_trailer'] ?? null) && filled($existing['youtube_trailer'] ?? null)) {
+            $seasonInfo['youtube_trailer'] = $existing['youtube_trailer'];
+        }
+
+        return $seasonInfo;
+    }
+
+    /**
      * Resolve provider season metadata by its explicit season number.
      *
      * Xtream providers commonly return seasons as a zero-indexed JSON list,
@@ -169,6 +193,32 @@ class Series extends Model
         ];
     }
 
+    /**
+     * Provider-sourced series that no category listing returned this sync (the series was
+     * removed, or re-added under a new series_id). Every listed series is stamped with the
+     * batch by its provider category id, wherever it sits now, so this also covers series
+     * moved into a genre or custom category. Locally created series (DVR recordings, rows
+     * without a provider series or category id) are never included.
+     */
+    public function scopeNoLongerListed(Builder $query, string $batchNo): Builder
+    {
+        return $query->whereNotNull('source_series_id')
+            ->whereNotNull('source_category_id')
+            ->where('import_batch_no', '!=', $batchNo)
+            ->where('import_batch_no', '!=', 'dvr');
+    }
+
+    /**
+     * The US content rating (e.g. "TV-MA"): TMDB's first, then the rating a
+     * media server sync stored. Shared by get_series_info, tvshow.nfo and the view page.
+     */
+    public function getContentRating(): ?string
+    {
+        $rating = $this->metadata['content_rating'] ?? $this->metadata['official_rating'] ?? null;
+
+        return filled($rating) ? (string) $rating : null;
+    }
+
     public function scopeHasSeriesId(Builder $query): Builder
     {
         $isPgsql = config('database.connections.'.config('database.default').'.driver') === 'pgsql';
@@ -179,12 +229,15 @@ class Series extends Model
                 ->orWhereNotNull('imdb_id');
 
             if ($isPgsql) {
-                $q->orWhereRaw("metadata::jsonb ?? 'tmdb_id'")
-                    ->orWhereRaw("metadata::jsonb ?? 'tmdb'")
-                    ->orWhereRaw("metadata::jsonb ?? 'tvdb_id'")
-                    ->orWhereRaw("metadata::jsonb ?? 'tvdb'")
-                    ->orWhereRaw("metadata::jsonb ?? 'imdb_id'")
-                    ->orWhereRaw("metadata::jsonb ?? 'imdb'");
+                // ->>'key' (value), not ?? 'key' (key existence): a key can be present with a
+                // null/empty value (e.g. a prior failed enrichment), which should still count
+                // as "no ID" - the ?? operator would wrongly call that "has an ID" (issue #1645).
+                $q->orWhereRaw("metadata::jsonb->>'tmdb_id' IS NOT NULL AND metadata::jsonb->>'tmdb_id' != ''")
+                    ->orWhereRaw("metadata::jsonb->>'tmdb' IS NOT NULL AND metadata::jsonb->>'tmdb' != ''")
+                    ->orWhereRaw("metadata::jsonb->>'tvdb_id' IS NOT NULL AND metadata::jsonb->>'tvdb_id' != ''")
+                    ->orWhereRaw("metadata::jsonb->>'tvdb' IS NOT NULL AND metadata::jsonb->>'tvdb' != ''")
+                    ->orWhereRaw("metadata::jsonb->>'imdb_id' IS NOT NULL AND metadata::jsonb->>'imdb_id' != ''")
+                    ->orWhereRaw("metadata::jsonb->>'imdb' IS NOT NULL AND metadata::jsonb->>'imdb' != ''");
             }
         });
     }
@@ -199,15 +252,17 @@ class Series extends Model
             return $query;
         }
 
+        // ->>'key' (value), not ?? 'key' (key existence): stays the exact negation of
+        // scopeHasSeriesId() above instead of excluding rows that ought to match (issue #1645).
         return $query->where(function (Builder $q) {
             $q->whereNull('metadata')
                 ->orWhere(function (Builder $inner) {
-                    $inner->whereRaw("NOT (metadata::jsonb ?? 'tmdb_id')")
-                        ->whereRaw("NOT (metadata::jsonb ?? 'tmdb')")
-                        ->whereRaw("NOT (metadata::jsonb ?? 'tvdb_id')")
-                        ->whereRaw("NOT (metadata::jsonb ?? 'tvdb')")
-                        ->whereRaw("NOT (metadata::jsonb ?? 'imdb_id')")
-                        ->whereRaw("NOT (metadata::jsonb ?? 'imdb')");
+                    $inner->whereRaw("(metadata::jsonb->>'tmdb_id' IS NULL OR metadata::jsonb->>'tmdb_id' = '')")
+                        ->whereRaw("(metadata::jsonb->>'tmdb' IS NULL OR metadata::jsonb->>'tmdb' = '')")
+                        ->whereRaw("(metadata::jsonb->>'tvdb_id' IS NULL OR metadata::jsonb->>'tvdb_id' = '')")
+                        ->whereRaw("(metadata::jsonb->>'tvdb' IS NULL OR metadata::jsonb->>'tvdb' = '')")
+                        ->whereRaw("(metadata::jsonb->>'imdb_id' IS NULL OR metadata::jsonb->>'imdb_id' = '')")
+                        ->whereRaw("(metadata::jsonb->>'imdb' IS NULL OR metadata::jsonb->>'imdb' = '')");
                 });
         });
     }
@@ -257,7 +312,7 @@ class Series extends Model
         });
     }
 
-    public function fetchMetadata($refresh = false, $sync = true, bool $dispatchTmdb = true)
+    public function fetchMetadata($refresh = false, $sync = true, bool $dispatchTmdb = true, bool $preferTmdb = false)
     {
         // AIOStreams-backed series are resolved via ResolveAioStreamsSeries, not Xtream.
         if ($this->is_custom) {
@@ -313,13 +368,19 @@ class Series extends Model
                 // Use the provider-supplied timestamp when available; fall back to now + 24 hours
                 // so the freshness check treats this fetch as valid for one day.
                 $providerLastModified = isset($info['last_modified']) && $info['last_modified']
-                    ? Carbon::createFromTimestamp((int) $info['last_modified'])
+                    ? Carbon::createFromTimestamp((int) $info['last_modified'], config('app.timezone'))
                     : now()->addDay();
 
                 $update = [
                     'last_metadata_fetch' => now(),
                     'last_modified' => $providerLastModified,
-                    'metadata' => $info, // Store raw metadata
+                    // Store raw metadata, keeping TMDB-only enrichment (cast_list/clearlogo/
+                    // related_tmdb) the provider payload never carries.
+                    'metadata' => TmdbEnrichment::preserveOnProviderRefresh(
+                        $this->metadata,
+                        $info,
+                        $preferTmdb ? TmdbEnrichment::PREFERRED_SERIES_METADATA_KEYS : [],
+                    ),
                 ];
                 if ($refresh) {
                     $item = $detail['info'] ?? null;
@@ -338,6 +399,24 @@ class Series extends Model
                             'backdrop_path' => is_string($backdropPath) ? json_decode($backdropPath, true) : $backdropPath,
                             'youtube_trailer' => $item['youtube_trailer'] ?? null,
                         ]);
+
+                        // TMDB-owned columns on an enriched series keep their TMDB value.
+                        if ($preferTmdb && TmdbEnrichment::isEnriched($this->metadata)) {
+                            foreach (TmdbEnrichment::PREFERRED_SERIES_COLUMNS as $column) {
+                                if (! blank($this->{$column})) {
+                                    unset($update[$column]);
+                                }
+                            }
+                        }
+
+                        // A blank provider plot/cover doesn't wipe the one TMDB filled in.
+                        if (TmdbEnrichment::isTmdbChecked($this->metadata)) {
+                            foreach (TmdbEnrichment::TMDB_FILLED_KEYS as $column) {
+                                if (array_key_exists($column, $update) && blank($update[$column]) && ! blank($this->{$column})) {
+                                    unset($update[$column]);
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -386,7 +465,7 @@ class Series extends Model
                                 'cover_big' => $seasonInfo['cover_big'] ?? $playlistSeason->getRawOriginal('cover_big'),
                                 'series_id' => $this->id,
                                 'import_batch_no' => $batchNo,
-                                'metadata' => $seasonInfo ?: $playlistSeason->metadata,
+                                'metadata' => self::mergeSeasonMetadata($playlistSeason->metadata, $seasonInfo),
                             ]);
                         }
 
@@ -459,13 +538,16 @@ class Series extends Model
                     // (truncated/rate-limited answer, or a real removal - we can't tell which
                     // from one fetch) is left untouched rather than assumed gone. Only
                     // provider-sourced rows are ever considered, so locally created episodes
-                    // (DVR recordings, manual entries) are never touched.
+                    // (DVR recordings, manual entries) are never touched. Matched on the ids the
+                    // provider listed, not this run's import_batch_no: an overlapping fetch of the
+                    // same series re-stamps these rows, and would have them deleted as "stale".
                     $seasonsInResponse = array_map('intval', array_keys($eps));
-                    DB::transaction(function () use ($seasonsInResponse, $batchNo) {
+                    $episodeIdsInResponse = collect($eps)->flatten(1)->map(fn (array $ep) => (int) $ep['id'])->all();
+                    DB::transaction(function () use ($seasonsInResponse, $episodeIdsInResponse) {
                         $removedEpisodes = $this->episodes()
                             ->whereIn('season', $seasonsInResponse)
                             ->whereNotNull('source_episode_id')
-                            ->where('import_batch_no', '!=', $batchNo)
+                            ->whereNotIn('source_episode_id', $episodeIdsInResponse)
                             ->delete();
 
                         $removedSeasons = $this->seasons()

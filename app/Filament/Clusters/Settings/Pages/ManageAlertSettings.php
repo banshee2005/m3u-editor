@@ -28,7 +28,7 @@ class ManageAlertSettings extends BaseSettingsPage
 
     protected static ?string $slug = 'alerts';
 
-    protected static ?int $navigationSort = 11;
+    protected static ?int $navigationSort = 13;
 
     public static function getNavigationLabel(): string
     {
@@ -98,6 +98,7 @@ class ManageAlertSettings extends BaseSettingsPage
                                             ->helperText(__('When enabled, error-level log entries will be forwarded to your Discord channel.'))
                                             ->live(),
                                         TextInput::make('discord_webhook_url')
+                                            ->extraInputAttributes(['class' => 'privacy-sensitive'])
                                             ->label(__('Discord Webhook URL'))
                                             ->url()
                                             ->placeholder(__('https://discord.com/api/webhooks/...'))
@@ -206,6 +207,7 @@ HTML))
                                             ->visible(fn (Get $get): bool => (bool) $get('slack_alerts_enabled'))
                                             ->columnSpanFull(),
                                         TextInput::make('slack_webhook_url')
+                                            ->extraInputAttributes(['class' => 'privacy-sensitive'])
                                             ->label(__('Slack Webhook URL'))
                                             ->url()
                                             ->hintAction(
@@ -319,6 +321,9 @@ HTML))
                                         Toggle::make('alerts_on_import_failed')
                                             ->label(__('Notify on playlist import failures'))
                                             ->helperText(__('Sends an alert when a playlist sync fails entirely, e.g. all provider URLs were unreachable.')),
+                                        Toggle::make('alerts_on_sync_invalidated')
+                                            ->label(__('Notify on invalidated playlist syncs'))
+                                            ->helperText(__('Sends an alert when a playlist sync is canceled because it would have removed more channels, groups or series than the invalidation threshold allows.')),
                                     ]),
                             ]),
                     ]),

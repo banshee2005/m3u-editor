@@ -23,6 +23,8 @@
         $seriesRatingSuppressed = \App\Support\TmdbRating::isVoteCountBelowThreshold($record->metadata['vote_count'] ?? null);
         $clearLogo = $record->metadata['clearlogo'] ?? null;
         $castList = $record->metadata['cast_list'] ?? [];
+        $contentRating = $record->getContentRating();
+        $networkNames = collect($record->metadata['networks'] ?? [])->pluck('name')->filter()->values();
     @endphp
 
     @if ($backdropUrl)
@@ -68,6 +70,9 @@
 
                     {{-- Metadata Badges --}}
                     <div class="flex flex-wrap items-center gap-2 text-sm">
+                        @if ($record->import_batch_no === 'dvr')
+                            <x-dvr-recording-badge />
+                        @endif
                         @if ($record->release_date)
                             <span class="rounded-full bg-white/10 px-3 py-1">{{ $record->release_date }}</span>
                         @endif
@@ -96,6 +101,9 @@
                             {{ $record->enabled ? 'Enabled' : 'Disabled' }}
                         </span>
                     </div>
+
+                    {{-- Content rating (TMDB's, else the media server's) and networks --}}
+                    <x-content-rating-badges :rating="$contentRating" :names="$networkNames" icon="heroicon-m-tv" />
 
                     {{-- Plot --}}
                     @if ($record->plot)
@@ -195,6 +203,9 @@
                 {{-- Info --}}
                 <div class="flex-1 space-y-3">
                     <div class="flex flex-wrap items-center gap-2 text-sm">
+                        @if ($record->import_batch_no === 'dvr')
+                            <x-dvr-recording-badge />
+                        @endif
                         @if ($record->release_date)
                             <span class="rounded bg-gray-200 px-2 py-1 dark:bg-gray-700">{{ $record->release_date }}</span>
                         @endif
@@ -211,6 +222,9 @@
                             {{ $record->enabled ? 'Enabled' : 'Disabled' }}
                         </span>
                     </div>
+
+                    {{-- Content rating (TMDB's, else the media server's) and networks --}}
+                    <x-content-rating-badges :rating="$contentRating" :names="$networkNames" icon="heroicon-m-tv" />
 
                     @if ($record->plot)
                         <p class="text-gray-600 dark:text-gray-300">{{ Str::limit($record->plot, 300) }}</p>
@@ -231,8 +245,24 @@
         </div>
     @endif
 
-    {{-- Cast --}}
-    @include('filament.partials.cast-section', ['cast' => $castList, 'collapsed' => true])
+    {{-- Cast (clickable: each tile navigates to the actor's filmography page,
+         scoped to this playlist so it only shows items available locally) --}}
+    @php
+        // Detect the active panel without crashing when no panel context is
+        // available (e.g. Livewire tests that don't set up a Filament panel).
+        // Default to 'admin' so admin tests resolve the right Filmography class
+        // and admin ownership checks still run; production URLs pick up the
+        // real panel id.
+        $activePanelId = \Filament\Facades\Filament::getCurrentPanel()?->getId() ?? 'admin';
+        $isAdminPanel = $activePanelId === 'admin';
+    @endphp
+    @include('filament.partials.cast-section', [
+        'cast' => $castList,
+        'filmographyPage' => $isAdminPanel
+            ? \App\Filament\Pages\ActorFilmography::class
+            : \App\Filament\GuestPanel\Pages\GuestActorFilmography::class,
+        'playlistId' => $isAdminPanel ? ($record->playlist_id ?? null) : null,
+    ])
 
     {{-- Probed Stream Info (aggregated across episodes) --}}
     @include('filament.partials.probed-stream-info-series', ['record' => $record])

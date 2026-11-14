@@ -1221,6 +1221,7 @@ it('toggleBrowseGenre loads discover results filtered by genre', function () {
     expect($component->get('browseResults'))->toHaveCount(1);
     expect($component->get('browseResults.0.title'))->toBe('Action Movie');
     expect($component->get('browseLoading'))->toBeFalse();
+    expect($component->html())->toMatch('/<button(?=[^>]*wire:click="clearBrowse")(?=[^>]*\\bfi-btn\\b)[^>]*>/');
 });
 
 it('toggleBrowseGenre supports multiple genres with OR logic', function () {
@@ -1357,6 +1358,80 @@ it('requestFromDiscover shows warning when title cannot be resolved', function (
         ->call('requestFromDiscover', 99999, 'movie')
         ->assertSet('showDetail', false)
         ->assertNotified();
+});
+
+it('requestFromDiscover offers a destination selector when multiple instances resolve the same title (issue #1669)', function () {
+    $radarrA = ArrIntegration::factory()->radarr()->create([
+        'user_id' => $this->user->id,
+        'name' => 'A First',
+        'url' => 'http://radarr-a.test:7878',
+        'quality_profile_id' => 1,
+        'root_folder_path' => '/media/movies-sd',
+    ]);
+    $radarrB = ArrIntegration::factory()->radarr()->create([
+        'user_id' => $this->user->id,
+        'name' => 'Z Second',
+        'url' => 'http://radarr-b.test:7878',
+        'quality_profile_id' => 2,
+        'root_folder_path' => '/media/movies-uhd',
+    ]);
+
+    Http::fake([
+        'radarr-a.test*/api/v3/movie/lookup*' => Http::response([
+            ['tmdbId' => 27205, 'title' => 'Inception', 'year' => 2010, 'titleSlug' => 'inception'],
+        ], 200),
+        'radarr-b.test*/api/v3/movie/lookup*' => Http::response([
+            ['tmdbId' => 27205, 'title' => 'Inception', 'year' => 2010, 'titleSlug' => 'inception'],
+        ], 200),
+        '*/api/v3/movie*' => Http::response([], 200),
+        '*/api/v3/series*' => Http::response([], 200),
+    ]);
+
+    $component = Livewire::test(ArrSearch::class)
+        ->set('tmdbConfigured', true)
+        ->call('requestFromDiscover', 27205, 'movie');
+
+    expect($component->get('showDetail'))->toBeTrue()
+        ->and($component->get('detailCandidates'))->toHaveCount(2)
+        ->and($component->get('detailIntegrationId'))->toBe($radarrA->id)
+        ->and($component->get('detailResult.integrationName'))->toBe('A First');
+
+    $component->call('switchDetailIntegration', $radarrB->id);
+
+    expect($component->get('detailIntegrationId'))->toBe($radarrB->id)
+        ->and($component->get('detailResult.integrationName'))->toBe('Z Second')
+        // Switching keeps using the shared results/detail machinery, not a parallel identifier.
+        ->and($component->get('results.'.$component->get('detailIndex').'.integrationId'))->toBe($radarrB->id);
+});
+
+it('switchDetailIntegration ignores an integration id that was not among the resolved candidates', function () {
+    $radarrA = ArrIntegration::factory()->radarr()->create([
+        'user_id' => $this->user->id,
+        'name' => 'A First',
+        'url' => 'http://radarr-a.test:7878',
+    ]);
+    $unrelated = ArrIntegration::factory()->radarr()->create([
+        'user_id' => $this->user->id,
+        'name' => 'Unrelated',
+    ]);
+
+    Http::fake([
+        'radarr-a.test*/api/v3/movie/lookup*' => Http::response([
+            ['tmdbId' => 27205, 'title' => 'Inception', 'year' => 2010, 'titleSlug' => 'inception'],
+        ], 200),
+        '*/api/v3/movie*' => Http::response([], 200),
+        '*/api/v3/series*' => Http::response([], 200),
+    ]);
+
+    $component = Livewire::test(ArrSearch::class)
+        ->set('tmdbConfigured', true)
+        ->call('requestFromDiscover', 27205, 'movie');
+
+    expect($component->get('detailIntegrationId'))->toBe($radarrA->id);
+
+    $component->call('switchDetailIntegration', $unrelated->id);
+
+    expect($component->get('detailIntegrationId'))->toBe($radarrA->id);
 });
 
 it('fetchLibraryTmdbIds returns radarr movie tmdb ids with download status', function () {

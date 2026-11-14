@@ -3,20 +3,30 @@
 namespace App\Http\Controllers;
 
 use App\Enums\ChannelLogoType;
+use App\Enums\DefaultAuthMode;
 use App\Enums\PlaylistChannelId;
 use App\Facades\PlaylistFacade;
 use App\Facades\ProxyFacade;
 use App\Models\Channel;
 use App\Models\CustomPlaylist;
+use App\Models\MergedPlaylist;
 use App\Models\Network;
 use App\Models\Playlist;
 use App\Models\PlaylistAlias;
+use App\Models\PlaylistAuth;
+use App\Services\ChannelNumberSequence;
 use App\Services\PlaylistUrlService;
 use Illuminate\Http\Request;
 use Illuminate\Support\LazyCollection;
 
 class PlaylistGenerateController extends Controller
 {
+    /**
+     * Sub-channel tiebreak for custom playlist ordering: the pivot's minor when the
+     * pivot number is set (it overrides as a pair), else the channel's own minor.
+     */
+    private const CUSTOM_CHANNEL_MINOR_ORDER = 'COALESCE(CASE WHEN NULLIF(channel_custom_playlist.channel_number, 0) IS NOT NULL THEN channel_custom_playlist.channel_minor ELSE channels.channel_minor END, 0)';
+
     public function __invoke(Request $request, string $uuid)
     {
         // Fetch the playlist
@@ -28,6 +38,11 @@ class PlaylistGenerateController extends Controller
         // Handle network playlists separately
         if ($playlist instanceof Playlist && $playlist->is_network_playlist) {
             return $this->generateNetworkPlaylist($request, $playlist);
+        }
+
+        // Ensure M3U output is enabled
+        if ($response = $this->outputDisabledResponse($playlist->m3u_enabled)) {
+            return $response;
         }
 
         switch (class_basename($playlist)) {
@@ -48,35 +63,9 @@ class PlaylistGenerateController extends Controller
         }
 
         // Check auth
-        $auths = $playlist->playlistAuths()->where('enabled', true)->get();
-        // For PlaylistAlias, also check direct alias credentials as fallback
-        if ($auths->isEmpty() && $playlist instanceof PlaylistAlias) {
-            $auth = $playlist->authObject;
-            if ($auth) {
-                $auths = collect([$auth]);
-            }
-        }
-
-        $usedAuth = null;
-        if ($auths->isNotEmpty()) {
-            $authenticated = false;
-            foreach ($auths as $auth) {
-                $authUsername = $auth->username;
-                $authPassword = $auth->password;
-
-                if (
-                    $request->get('username') === $authUsername &&
-                    $request->get('password') === $authPassword
-                ) {
-                    $authenticated = true;
-                    $usedAuth = $auth;
-                    break;
-                }
-            }
-
-            if (! $authenticated) {
-                return response()->json(['Error' => 'Unauthorized'], 401);
-            }
+        [$authorized, $usedAuth] = $this->resolveOutputAuth($playlist, $request->get('username'), $request->get('password'));
+        if (! $authorized) {
+            return response()->json(['Error' => 'Unauthorized'], 401);
         }
 
         // Check if proxy enabled
@@ -98,8 +87,10 @@ class PlaylistGenerateController extends Controller
         // Get the base URL
         $baseUrl = ProxyFacade::getBaseUrl();
 
-        // Pre-compute MediaFlow stream URL rewrite flag (checked once, used per channel)
-        $mfRewriteEnabled = ! $proxyEnabled && PlaylistFacade::mediaFlowProxyEnabled()
+        // Pre-compute the global MediaFlow settings (checked once); whether it actually
+        // applies is decided per-channel below, since the proxy can be forced on for a
+        // single channel (or its source playlist) even when the playlist-level toggle is off.
+        $mediaFlowRewriteStreamUrls = PlaylistFacade::mediaFlowProxyEnabled()
             && (PlaylistFacade::getMediaFlowSettings()['mediaflow_proxy_rewrite_stream_urls'] ?? false);
 
         // Build the channel query
@@ -108,8 +99,8 @@ class PlaylistGenerateController extends Controller
 
         // Get all active channels
         return response()->stream(
-            function () use ($cursor, $baseUrl, $playlist, $proxyEnabled, $logoProxyEnabled, $type, $tvgTypeoutputEnabled, $usedAuth, $mfRewriteEnabled) {
-                // Set the auth details
+            function () use ($cursor, $baseUrl, $playlist, $proxyEnabled, $logoProxyEnabled, $type, $tvgTypeoutputEnabled, $usedAuth, $mediaFlowRewriteStreamUrls) {
+                // Set the auth details (no matched credentials means the public UUID login applies)
                 if ($usedAuth) {
                     $username = urlencode($usedAuth->username);
                     $password = urlencode($usedAuth->password);
@@ -121,9 +112,19 @@ class PlaylistGenerateController extends Controller
                 // Output the enabled channels
                 $epgUrl = route('epg.generate', ['uuid' => $playlist->uuid]);
                 echo "#EXTM3U x-tvg-url=\"$epgUrl\" \n";
-                $channelNumber = ($playlist->auto_channel_increment || $playlist->force_channel_numbering) ? $playlist->channel_start - 1 : 0;
+                $numberSequence = new ChannelNumberSequence($playlist);
                 $idChannelBy = $playlist->id_channel_by;
+                // Memoized by playlist_id so a batch of channels sharing the same source
+                // playlist (the common case) only resolves it once rather than per row.
+                $sourcePlaylistCache = [];
                 foreach ($cursor as $channel) {
+                    [$channelSourcePlaylist, $channelProxyEnabled, $channelMfRewriteEnabled] = self::resolveChannelProxyContext(
+                        $playlist,
+                        $channel,
+                        $proxyEnabled,
+                        $mediaFlowRewriteStreamUrls,
+                        $sourcePlaylistCache
+                    );
                     // Get the title and name
                     $title = $channel->title_custom ?? $channel->title;
                     $name = $channel->name_custom ?? $channel->name;
@@ -133,9 +134,7 @@ class PlaylistGenerateController extends Controller
                     $epgIconCustom = $channel->epg_icon_custom ?? null;
                     $isCustomContext = ($type === 'custom') || ($type === 'alias' && ! empty($playlist->custom_playlist_id));
 
-                    $channelNo = ($isCustomContext && ! empty($channel->pivot?->channel_number))
-                        ? (int) $channel->pivot->channel_number
-                        : $channel->channel;
+                    $channelNo = $channel->resolveChannelNumber($isCustomContext);
                     $timeshift = $channel->shift ?? 0;
                     $stationId = $channel->station_id ?? '';
                     $epgShift = $channel->tvg_shift ?? 0;
@@ -143,12 +142,10 @@ class PlaylistGenerateController extends Controller
                     // A group folded into a merged group reports the parent's name for
                     // all standard (non-custom) output. Custom playlists key their
                     // grouping off tags, handled just below, so leave those untouched.
-                    if (! $isCustomContext && ! empty($channel->merged_group_name)) {
+                    if (! $isCustomContext && $channel->merged_group_name !== null && $channel->merged_group_name !== '') {
                         $group = $channel->merged_group_name;
                     }
-                    if ($playlist->force_channel_numbering || (! $channelNo && ($playlist->auto_channel_increment || $idChannelBy === PlaylistChannelId::Number))) {
-                        $channelNo = ++$channelNumber;
-                    }
+                    $channelNo = $numberSequence->next($channelNo);
                     if ($isCustomContext) {
                         // We selected the custom tag name as `custom_group_name` when building the query
                         // It's a JSON field with translations, so decode and extract the 'en' locale
@@ -185,9 +182,8 @@ class PlaylistGenerateController extends Controller
                     $filename = parse_url($url, PHP_URL_PATH);
                     $extension = pathinfo($filename, PATHINFO_EXTENSION);
                     if (empty($extension)) {
-                        $sourcePlaylist = $channel->getEffectivePlaylist();
-                        if ($sourcePlaylist?->xtream) {
-                            $extension = $sourcePlaylist->xtream_config['output'] ?? 'ts'; // Default to 'ts' if not set
+                        if ($channelSourcePlaylist?->xtream) {
+                            $extension = $channelSourcePlaylist->xtream_config['output'] ?? 'ts'; // Default to 'ts' if not set
                         }
                     }
 
@@ -205,13 +201,26 @@ class PlaylistGenerateController extends Controller
                         if ($channel->is_vod) {
                             $urlPath = 'movie';
                             $extension = $channel->container_extension ?? 'mkv';
+                        } elseif ($channelProxyEnabled) {
+                            // The proxy may transcode the stream, so advertise the configured
+                            // output format instead of the raw provider extension.
+                            $extension = self::resolveProxyOutputFormat($channelSourcePlaylist, $playlist);
                         }
                         $url = $baseUrl."/{$urlPath}/{$username}/{$password}/".$channel->id.'.'.$extension;
-                    } elseif ($mfRewriteEnabled) {
+                    } elseif ($channelMfRewriteEnabled) {
                         // Raw URL mode: wrap the provider URL through MediaFlow Proxy
                         $url = PlaylistFacade::buildMediaFlowStreamUrl($url);
                     }
                     $url = rtrim($url, '.');
+
+                    // The catchup-source URL always points at our own endpoint when the proxy is
+                    // enabled, regardless of whether the main URL above used the internal Xtream
+                    // format, so its extension must independently reflect the proxy's configured
+                    // output format rather than reusing $extension (which is only proxy-aware
+                    // inside the $useInternalXtreamFormat branch).
+                    $catchupExtension = ($channelProxyEnabled && ! $channel->is_vod)
+                        ? self::resolveProxyOutputFormat($channelSourcePlaylist, $playlist)
+                        : $extension;
 
                     // Make sure TVG ID only contains characters and numbers
                     $tvgId = preg_replace(config('dev.tvgid.regex'), '', $tvgId);
@@ -219,27 +228,34 @@ class PlaylistGenerateController extends Controller
                     // Output the channel
                     $extInf = '#EXTINF:-1';
                     if (! $playlist->disable_catchup) {
-                        if ($channel->catchup) {
-                            $extInf .= " catchup=\"$channel->catchup\"";
-                        }
-
-                        // Determine the catchup-source to output.
                         // When the proxy is enabled, or when the channel URL is served via the
                         // internal Xtream format (default), we generate a catchup-source that
-                        // points to our own timeshift endpoint so catchup requests flow through
-                        // m3u-editor rather than going directly to the provider.
-                        // This also ensures catchup works for Xtream-imported channels that have
-                        // tv_archive=1 but no catchup_source URL template stored.
-                        if (($proxyEnabled || $useInternalXtreamFormat) && $channel->catchup) {
-                            $catchupExt = $extension ?: 'ts';
-                            $catchupSource = "{$baseUrl}/timeshift/{$username}/{$password}/{duration}/{start}/{$channel->id}.{$catchupExt}";
-                            $extInf .= " catchup-source=\"{$catchupSource}\"";
-                        } elseif ($channel->catchup_source) {
-                            $extInf .= " catchup-source=\"$channel->catchup_source\"";
+                        // points to our own endpoint so catchup requests flow through m3u-editor
+                        // rather than going directly to the provider. This also ensures catchup
+                        // works for Xtream-imported channels that have tv_archive=1 but no
+                        // catchup_source URL template stored.
+                        // It uses the SIPTV utc/lutc query (programme start and now, as UNIX
+                        // epochs) on the live URL: the one catchup form Kodi, TiviMate and
+                        // IPTVnator all fill in the same way. The live endpoint turns it into the
+                        // provider's own catchup URL. As a complete URL, its mode is "default".
+                        if (($channelProxyEnabled || $useInternalXtreamFormat) && $channel->catchup) {
+                            $catchupExt = $catchupExtension ?: 'ts';
+                            $catchupSource = "{$baseUrl}/live/{$username}/{$password}/{$channel->id}.{$catchupExt}?utc={utc}&lutc={lutc}";
+                            $extInf .= " catchup=\"default\" catchup-source=\"{$catchupSource}\"";
+                        } else {
+                            if ($channel->catchup) {
+                                $extInf .= " catchup=\"$channel->catchup\"";
+                            }
+                            if ($channel->catchup_source) {
+                                $extInf .= " catchup-source=\"$channel->catchup_source\"";
+                            }
                         }
 
+                        // The archive window: shift is stored in hours, while catchup-days and
+                        // the SIPTV timeshift attribute are both read as days by clients
                         if ($timeshift) {
-                            $extInf .= " timeshift=\"$timeshift\"";
+                            $catchupDays = (int) ceil($timeshift / 24);
+                            $extInf .= " catchup-days=\"$catchupDays\" timeshift=\"$catchupDays\"";
                         }
                     }
                     if ($stationId) {
@@ -283,25 +299,40 @@ class PlaylistGenerateController extends Controller
 
                 // If the playlist includes series in M3U, include the series episodes
                 if ($playlist->include_series_in_m3u) {
+                    // A Custom Playlist (or an alias of one) categorizes a series by its
+                    // own category tag when one is saved, rather than the series' original
+                    // provider category - the same distinction get_series_categories/
+                    // get_series already make for the Xtream output.
+                    $seriesCategoryTagType = ($playlist instanceof CustomPlaylist)
+                        ? $playlist->uuid.'-category'
+                        : (($playlist instanceof PlaylistAlias && $playlist->custom_playlist_id)
+                            ? $playlist->customPlaylist->uuid.'-category'
+                            : null);
+
                     // Get the seasons
                     $seriesQuery = $playlist->series()
                         ->where('series.enabled', true)
-                        ->with([
+                        ->with(array_filter([
                             'category.parent',
+                            $seriesCategoryTagType !== null ? 'tags' : null,
                             'episodes' => function ($q) {
                                 $q->where('episodes.enabled', true);
                             },
-                        ]);
+                        ]));
                     foreach (self::seriesKeysetLazy($seriesQuery, 50) as $s) {
                         // Get series movie DB ID's as fallbacks for episode
                         $movieDbIds = $s->getMovieDbIds() ?? [];
                         $seriesTmdbId = $movieDbIds['tmdb'] ?? $movieDbIds['tvdb'] ?? $movieDbIds['imdb'] ?? null;
 
+                        $customCategory = $seriesCategoryTagType !== null
+                            ? $s->tags->where('type', $seriesCategoryTagType)->first()
+                            : null;
+
                         // Append the episodes
                         foreach ($s->episodes as $episode) {
                             // Set channel variables
-                            $channelNo = ++$channelNumber;
-                            $group = $s->category->effective_name ?? 'Seasons';
+                            $channelNo = $numberSequence->advance();
+                            $group = $customCategory?->name ?? $s->category->effective_name ?? 'Seasons';
                             $name = $s->name;
                             $url = PlaylistUrlService::getEpisodeUrl($episode, $playlist);
                             $title = $episode->title;
@@ -317,7 +348,7 @@ class PlaylistGenerateController extends Controller
                             if (! ((config('app.disable_m3u_xtream_format') ?? false) || $playlist->disable_m3u_xtream_format) || $proxyEnabled) {
                                 $containerExtension = $episode->container_extension ?? 'mp4';
                                 $url = $baseUrl."/series/{$username}/{$password}/".$episode->id.".{$containerExtension}";
-                            } elseif ($mfRewriteEnabled) {
+                            } elseif (! $proxyEnabled && $mediaFlowRewriteStreamUrls) {
                                 // Raw URL mode: wrap the provider URL through MediaFlow Proxy
                                 $url = PlaylistFacade::buildMediaFlowStreamUrl($url);
                             }
@@ -391,6 +422,11 @@ class PlaylistGenerateController extends Controller
             return response()->json(['Error' => 'Playlist Not Found'], 404);
         }
 
+        // Ensure HDHR output is enabled
+        if ($response = $this->outputDisabledResponse($playlist->hdhr_enabled)) {
+            return $response;
+        }
+
         // Setup the HDHR device info (pass through optional path auth)
         $deviceInfo = $this->getDeviceInfo($request, $playlist, $username, $password);
         // Ensure XML special characters are escaped (e.g., '&' -> '&amp;') to avoid parser errors
@@ -416,37 +452,15 @@ class PlaylistGenerateController extends Controller
             return response()->json(['Error' => 'Playlist Not Found'], 404);
         }
 
-        // Check auth (prefer path-based auth if present)
-        $providedUsername = $username ?? $request->get('username');
-        $providedPassword = $password ?? $request->get('password');
-
-        $auths = $playlist->playlistAuths()->where('enabled', true)->get();
-        if ($auths->isEmpty() && $playlist instanceof PlaylistAlias) {
-            $auth = $playlist->authObject;
-            if ($auth) {
-                $auths = collect([$auth]);
-            }
+        // Ensure HDHR output is enabled
+        if ($response = $this->outputDisabledResponse($playlist->hdhr_enabled)) {
+            return $response;
         }
 
-        if ($auths->isNotEmpty()) {
-            $authenticated = false;
-            foreach ($auths as $auth) {
-                $authUsername = $auth->username;
-                $authPassword = $auth->password;
-
-                if (
-                    $providedUsername === $authUsername &&
-                    $providedPassword === $authPassword
-                ) {
-                    $authenticated = true;
-                    $usedAuth = $auth;
-                    break;
-                }
-            }
-
-            if (! $authenticated) {
-                return response()->json(['Error' => 'Unauthorized'], 401);
-            }
+        // Check auth (prefer path-based auth if present)
+        [$authorized] = $this->resolveOutputAuth($playlist, $username ?? $request->get('username'), $password ?? $request->get('password'));
+        if (! $authorized) {
+            return response()->json(['Error' => 'Unauthorized'], 401);
         }
 
         return view('hdhr', [
@@ -462,6 +476,11 @@ class PlaylistGenerateController extends Controller
             return response()->json(['Error' => 'Playlist Not Found'], 404);
         }
 
+        // Ensure HDHR output is enabled
+        if ($response = $this->outputDisabledResponse($playlist->hdhr_enabled)) {
+            return $response;
+        }
+
         // Return the HDHR device info (pass through optional path auth)
         return $this->getDeviceInfo($request, $playlist, $username, $password);
     }
@@ -474,44 +493,21 @@ class PlaylistGenerateController extends Controller
             return response()->json(['Error' => 'Playlist Not Found'], 404);
         }
 
+        // Ensure HDHR output is enabled
+        if ($response = $this->outputDisabledResponse($playlist->hdhr_enabled)) {
+            return $response;
+        }
+
         // Build the channel query
         $channels = self::getChannelQuery($playlist);
 
         // Check auth (prefer path-based auth if present)
-        $providedUsername = $username ?? $request->get('username');
-        $providedPassword = $password ?? $request->get('password');
-
-        $usedAuth = null;
-        $auths = $playlist->playlistAuths()->where('enabled', true)->get();
-        if ($auths->isEmpty() && $playlist instanceof PlaylistAlias) {
-            $auth = $playlist->authObject;
-            if ($auth) {
-                $auths = collect([$auth]);
-            }
+        [$authorized, $usedAuth] = $this->resolveOutputAuth($playlist, $username ?? $request->get('username'), $password ?? $request->get('password'));
+        if (! $authorized) {
+            return response()->json(['Error' => 'Unauthorized'], 401);
         }
 
-        if ($auths->isNotEmpty()) {
-            $authenticated = false;
-            foreach ($auths as $auth) {
-                $authUsername = $auth->username;
-                $authPassword = $auth->password;
-
-                if (
-                    $providedUsername === $authUsername &&
-                    $providedPassword === $authPassword
-                ) {
-                    $authenticated = true;
-                    $usedAuth = $auth;
-                    break;
-                }
-            }
-
-            if (! $authenticated) {
-                return response()->json(['Error' => 'Unauthorized'], 401);
-            }
-        }
-
-        // Set the auth details
+        // Set the auth details (no matched credentials means the public UUID login applies)
         if ($usedAuth) {
             $username = $usedAuth->username;
             $password = $usedAuth->password;
@@ -522,9 +518,7 @@ class PlaylistGenerateController extends Controller
 
         // Check if proxy enabled
         $idChannelBy = $playlist->id_channel_by;
-        $channelNumber = ($playlist->auto_channel_increment || $playlist->force_channel_numbering)
-            ? $playlist->channel_start - 1
-            : 0;
+        $numberSequence = new ChannelNumberSequence($playlist);
         $isCustomContext = ($playlist instanceof CustomPlaylist) ||
             ($playlist instanceof PlaylistAlias && ! empty($playlist->custom_playlist_id));
 
@@ -541,27 +535,36 @@ class PlaylistGenerateController extends Controller
             $proxyEnabled = $playlist->enable_proxy;
         }
 
-        // Pre-compute MediaFlow stream URL rewrite flag (checked once, used per channel)
-        $mfRewriteEnabled = ! $proxyEnabled && PlaylistFacade::mediaFlowProxyEnabled()
+        // Pre-compute the global MediaFlow settings (checked once); whether it actually
+        // applies is decided per-channel below, since the proxy can be forced on for a
+        // single channel (or its source playlist) even when the playlist-level toggle is off.
+        $mediaFlowRewriteStreamUrls = PlaylistFacade::mediaFlowProxyEnabled()
             && (PlaylistFacade::getMediaFlowSettings()['mediaflow_proxy_rewrite_stream_urls'] ?? false);
 
         // Pre-compute the base URL for stream URL generation (used if proxy enabled or internal Xtream format used)
         $baseUrl = ProxyFacade::getBaseUrl();
         $useInternalXtreamFormat = ! ((config('app.disable_m3u_xtream_format') ?? false) || $playlist->disable_m3u_xtream_format);
 
-        return response()->stream(function () use ($cursor, $baseUrl, $username, $password, $playlist, $idChannelBy, $mfRewriteEnabled, $isCustomContext, $useInternalXtreamFormat, &$channelNumber) {
+        return response()->stream(function () use ($cursor, $baseUrl, $username, $password, $playlist, $idChannelBy, $proxyEnabled, $mediaFlowRewriteStreamUrls, $isCustomContext, $useInternalXtreamFormat, $numberSequence) {
             $first = true;
             echo '[';
+            // Memoized by playlist_id so a batch of channels sharing the same source
+            // playlist (the common case) only resolves it once rather than per row.
+            $sourcePlaylistCache = [];
             foreach ($cursor as $channel) {
+                [$channelSourcePlaylist, $channelProxyEnabled, $channelMfRewriteEnabled] = self::resolveChannelProxyContext(
+                    $playlist,
+                    $channel,
+                    $proxyEnabled,
+                    $mediaFlowRewriteStreamUrls,
+                    $sourcePlaylistCache
+                );
+
                 $url = PlaylistUrlService::getChannelUrl($channel, $playlist);
 
-                $channelNo = ($isCustomContext && ! empty($channel->pivot?->channel_number))
-                        ? (int) $channel->pivot->channel_number
-                        : $channel->channel;
+                $channelNo = $channel->resolveChannelNumber($isCustomContext);
 
-                if ($playlist->force_channel_numbering || (! $channelNo && ($playlist->auto_channel_increment || $idChannelBy === PlaylistChannelId::Number))) {
-                    $channelNo = ++$channelNumber;
-                }
+                $channelNo = $numberSequence->next($channelNo);
 
                 // Get the TVG ID
                 $tvgId = $channel->resolveTvgId($idChannelBy, $channelNo);
@@ -576,9 +579,8 @@ class PlaylistGenerateController extends Controller
                 $filename = parse_url($url, PHP_URL_PATH);
                 $extension = pathinfo($filename, PATHINFO_EXTENSION);
                 if (empty($extension)) {
-                    $sourcePlaylist = $channel->getEffectivePlaylist();
-                    if ($sourcePlaylist?->xtream) {
-                        $extension = $sourcePlaylist->xtream_config['output'] ?? 'ts'; // Default to 'ts' if not set
+                    if ($channelSourcePlaylist?->xtream) {
+                        $extension = $channelSourcePlaylist->xtream_config['output'] ?? 'ts'; // Default to 'ts' if not set
                     }
                 }
 
@@ -590,9 +592,13 @@ class PlaylistGenerateController extends Controller
                     if ($channel->is_vod) {
                         $urlPath = 'movie';
                         $extension = $channel->container_extension ?? 'mkv';
+                    } elseif ($channelProxyEnabled) {
+                        // The proxy may transcode the stream, so advertise the configured
+                        // output format instead of the raw provider extension.
+                        $extension = self::resolveProxyOutputFormat($channelSourcePlaylist, $playlist);
                     }
                     $url = $baseUrl."/{$urlPath}/{$username}/{$password}/".$channel->id.'.'.$extension;
-                } elseif ($mfRewriteEnabled) {
+                } elseif ($channelMfRewriteEnabled) {
                     // Raw URL mode: wrap the provider URL through MediaFlow Proxy
                     $url = PlaylistFacade::buildMediaFlowStreamUrl($url);
                 }
@@ -625,35 +631,60 @@ class PlaylistGenerateController extends Controller
         ]);
     }
 
+    private function outputDisabledResponse(bool $outputEnabled)
+    {
+        if ($outputEnabled) {
+            return null;
+        }
+
+        return response()->json(['Error' => 'Output disabled'], 403);
+    }
+
+    /**
+     * Check the credentials sent to an M3U/HDHR output. Unexpired Playlist Auths (or an
+     * unexpired alias' own credentials) always work. Otherwise the playlist's default login
+     * decides: UUID login keeps the output public while no auths are assigned (an expired
+     * auth still counts as assigned), Custom Password requires the owner's name and custom
+     * password, and Disabled requires an auth.
+     *
+     * Returns whether access is allowed, and the matched credentials (null for the
+     * public UUID login).
+     *
+     * @param  Playlist|MergedPlaylist|CustomPlaylist|PlaylistAlias  $playlist
+     * @return array{0: bool, 1: object{username: string, password: string}|null}
+     */
+    private function resolveOutputAuth($playlist, mixed $username, mixed $password): array
+    {
+        $auths = $playlist->playlistAuths()->where('enabled', true)->get();
+        $usableAuths = $auths->reject(fn (PlaylistAuth $auth): bool => $auth->isExpired());
+        // For PlaylistAlias, also check direct alias credentials as fallback
+        if ($auths->isEmpty() && $playlist instanceof PlaylistAlias && $playlist->authObject) {
+            $auths = collect([$playlist->authObject]);
+            $usableAuths = $playlist->isExpired() ? collect() : $auths;
+        }
+
+        $matchedAuth = $usableAuths->first(fn ($auth) => $username === $auth->username && $password === $auth->password);
+        if ($matchedAuth) {
+            return [true, $matchedAuth];
+        }
+
+        if ($playlist->getDefaultAuthMode() === DefaultAuthMode::Uuid) {
+            return [$auths->isEmpty(), null];
+        }
+
+        // Custom Password login (null when the default login is disabled)
+        $defaultCredentials = $playlist->getDefaultAuthCredentials();
+        if ($defaultCredentials && $username === $defaultCredentials->username && $password === $defaultCredentials->password) {
+            return [true, $defaultCredentials];
+        }
+
+        return [false, null];
+    }
+
     private function getDeviceInfo(Request $request, $playlist, ?string $username = null, ?string $password = null)
     {
         // Check auth (prefer path-based auth if present)
-        $usedAuth = null;
-        $providedUsername = $username ?? $request->get('username');
-        $providedPassword = $password ?? $request->get('password');
-
-        $auths = $playlist->playlistAuths()->where('enabled', true)->get();
-        if ($auths->isEmpty() && $playlist instanceof PlaylistAlias) {
-            $auth = $playlist->authObject;
-            if ($auth) {
-                $auths = collect([$auth]);
-            }
-        }
-
-        if ($auths->isNotEmpty()) {
-            foreach ($auths as $auth) {
-                $authUsername = $auth->username;
-                $authPassword = $auth->password;
-
-                if (
-                    $providedUsername === $authUsername &&
-                    $providedPassword === $authPassword
-                ) {
-                    $usedAuth = $auth;
-                    break;
-                }
-            }
-        }
+        [, $usedAuth] = $this->resolveOutputAuth($playlist, $username ?? $request->get('username'), $password ?? $request->get('password'));
 
         // Return the HDHR device info
         $uuid = $playlist->uuid;
@@ -682,6 +713,72 @@ class PlaylistGenerateController extends Controller
             'LineupURL' => $baseUrl.$authPath.'/lineup.json',
             'TunerCount' => $tunerCount,
         ];
+    }
+
+    /**
+     * Resolve a channel's proxy context: its own source playlist (memoized in
+     * $sourcePlaylistCache by playlist_id, so a batch of channels sharing the same
+     * source playlist only resolves it once instead of once per row), whether the
+     * proxy is effectively enabled for it, and whether MediaFlow's raw-URL rewrite
+     * applies.
+     *
+     * A channel can force the proxy path even when the playlist-level toggle is
+     * off: its own per-channel override, or its source playlist pooling provider
+     * profiles (profile selection/pool distribution only happens on the proxy
+     * path). Uses the same `Channel::needsProxy()` rule as
+     * XtreamStreamController::handleLive()/handleVod() so the two can't drift apart.
+     *
+     * @return array{0: ?Playlist, 1: bool, 2: bool}
+     */
+    private static function resolveChannelProxyContext(
+        $playlist,
+        Channel $channel,
+        bool $proxyEnabled,
+        bool $mediaFlowRewriteStreamUrls,
+        array &$sourcePlaylistCache
+    ): array {
+        $sourcePlaylistId = $channel->playlist_id;
+        if ($sourcePlaylistId !== null) {
+            if (! array_key_exists($sourcePlaylistId, $sourcePlaylistCache)) {
+                $sourcePlaylistCache[$sourcePlaylistId] = Playlist::find($sourcePlaylistId, ['id', 'xtream', 'profiles_enabled', 'xtream_config']);
+            }
+            $channelSourcePlaylist = $sourcePlaylistCache[$sourcePlaylistId];
+        } else {
+            $channelSourcePlaylist = null;
+        }
+
+        $channelProxyEnabled = Channel::needsProxy(
+            channelEnableProxy: (bool) $channel->enable_proxy,
+            playlistEnableProxy: $proxyEnabled,
+            requestProxyFlag: false,
+            sourcePlaylistProfilesEnabled: $channelSourcePlaylist->profiles_enabled ?? false,
+            userCanUseProxy: $playlist->user->canUseProxy(),
+        );
+
+        return [$channelSourcePlaylist, $channelProxyEnabled, ! $channelProxyEnabled && $mediaFlowRewriteStreamUrls];
+    }
+
+    /**
+     * Resolve the proxy's configured output format extension for a live channel,
+     * preferring the channel's own source playlist's xtream_config and falling back
+     * to the requested playlist's. A PlaylistAlias's own xtream_config is a
+     * normalized list of provider account configs (not a single keyed config), so
+     * its actual output setting must be read from the real playlist it wraps via
+     * getEffectivePlaylist() instead - mirrors the allowed_output_formats
+     * resolution in XtreamApiController::__invoke().
+     */
+    private static function resolveProxyOutputFormat(?Playlist $channelSourcePlaylist, $playlist): string
+    {
+        $proxyOutput = $channelSourcePlaylist?->xtream_config['output'] ?? null;
+
+        if ($proxyOutput === null) {
+            $contextXtreamConfig = $playlist instanceof PlaylistAlias
+                ? ($playlist->getEffectivePlaylist()?->xtream_config ?? null)
+                : ($playlist->xtream_config ?? null);
+            $proxyOutput = $contextXtreamConfig['output'] ?? 'ts';
+        }
+
+        return $proxyOutput === 'hls' ? 'm3u8' : $proxyOutput;
     }
 
     /**
@@ -727,6 +824,25 @@ class PlaylistGenerateController extends Controller
         // rows for channels that belong to more than one tag in this playlist.
         $isCustomContext = $playlist instanceof CustomPlaylist
             || ($playlist instanceof PlaylistAlias && ! empty($playlist->custom_playlist_id));
+
+        // Optional flat channel number ordering, ahead of any group ordering. Channels
+        // without a number (NULL or 0, matching the output's "no number" check) go last
+        // on every driver, then fall through to the standard ordering below. A custom
+        // playlist's pivot number wins when set, as it does for tvg-chno. 0 is folded
+        // into NULL so unnumbered channels tie here regardless of driver NULL ordering.
+        // Sub-channels ("5.1") follow their major number, from the same source as it.
+        if ($playlist->sort_by_channel_number) {
+            if ($isCustomContext) {
+                $query->orderByRaw('CASE WHEN COALESCE(NULLIF(channel_custom_playlist.channel_number, 0), NULLIF(channels.channel, 0)) IS NULL THEN 1 ELSE 0 END')
+                    ->orderByRaw('COALESCE(NULLIF(channel_custom_playlist.channel_number, 0), NULLIF(channels.channel, 0))')
+                    ->orderByRaw(self::CUSTOM_CHANNEL_MINOR_ORDER);
+            } else {
+                $query->orderByRaw('CASE WHEN NULLIF(channels.channel, 0) IS NULL THEN 1 ELSE 0 END')
+                    ->orderByRaw('NULLIF(channels.channel, 0)')
+                    ->orderByRaw('COALESCE(channels.channel_minor, 0)');
+            }
+        }
+
         if ($isCustomContext) {
             $orderSubquery = '(SELECT MIN(t.order_column) FROM taggables tb INNER JOIN tags t ON t.id = tb.tag_id WHERE tb.taggable_id = channels.id AND tb.taggable_type = ? AND t.type = ?)';
 
@@ -767,6 +883,7 @@ class PlaylistGenerateController extends Controller
             $query->orderByRaw("COALESCE({$orderSubquery}, groups.sort_order)", [Channel::class, $playlistUuid])
                 ->orderByRaw('COALESCE(channel_custom_playlist.sort, channels.sort)')
                 ->orderByRaw('COALESCE(channel_custom_playlist.channel_number, channels.channel)')
+                ->orderByRaw(self::CUSTOM_CHANNEL_MINOR_ORDER)
                 ->orderBy('channels.title');
         } else {
             // Per-alias custom live group ordering (optional). When enabled, the
@@ -794,6 +911,7 @@ class PlaylistGenerateController extends Controller
                 ->orderBy('groups.sort_order')
                 ->orderBy('channels.sort')
                 ->orderBy('channels.channel')
+                ->orderByRaw('COALESCE(channels.channel_minor, 0)')
                 ->orderBy('channels.title');
         }
 

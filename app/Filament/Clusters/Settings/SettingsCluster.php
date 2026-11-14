@@ -6,9 +6,11 @@ use App\Filament\Clusters\Settings\Pages\ManageAlertSettings;
 use App\Filament\Clusters\Settings\Pages\ManageApiSettings;
 use App\Filament\Clusters\Settings\Pages\ManageAssetSettings;
 use App\Filament\Clusters\Settings\Pages\ManageBackupSettings;
+use App\Filament\Clusters\Settings\Pages\ManageCacheSettings;
 use App\Filament\Clusters\Settings\Pages\ManageCopilotSettings;
 use App\Filament\Clusters\Settings\Pages\ManageGeneralSettings;
 use App\Filament\Clusters\Settings\Pages\ManageIntegrationSettings;
+use App\Filament\Clusters\Settings\Pages\ManageNavigationSettings;
 use App\Filament\Clusters\Settings\Pages\ManageProxySettings;
 use App\Filament\Clusters\Settings\Pages\ManageSmtpSettings;
 use App\Filament\Clusters\Settings\Pages\ManageSyncSettings;
@@ -40,6 +42,7 @@ class SettingsCluster extends Cluster
     {
         return [
             ManageGeneralSettings::class,
+            ManageNavigationSettings::class,
             ManageProxySettings::class,
             ManageTvAppSettings::class,
             ManageSyncSettings::class,
@@ -47,6 +50,7 @@ class SettingsCluster extends Cluster
             ManageBackupSettings::class,
             ManageSmtpSettings::class,
             ManageApiSettings::class,
+            ManageCacheSettings::class,
             ManageIntegrationSettings::class,
             ManageCopilotSettings::class,
             ManageAlertSettings::class,

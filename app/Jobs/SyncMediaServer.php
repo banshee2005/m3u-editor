@@ -15,11 +15,14 @@ use App\Models\Series;
 use App\Services\LocalMediaService;
 use App\Services\MediaServerService;
 use App\Services\TmdbService;
+use App\Support\TmdbEnrichment;
+use Carbon\Carbon;
 use Exception;
 use Filament\Notifications\Notification;
 use Illuminate\Contracts\Queue\ShouldBeUnique;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Queue\Queueable;
+use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 
@@ -223,6 +226,13 @@ class SyncMediaServer implements ShouldBeUnique, ShouldQueue
                 'stats' => $this->stats,
             ]);
 
+            // Re-match provider playlists that prefer media server sources
+            // (Emby/Jellyfin/Plex only; local ids arrive later via FetchTmdbIds,
+            // which carries the matching job as postCompletionJobs).
+            if (! $integration->usesLocalPathConfig()) {
+                $this->dispatchSourceMatching($integration);
+            }
+
             // Dispatch TMDB metadata lookup for local media integrations
             $this->dispatchMetadataLookup($integration, $playlist);
 
@@ -379,6 +389,27 @@ class SyncMediaServer implements ShouldBeUnique, ShouldQueue
     }
 
     /**
+     * Build the studios/networks wire shape ({id, name, logo}) TMDB enrichment uses,
+     * from a media server Studios array. Like cast_list, `id` is always null (media
+     * servers only expose internal ids), and there is no logo.
+     *
+     * @param  array<int, array<string, mixed>>  $studios
+     * @return list<array{id: null, name: string, logo: null}>
+     */
+    protected function buildStudioList(array $studios): array
+    {
+        return collect($studios)
+            ->filter(fn ($studio) => ! empty($studio['Name']))
+            ->map(fn ($studio) => [
+                'id' => null,
+                'name' => $studio['Name'],
+                'logo' => null,
+            ])
+            ->values()
+            ->all();
+    }
+
+    /**
      * Sync a single movie as a VOD channel.
      */
     protected function syncMovie(
@@ -405,6 +436,12 @@ class SyncMediaServer implements ShouldBeUnique, ShouldQueue
         $runtimeMinutes = $runtimeSeconds > 0 ? (int) ($runtimeSeconds / 60) : null;
         $duration = $runtimeSeconds > 0 ? gmdate('H:i:s', $runtimeSeconds) : null;
 
+        // Extract external IDs (Tmdb/Tvdb/Imdb keys, same as syncEpisode reads)
+        $providerIds = $movie['ProviderIds'] ?? [];
+        $movieTmdbId = isset($providerIds['Tmdb']) && $providerIds['Tmdb'] !== '' ? (int) $providerIds['Tmdb'] : null;
+        $movieTvdbId = isset($providerIds['Tvdb']) && $providerIds['Tvdb'] !== '' ? (int) $providerIds['Tvdb'] : null;
+        $movieImdbId = isset($providerIds['Imdb']) && $providerIds['Imdb'] !== '' ? $providerIds['Imdb'] : null;
+
         // Extract director(s) from People array
         $directors = array_column(
             array_filter($movie['People'] ?? [], fn ($p) => ($p['Type'] ?? '') === 'Director'),
@@ -420,6 +457,7 @@ class SyncMediaServer implements ShouldBeUnique, ShouldQueue
         // Rich cast list (id null - media servers only expose internal person ids) + clearlogo
         $castList = $this->buildCastList($movie['People'] ?? [], $service);
         $clearLogo = $this->resolveClearLogo($movie, $itemId, $service);
+        $studios = $this->buildStudioList($movie['Studios'] ?? []);
 
         // Handle ProductionLocations - might be array or string
         $locations = $movie['ProductionLocations'] ?? [];
@@ -446,6 +484,9 @@ class SyncMediaServer implements ShouldBeUnique, ShouldQueue
             'backdrop_path' => $backdropUrl ? [$backdropUrl] : [],
             'youtube_trailer' => null,
             'country' => $country,
+            // Provider-owned, like an Xtream provider's mpaa_rating: TMDB's certification
+            // stays in tmdb_certification as the fallback.
+            'mpaa_rating' => $movie['OfficialRating'] ?? null,
         ];
 
         if (! empty($castList)) {
@@ -453,6 +494,9 @@ class SyncMediaServer implements ShouldBeUnique, ShouldQueue
         }
         if (! empty($clearLogo)) {
             $syncInfo['clearlogo'] = $clearLogo;
+        }
+        if (! empty($studios)) {
+            $syncInfo['studios'] = $studios;
         }
 
         // Find or create the channel
@@ -489,6 +533,15 @@ class SyncMediaServer implements ShouldBeUnique, ShouldQueue
                     $info[$key] = $value;
                 }
             }
+
+            // A TMDB-checked channel keeps the fields TMDB owns (clearlogo, cast_list,
+            // backdrop, etc.) so a TMDB fetch isn't rolled back by the next sync;
+            // TMDB-only keys are carried over by the merge above.
+            $info = TmdbEnrichment::preserveOnProviderRefresh(
+                $existingInfo,
+                $info,
+                TmdbEnrichment::isTmdbChecked($existingInfo) ? TmdbEnrichment::MEDIA_SERVER_PREFERRED_VOD_INFO_KEYS : [],
+            );
         }
 
         // For existing channels that have been TMDB-enriched, preserve the TMDB group/genre
@@ -512,6 +565,11 @@ class SyncMediaServer implements ShouldBeUnique, ShouldQueue
             'import_batch_no' => $this->batchNo,
             'year' => $movie['ProductionYear'] ?? null,
             'rating' => $movie['CommunityRating'] ?? null,
+            // Never overwrite an existing id with null (local items get ids later from FetchTmdbIds)
+            'tmdb_id' => $movieTmdbId ?: ($isNew ? null : $channel->tmdb_id),
+            'tvdb_id' => $movieTvdbId ?: ($isNew ? null : $channel->tvdb_id),
+            'imdb_id' => $movieImdbId ?: ($isNew ? null : $channel->imdb_id),
+            'source_added_at' => $this->parseDateCreated($movie['DateCreated'] ?? null) ?? ($isNew ? null : $channel->source_added_at),
             'info' => $info,
         ]);
 
@@ -524,6 +582,25 @@ class SyncMediaServer implements ShouldBeUnique, ShouldQueue
         }
 
         $channel->save();
+    }
+
+    /**
+     * Parse a media server DateCreated value, ignoring the .NET
+     * "0001-01-01" placeholder Emby/Jellyfin return for unknown dates.
+     */
+    protected function parseDateCreated(mixed $value): ?Carbon
+    {
+        if (! is_string($value) || $value === '') {
+            return null;
+        }
+
+        try {
+            $date = Carbon::parse($value);
+        } catch (Exception) {
+            return null;
+        }
+
+        return $date->year > 1970 ? $date->setTimezone(config('app.timezone')) : null;
     }
 
     /**
@@ -690,33 +767,42 @@ class SyncMediaServer implements ShouldBeUnique, ShouldQueue
         $syncCast = ! empty($actors) ? implode(', ', $actors) : null;
         $syncDirector = ! empty($directors) ? implode(', ', $directors) : null;
 
-        // Preserve a prior TMDB-enriched cast_list / clearlogo when this sync
-        // pass carries none (local libraries return no People / Logo).
-        $syncCastList = ! empty($castList)
-            ? $castList
-            : ($isNewSeries ? null : ($series->metadata['cast_list'] ?? null));
-        $syncClearLogo = $clearLogo
-            ?: ($isNewSeries ? null : ($series->metadata['clearlogo'] ?? null));
-
         $seriesMetadata = [
             'media_server_id' => $seriesId,
             'media_server_type' => $integration->type,
             'official_rating' => $seriesData['OfficialRating'] ?? null,
             'original_title' => $seriesData['OriginalTitle'] ?? null,
         ];
-        if (! empty($syncCastList)) {
-            $seriesMetadata['cast_list'] = $syncCastList;
+        if (! empty($castList)) {
+            $seriesMetadata['cast_list'] = $castList;
         }
-        if (! empty($syncClearLogo)) {
-            $seriesMetadata['clearlogo'] = $syncClearLogo;
+        if (! empty($clearLogo)) {
+            $seriesMetadata['clearlogo'] = $clearLogo;
         }
+        $networks = $this->buildStudioList($seriesData['Studios'] ?? []);
+        if (! empty($networks)) {
+            $seriesMetadata['networks'] = $networks;
+        }
+
+        // Keep prior TMDB enrichment this sync pass would otherwise wipe: related_tmdb /
+        // vote_count always, cast_list / clearlogo / networks when the server sent none (local
+        // libraries return no People / Logo), and on a TMDB-checked series every
+        // TMDB-owned field, so a TMDB fetch isn't rolled back by the next sync.
+        $isTmdbChecked = TmdbEnrichment::isTmdbChecked($series->metadata);
+        $seriesMetadata = TmdbEnrichment::preserveOnProviderRefresh(
+            $series->metadata,
+            $seriesMetadata,
+            $isTmdbChecked
+                ? TmdbEnrichment::MEDIA_SERVER_PREFERRED_SERIES_METADATA_KEYS
+                : TmdbEnrichment::PREFERRED_SERIES_METADATA_KEYS,
+        );
 
         // For existing series that have been TMDB-enriched, preserve the TMDB genre/category
         // instead of overwriting with the library folder name (e.g., "tv")
         $hasTmdbGenre = ! $isNewSeries && $series->last_metadata_fetch !== null
             && ! empty($series->genre) && $series->genre !== implode(', ', $genres);
 
-        $series->fill([
+        $attributes = [
             'name' => $seriesData['Name'],
             'user_id' => $playlist->user_id,
             'category_id' => $hasTmdbGenre ? $series->category_id : $category->id,
@@ -738,7 +824,18 @@ class SyncMediaServer implements ShouldBeUnique, ShouldQueue
             'tvdb_id' => $tvdbId ?: ($isNewSeries ? null : $series->tvdb_id),
             'imdb_id' => $imdbId ?: ($isNewSeries ? null : $series->imdb_id),
             'metadata' => $seriesMetadata,
-        ]);
+        ];
+
+        // TMDB-owned columns on a TMDB-checked series keep their TMDB value.
+        if ($isTmdbChecked) {
+            foreach (TmdbEnrichment::MEDIA_SERVER_PREFERRED_SERIES_COLUMNS as $column) {
+                if (! blank($series->{$column})) {
+                    unset($attributes[$column]);
+                }
+            }
+        }
+
+        $series->fill($attributes);
 
         // Only reset last_metadata_fetch for new local-style media series (existing ones keep their timestamp)
         // For non-local-style (Emby/Jellyfin/Plex), set to now() so FetchTmdbIds skips them (they already have metadata)
@@ -1044,6 +1141,9 @@ class SyncMediaServer implements ShouldBeUnique, ShouldQueue
                 'integration_id' => $integration->id,
             ]);
 
+            // Items may already have ids from a previous sync, so match anyway.
+            $this->dispatchSourceMatching($integration);
+
             return;
         }
 
@@ -1060,6 +1160,9 @@ class SyncMediaServer implements ShouldBeUnique, ShouldQueue
                 ->broadcast($integration->user)
                 ->sendToDatabase($integration->user);
 
+            // Items may already have ids from a previous sync, so match anyway.
+            $this->dispatchSourceMatching($integration);
+
             return;
         }
 
@@ -1068,6 +1171,9 @@ class SyncMediaServer implements ShouldBeUnique, ShouldQueue
             Log::debug('SyncMediaServer: Skipping metadata lookup (no items synced)', [
                 'integration_id' => $integration->id,
             ]);
+
+            // Items may already have ids from a previous sync, so match anyway.
+            $this->dispatchSourceMatching($integration);
 
             return;
         }
@@ -1087,8 +1193,45 @@ class SyncMediaServer implements ShouldBeUnique, ShouldQueue
             allVodPlaylists: false,
             allSeriesPlaylists: false,
             overwriteExisting: false,
-            user: $integration->user
+            user: $integration->user,
+            // Ids only exist after the lookup completes, so chain one rebuild per
+            // toggled-on provider playlist (the integration's own playlist is
+            // never the target; it just fills the index).
+            postCompletionJobs: $this->sourceMatchingPlaylistIds($integration)
+                ->map(fn (int $playlistId) => new MatchMediaServerSources($playlistId))
+                ->all(),
         );
+    }
+
+    /**
+     * Dispatch MatchMediaServerSources for every playlist of the integration
+     * owner that prefers media server sources. Used when a sync just changed
+     * the media-server side of the index (ids written directly, or ids that
+     * already exist because a previous lookup filled them). The integration's
+     * own media playlist is excluded: it is a match target, not a provider.
+     */
+    protected function dispatchSourceMatching(MediaServerIntegration $integration): void
+    {
+        $this->sourceMatchingPlaylistIds($integration)
+            ->each(fn (int $playlistId) => MatchMediaServerSources::dispatch($playlistId));
+    }
+
+    /**
+     * Ids of the integration owner's playlists that prefer media server
+     * sources, i.e. the provider playlists that consume this integration's
+     * content. The integration's own media playlist is never included: it is
+     * a match target, not a provider.
+     *
+     * @return Collection<int, int>
+     */
+    protected function sourceMatchingPlaylistIds(MediaServerIntegration $integration): Collection
+    {
+        return Playlist::query()
+            ->where('user_id', $integration->user_id)
+            ->where('prefer_media_server_sources', true)
+            ->where('id', '!=', $integration->playlist_id)
+            ->orderBy('id')
+            ->pluck('id');
     }
 
     /**

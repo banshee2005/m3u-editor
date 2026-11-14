@@ -4,6 +4,7 @@ namespace App\Services;
 
 use App\Models\Playlist;
 use App\Models\PlaylistProfile;
+use Illuminate\Contracts\Cache\LockTimeoutException;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Redis;
@@ -111,8 +112,14 @@ class ProfileService
      * Iterates through enabled profiles in priority order and returns
      * the first one with available capacity. When a client identifier
      * is provided, prefers the profile the client was previously assigned to.
+     *
+     * @param  ?array<string, int>  $proxyCounts  Pre-fetched proxy stream counts keyed by
+     *                                            profile ID (string). Pass this in when the
+     *                                            caller already has fresh counts (e.g. fetched
+     *                                            outside a lock) to avoid a redundant proxy call.
+     *                                            When omitted, counts are fetched here.
      */
-    public static function selectProfile(Playlist $playlist, ?int $excludeProfileId = null, bool $forceSelect = false, ?string $clientIdentifier = null): ?PlaylistProfile
+    public static function selectProfile(Playlist $playlist, ?int $excludeProfileId = null, bool $forceSelect = false, ?string $clientIdentifier = null, ?array $proxyCounts = null): ?PlaylistProfile
     {
         if (! $playlist->profiles_enabled) {
             return null;
@@ -136,11 +143,14 @@ class ProfileService
 
         // Pre-fetch proxy counts for all profiles in one request, then add
         // per-profile pending reservations from Redis. This replaces N individual
-        // proxy calls with a single batch call.
-        $profileIds = $profiles->pluck('id')->map(fn ($id) => (string) $id)->all();
-        $proxyCounts = M3uProxyService::getActiveStreamsCountsBatch('provider_profile_id', $profileIds);
+        // proxy calls with a single batch call. Skipped when the caller already
+        // supplied fresh counts.
+        if ($proxyCounts === null) {
+            $profileIds = $profiles->pluck('id')->map(fn ($id) => (string) $id)->all();
+            $proxyCounts = M3uProxyService::getActiveStreamsCountsBatch('provider_profile_id', $profileIds);
+        }
 
-        // Check client affinity — prefer the profile the client used before.
+        // Check client affinity - prefer the profile the client used before.
         // Only active when enable_provider_affinity is set on the playlist.
         if ($clientIdentifier !== null && $playlist->enable_provider_affinity) {
             $affinityProfileId = static::getClientAffinity($clientIdentifier, $playlist->id);
@@ -262,23 +272,41 @@ class ProfileService
             return [null, null];
         }
 
+        // Fetch proxy stream counts BEFORE acquiring the lock. This is a network call
+        // to m3u-proxy, and previously ran inside the lock - serializing every channel
+        // switch on this playlist behind a live HTTP round trip. The lock only needs to
+        // guard the local Redis reservation bookkeeping below, which is fast; a proxy
+        // count that's a few milliseconds stale is fine because the reservation set
+        // (checked inside the lock via countPendingReservations()) is what actually
+        // prevents concurrent requests from over-allocating a slot.
+        $profileIds = $playlist->enabledProfiles()
+            ->when($excludeProfileId, fn ($query) => $query->where('id', '!=', $excludeProfileId))
+            ->pluck('id')
+            ->map(fn ($id) => (string) $id)
+            ->all();
+        $proxyCounts = M3uProxyService::getActiveStreamsCountsBatch('provider_profile_id', $profileIds);
+
         $lockKey = "profile_select_lock:playlist:{$playlist->id}";
         $reservationId = 'reservation:'.bin2hex(random_bytes(8));
 
         // Acquire a short-lived atomic lock scoped to this playlist.
-        // block() waits up to PROFILE_LOCK_TIMEOUT seconds for the lock.
+        // block() waits up to PROFILE_LOCK_TIMEOUT seconds for the lock, then throws
+        // LockTimeoutException - it never returns false.
         $lock = Cache::lock($lockKey, static::PROFILE_LOCK_TIMEOUT);
 
         try {
-            // Wait for the lock with a timeout
-            if (! $lock->block(static::PROFILE_LOCK_TIMEOUT)) {
-                Log::warning('Failed to acquire profile selection lock', [
-                    'playlist_id' => $playlist->id,
-                ]);
+            $lock->block(static::PROFILE_LOCK_TIMEOUT);
+        } catch (LockTimeoutException) {
+            // Lock contention, not "no capacity" - log distinctly so it isn't
+            // conflated with genuine capacity exhaustion or unexpected errors.
+            Log::warning('Timed out waiting for profile selection lock', [
+                'playlist_id' => $playlist->id,
+            ]);
 
-                return [null, null];
-            }
+            return [null, null];
+        }
 
+        try {
             // Prune stale reservations before counting capacity. A pending
             // reservation (reservation:xxx) only lives as long as its reverse
             // channel mapping (30s TTL). If the reverse key is gone, whoever
@@ -295,7 +323,7 @@ class ProfileService
                 $channelStreamKey = static::getChannelStreamKey($channelId, $channelPlaylistUuid, $streamType);
 
                 if (Redis::exists($channelStreamKey)) {
-                    Log::debug('Channel reuse detected inside lock — skipping profile allocation', [
+                    Log::debug('Channel reuse detected inside lock - skipping profile allocation', [
                         'channel_id' => $channelId,
                         'playlist_uuid' => $channelPlaylistUuid,
                         'playlist_id' => $playlist->id,
@@ -309,7 +337,7 @@ class ProfileService
             }
 
             // Inside the lock: select + increment atomically
-            $profile = static::selectProfile($playlist, $excludeProfileId, $forceSelect, $clientIdentifier);
+            $profile = static::selectProfile($playlist, $excludeProfileId, $forceSelect, $clientIdentifier, $proxyCounts);
 
             if ($profile) {
                 // Reserve the slot immediately so the next concurrent request
@@ -444,7 +472,7 @@ class ProfileService
     /**
      * Count in-flight reservations for a profile.
      *
-     * Reservations are stream set entries prefixed with "reservation:" — they
+     * Reservations are stream set entries prefixed with "reservation:" - they
      * represent slots claimed inside the lock but not yet visible to the proxy.
      */
     public static function countPendingReservations(PlaylistProfile $profile): int
@@ -702,10 +730,16 @@ class ProfileService
 
     /**
      * Refresh provider info for all profiles in a playlist.
+     *
+     * M3U-backed playlists have no provider API to query, so their profiles are skipped.
      */
     public static function refreshAllProfiles(Playlist $playlist): array
     {
         $results = [];
+
+        if (! $playlist->xtream) {
+            return $results;
+        }
 
         foreach ($playlist->profiles()->get() as $profile) {
             $results[$profile->id] = static::refreshProfile($profile);
@@ -716,10 +750,19 @@ class ProfileService
 
     /**
      * Refresh provider info for a single profile.
+     *
+     * Returns false without any network call for profiles of M3U-backed playlists,
+     * which expose no account API (see PlaylistProfile::supportsProviderInfo()).
      */
     public static function refreshProfile(PlaylistProfile $profile): bool
     {
         try {
+            if (! $profile->supportsProviderInfo()) {
+                Log::debug("Skipping provider info refresh for profile {$profile->id}: playlist is not Xtream-backed");
+
+                return false;
+            }
+
             $xtreamConfig = $profile->xtream_config;
 
             if (! $xtreamConfig) {
@@ -747,7 +790,7 @@ class ProfileService
 
                 // Only auto-update max_streams if not explicitly set by the user.
                 // A positive value means the user (or initial auto-detection) has
-                // already configured it — respect that choice even if provider upgrades.
+                // already configured it - respect that choice even if provider upgrades.
                 // Auto-update only when max_streams is null/0 (never configured).
                 $shouldUpdateMaxStreams = ! $profile->max_streams
                     || $profile->max_streams <= 0;
@@ -858,11 +901,12 @@ class ProfileService
     /**
      * Create the primary profile from a playlist's xtream_config.
      *
-     * Called when profiles are first enabled on a playlist.
+     * Called when profiles are first enabled on a playlist. M3U playlists (xtream
+     * off, even with a stale xtream_config) are handled by ensureM3uPrimaryProfile().
      */
     public static function createPrimaryProfile(Playlist $playlist): ?PlaylistProfile
     {
-        if (! $playlist->xtream_config) {
+        if (! $playlist->xtream || ! $playlist->xtream_config) {
             return null;
         }
 
@@ -907,7 +951,9 @@ class ProfileService
      */
     public static function syncPrimaryProfile(Playlist $playlist): void
     {
-        if (! $playlist->xtream_config) {
+        // M3U playlists own their primary via ensureM3uPrimaryProfile(); a stale
+        // xtream_config left over from switching the playlist type must not overwrite it.
+        if (! $playlist->xtream || ! $playlist->xtream_config) {
             return;
         }
 
@@ -941,6 +987,83 @@ class ProfileService
                 'profile_id' => $primaryProfile->id,
             ]);
         }
+    }
+
+    /**
+     * Create the primary profile for an M3U playlist.
+     *
+     * The account's URL and credentials are parsed from the playlist's M3U URL when it
+     * carries them (get.php?username=..&password=.. or /USER/PASS/ forms). When it does
+     * not, the profile is created with blank credentials and stream URLs are parsed at
+     * stream time instead. M3U providers expose no account API, so max_streams starts
+     * at 1 and is set by the user.
+     */
+    private static function createM3uPrimaryProfile(Playlist $playlist): PlaylistProfile
+    {
+        $credentials = PlaylistProfile::parseM3uUrlCredentials($playlist->url);
+
+        return PlaylistProfile::create([
+            'playlist_id' => $playlist->id,
+            'user_id' => $playlist->user_id,
+            'name' => 'Primary Account',
+            'url' => $credentials['url'] ?? null,
+            'username' => $credentials['username'] ?? '',
+            'password' => $credentials['password'] ?? '',
+            'max_streams' => 1,
+            'priority' => 0,
+            'enabled' => true,
+            'is_primary' => true,
+        ]);
+    }
+
+    /**
+     * Ensure an M3U playlist's primary profile exists and follows its M3U URL.
+     *
+     * Called from the playlist form when a user saves an M3U playlist with profiles
+     * enabled - deliberately not from PlaylistListener, so playlists whose profiles
+     * were set up by other means never gain an auto-created primary. Xtream playlists
+     * (or profiles disabled) are left alone and return null.
+     *
+     * Credentials are only rewritten when the M3U URL carries some; a URL without
+     * credentials leaves the stored ones alone rather than blanking them. When
+     * $maxStreams is given (>= 1) it becomes the primary's stream limit, since M3U
+     * providers cannot report one.
+     */
+    public static function ensureM3uPrimaryProfile(Playlist $playlist, ?int $maxStreams = null): ?PlaylistProfile
+    {
+        if ($playlist->xtream || ! $playlist->profiles_enabled) {
+            return null;
+        }
+
+        $primaryProfile = $playlist->profiles()->where('is_primary', true)->first()
+            ?? static::createM3uPrimaryProfile($playlist);
+
+        $updates = [];
+
+        if (
+            ($credentials = PlaylistProfile::parseM3uUrlCredentials($playlist->url))
+            && ($primaryProfile->url !== $credentials['url']
+                || $primaryProfile->username !== $credentials['username']
+                || $primaryProfile->password !== $credentials['password'])
+        ) {
+            $updates = $credentials;
+        }
+
+        if ($maxStreams !== null && $maxStreams >= 1 && $primaryProfile->max_streams !== $maxStreams) {
+            $updates['max_streams'] = $maxStreams;
+        }
+
+        if ($updates) {
+            $primaryProfile->update($updates);
+
+            Log::info('Synced M3U primary profile from playlist form', [
+                'playlist_id' => $playlist->id,
+                'profile_id' => $primaryProfile->id,
+                'fields' => array_keys($updates),
+            ]);
+        }
+
+        return $primaryProfile;
     }
 
     /**

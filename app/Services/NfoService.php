@@ -58,6 +58,8 @@ class NfoService
                 $xml .= $this->xmlElement('status', $metadata['status']);
             }
 
+            $this->appendXml($xml, 'mpaa', $series->getContentRating());
+
             $this->appendGenres($xml, $metadata['genres'] ?? null);
             $this->appendNamedList($xml, 'studio', $metadata['networks'] ?? null);
 
@@ -239,6 +241,9 @@ class NfoService
                 }
                 $xml .= $this->xmlElement('runtime', $runtime);
             }
+
+            $this->appendXml($xml, 'mpaa', $channel->getContentRating());
+            $this->appendNamedList($xml, 'studio', $info['studios'] ?? null);
 
             $this->appendGenres($xml, $info['genres'] ?? $movieData['genre'] ?? null);
             $this->appendXml($xml, 'director', $info['director'] ?? $movieData['director'] ?? null);
@@ -790,18 +795,12 @@ class NfoService
     }
 
     /**
-     * Decide whether a DVR recording is series-shaped (has season/episode info or series_key).
+     * Decide whether a DVR recording is series-shaped. Delegates to the model so the
+     * NFO sidecars always agree with how the recording was filed in the VOD library.
      */
     public function isDvrRecordingSeries(DvrRecording $recording): bool
     {
-        if (! empty($recording->series_key)) {
-            return true;
-        }
-        if (! empty($recording->season) || ! empty($recording->episode)) {
-            return true;
-        }
-
-        return ($recording->metadata['tmdb']['type'] ?? null) === 'tv';
+        return $recording->isTvContent();
     }
 
     /**

@@ -3,6 +3,7 @@
 namespace App\Jobs;
 
 use App\Enums\Status;
+use App\Jobs\Middleware\SkipIfSyncReset;
 use App\Models\Channel;
 use App\Models\Epg;
 use App\Models\EpgMap;
@@ -28,6 +29,12 @@ class MapPlaylistChannelsToEpg implements ShouldQueue
     // Giving a timeout of 120 minutes to the Job to process the mapping
     public $timeout = 60 * 120;
 
+    // Channels handed to each MapPlaylistChannelsToEpgChunk job
+    public const CHUNK_SIZE = 50;
+
+    // When the mapping was queued (microtime); null for jobs queued before this was tracked
+    public ?float $queuedAt = null;
+
     /**
      * Create a new job instance.
      */
@@ -40,7 +47,31 @@ class MapPlaylistChannelsToEpg implements ShouldQueue
         public ?bool $recurring = false,
         public ?int $epgMapId = null,
         public ?array $settings = null,
-    ) {}
+    ) {
+        $this->queuedAt = microtime(true);
+    }
+
+    /**
+     * Skip the mapping, and the chain it starts, once the user restarts the
+     * EPG map after it was queued.
+     *
+     * @return array<int, object>
+     */
+    public function middleware(): array
+    {
+        return $this->queuedAt !== null && $this->epgMapId !== null
+            ? [$this->syncResetGuard($this->epgMapId)]
+            : [];
+    }
+
+    /**
+     * Guard for this mapping's jobs. Mappings queued before queuedAt was
+     * tracked only guard the chain they start, from now on.
+     */
+    private function syncResetGuard(int $epgMapId): SkipIfSyncReset
+    {
+        return new SkipIfSyncReset(EpgMap::class, $epgMapId, $this->queuedAt ?? microtime(true));
+    }
 
     /**
      * Execute the job.
@@ -201,10 +232,9 @@ class MapPlaylistChannelsToEpg implements ShouldQueue
             // Create jobs array for batch processing
             $jobs = [];
 
-            // Process channels in chunks of 50
-            $chunkSize = 50;
+            // Process channels in chunks
             $channelIds = $channels->pluck('id')->toArray();
-            $chunks = array_chunk($channelIds, $chunkSize);
+            $chunks = array_chunk($channelIds, self::CHUNK_SIZE);
 
             // Create a processing job for each chunk
             foreach ($chunks as $chunk) {
@@ -226,7 +256,7 @@ class MapPlaylistChannelsToEpg implements ShouldQueue
             $jobs[] = new MapEpgToChannelsComplete($epg, 0, $channelCount, 0, $batchNo, $start);
 
             // Dispatch the batch
-            Bus::chain($jobs)
+            Bus::chain($this->syncResetGuard($map->id)->guard($jobs))
                 ->onConnection('redis') // force to use redis connection
                 ->onQueue('import')
                 ->catch(function (Throwable $e) use ($epg, $map) {

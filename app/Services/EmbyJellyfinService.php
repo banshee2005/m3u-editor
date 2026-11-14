@@ -12,6 +12,7 @@ use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use RuntimeException;
+use Throwable;
 
 /**
  * EmbyJellyfinService - The "Brain" for Emby/Jellyfin integration
@@ -56,20 +57,190 @@ class EmbyJellyfinService implements MediaServer
     }
 
     /**
+     * Headers that authenticate JSON API requests against the media server.
+     *
+     * Jellyfin 12 removed the legacy X-Emby-Token header, so Jellyfin uses the
+     * Authorization header with the MediaBrowser scheme (also accepted by
+     * Jellyfin 10.8+). Emby keeps the header it has always documented. The two
+     * mechanisms must never be combined on one request, since Jellyfin 12 rejects
+     * requests carrying more than one token.
+     *
+     * @return array<string, string>
+     */
+    protected function authHeaders(): array
+    {
+        if ($this->integration->isJellyfin()) {
+            return [
+                'Authorization' => sprintf(
+                    'MediaBrowser Token="%s", Client="m3u editor", Device="m3u editor", DeviceId="%s", Version="%s"',
+                    $this->apiKey,
+                    $this->deviceId(),
+                    (string) config('dev.version', '1.0.0'),
+                ),
+            ];
+        }
+
+        return ['X-Emby-Token' => $this->apiKey];
+    }
+
+    /**
+     * DeviceId reported to the server. User-login integrations reuse the
+     * DeviceId their session token was issued for, so the server keeps
+     * showing one device for this integration.
+     */
+    protected function deviceId(): string
+    {
+        if ($this->integration->usesUserLogin() && filled($this->integration->server_username)) {
+            return self::userLoginDeviceId($this->baseUrl, $this->integration->server_username);
+        }
+
+        return substr(sha1('m3u-editor:'.($this->integration->id ?? '')), 0, 32);
+    }
+
+    /**
+     * Stable DeviceId for a username/password login. Emby and Jellyfin
+     * revoke a user's earlier session for the same DeviceId on each new
+     * login, so re-entering the password replaces the old token instead of
+     * piling up devices on the server. It is derived from the server URL and
+     * username (not the record id) because the first login runs before the
+     * integration is saved.
+     */
+    public static function userLoginDeviceId(string $baseUrl, string $username): string
+    {
+        return substr(sha1('m3u-editor:user:'.config('app.key').'|'.rtrim($baseUrl, '/').'|'.mb_strtolower($username)), 0, 32);
+    }
+
+    /**
+     * Exchange a server user's username and password for a session token
+     * via /Users/AuthenticateByName. Works for non-admin users, which cannot
+     * create API keys. The password is only sent to the media server and is
+     * never stored.
+     *
+     * @return array{success: bool, message: string, access_token?: string, user_id?: string, user_name?: string, is_admin?: bool}
+     */
+    public static function authenticateByName(MediaServerIntegration $integration, string $username, string $password): array
+    {
+        $baseUrl = $integration->base_url;
+        $authorization = sprintf(
+            'MediaBrowser Client="m3u editor", Device="m3u editor", DeviceId="%s", Version="%s"',
+            self::userLoginDeviceId($baseUrl, $username),
+            (string) config('dev.version', '1.0.0'),
+        );
+
+        try {
+            $response = Http::baseUrl($baseUrl)
+                ->timeout(30)
+                ->withoutRedirecting()
+                ->withHeaders([
+                    // Jellyfin 12 only reads the standard Authorization header;
+                    // Emby reads X-Emby-Authorization.
+                    $integration->isJellyfin() ? 'Authorization' : 'X-Emby-Authorization' => $authorization,
+                    'Accept' => 'application/json',
+                ])
+                ->post('/Users/AuthenticateByName', [
+                    'Username' => $username,
+                    'Pw' => $password,
+                ]);
+
+            if (in_array($response->status(), [401, 403], true)) {
+                return [
+                    'success' => false,
+                    'message' => __('Invalid username or password.'),
+                ];
+            }
+
+            $accessToken = $response->json('AccessToken');
+            $userId = $response->json('User.Id');
+
+            if (! $response->successful() || ! is_string($accessToken) || $accessToken === '' || ! is_string($userId) || $userId === '') {
+                return [
+                    'success' => false,
+                    'message' => __('Login failed. Server returned status: :status', ['status' => $response->status()]),
+                ];
+            }
+
+            return [
+                'success' => true,
+                'message' => __('Signed in successfully'),
+                'access_token' => $accessToken,
+                'user_id' => $userId,
+                'user_name' => (string) ($response->json('User.Name') ?? $username),
+                'is_admin' => (bool) $response->json('User.Policy.IsAdministrator', false),
+            ];
+        } catch (Throwable $e) {
+            Log::warning('EmbyJellyfinService: User login failed', [
+                'integration_id' => $integration->id,
+                'error' => $e->getMessage(),
+            ]);
+
+            return [
+                'success' => false,
+                'message' => __('Login failed: :error', ['error' => $e->getMessage()]),
+            ];
+        }
+    }
+
+    /**
+     * Add the UserId parameter to an item query for user-login
+     * integrations, so results honor that user's library access. API-key
+     * integrations keep their existing unscoped queries.
+     *
+     * @param  array<string, mixed>  $params
+     * @return array<string, mixed>
+     */
+    protected function userScopedParams(array $params): array
+    {
+        if ($this->integration->usesUserLogin() && filled($this->integration->server_user_id)) {
+            $params['UserId'] = $this->integration->server_user_id;
+        }
+
+        return $params;
+    }
+
+    /**
+     * Query-parameter name that authenticates raw media URLs fetched by
+     * external players and proxies, which cannot attach request headers.
+     * Jellyfin 12 removed the legacy lowercase api_key parameter; ApiKey is
+     * the supported form (accepted by Jellyfin 10.8+). Emby keeps api_key.
+     */
+    protected function authQueryParamName(): string
+    {
+        return $this->integration->isJellyfin() ? 'ApiKey' : 'api_key';
+    }
+
+    /**
      * Get a configured HTTP client for the media server.
      */
     protected function client(bool $withoutRedirecting = false): PendingRequest
     {
         $client = Http::baseUrl($this->baseUrl)
             ->timeout(30)
-            ->withHeaders([
-                'X-Emby-Token' => $this->apiKey,
+            ->withHeaders(array_merge($this->authHeaders(), [
                 'Accept' => 'application/json',
-            ]);
+            ]));
 
         return $withoutRedirecting
             ? $client->withoutRedirecting()
             : $client->retry(2, 1000);
+    }
+
+    /**
+     * Cheap reachability probe for stream-start gating. Unlike
+     * testConnection() this uses short timeouts and no retries (the
+     * non-redirecting client skips them): a dead media server must never
+     * stall playback start for ~90s.
+     */
+    public function isReachable(): bool
+    {
+        try {
+            return $this->client(withoutRedirecting: true)
+                ->connectTimeout(2)
+                ->timeout(3)
+                ->get('/System/Info/Public')
+                ->successful();
+        } catch (Throwable $e) {
+            return false;
+        }
     }
 
     /**
@@ -112,12 +283,17 @@ class EmbyJellyfinService implements MediaServer
 
     /**
      * Fetch available libraries from the media server.
-     * Returns only movies and TV shows libraries.
+     * Returns movies, TV shows, and Mixed Content libraries. Emby reports a Mixed
+     * Content library with an empty/missing CollectionType, so it's normalized to 'mixed'.
      *
      * @return Collection<int, array{id: string, name: string, type: string, item_count: int}>
      */
     public function fetchLibraries(bool $withoutRedirecting = false, bool $failClosed = false): Collection
     {
+        if ($this->integration->usesUserLogin()) {
+            return $this->fetchUserLibraries($withoutRedirecting, $failClosed);
+        }
+
         try {
             $response = $this->client($withoutRedirecting)->get('/Library/VirtualFolders');
 
@@ -125,13 +301,8 @@ class EmbyJellyfinService implements MediaServer
                 $data = $response->json();
 
                 return collect($data ?? [])
-                    ->filter(function ($library) {
-                        // Only include movies and tvshows libraries
-                        $collectionType = $library['CollectionType'] ?? '';
-
-                        return in_array($collectionType, ['movies', 'tvshows']);
-                    })
                     ->map(function ($library) {
+                        $collectionType = $library['CollectionType'] ?? null;
                         $locations = is_array($library['Locations'] ?? null)
                             ? array_values($library['Locations'])
                             : array_values(array_filter([$library['Path'] ?? null]));
@@ -139,7 +310,9 @@ class EmbyJellyfinService implements MediaServer
                         return [
                             'id' => $library['ItemId'] ?? $library['Id'] ?? '',
                             'name' => $library['Name'] ?? 'Unknown Library',
-                            'type' => $library['CollectionType'] ?? 'unknown',
+                            'type' => in_array($collectionType, ['movies', 'tvshows'], true)
+                                ? $collectionType
+                                : 'mixed',
                             'item_count' => $library['ChildCount'] ?? 0,
                             'paths' => $locations,
                             'path' => implode(', ', $locations),
@@ -173,6 +346,64 @@ class EmbyJellyfinService implements MediaServer
     }
 
     /**
+     * Fetch the libraries visible to a user-login integration. Non-admin
+     * users cannot read /Library/VirtualFolders, so this uses the user's
+     * views, whose ids match the library ids admin keys see. Views that are
+     * not libraries (playlists, collections, Live TV, channels) are left out,
+     * and folder paths are not exposed to regular users.
+     *
+     * @return Collection<int, array{id: string, name: string, type: string, item_count: int, paths: list<string>, path: string}>
+     */
+    protected function fetchUserLibraries(bool $withoutRedirecting, bool $failClosed): Collection
+    {
+        try {
+            $response = $this->client($withoutRedirecting)->get("/Users/{$this->getUserId()}/Views");
+
+            if ($response->successful()) {
+                return collect($response->json('Items') ?? [])
+                    ->reject(fn (array $view): bool => in_array($view['CollectionType'] ?? null, ['playlists', 'boxsets', 'livetv', 'channels'], true))
+                    ->map(function (array $view): array {
+                        $collectionType = $view['CollectionType'] ?? null;
+
+                        return [
+                            'id' => $view['Id'] ?? '',
+                            'name' => $view['Name'] ?? 'Unknown Library',
+                            'type' => in_array($collectionType, ['movies', 'tvshows'], true)
+                                ? $collectionType
+                                : 'mixed',
+                            'item_count' => $view['ChildCount'] ?? 0,
+                            'paths' => [],
+                            'path' => '',
+                        ];
+                    })
+                    ->values();
+            }
+
+            Log::warning('EmbyJellyfinService: Failed to fetch user libraries', [
+                'integration_id' => $this->integration->id,
+                'status' => $response->status(),
+            ]);
+
+            if ($failClosed) {
+                throw new RuntimeException('Emby library inventory request failed.');
+            }
+
+            return collect();
+        } catch (Exception $e) {
+            Log::error('EmbyJellyfinService: Error fetching user libraries', [
+                'integration_id' => $this->integration->id,
+                'error' => $e->getMessage(),
+            ]);
+
+            if ($failClosed) {
+                throw $e;
+            }
+
+            return collect();
+        }
+    }
+
+    /**
      * @param  list<string>  $paths
      * @return array{success: bool, created: bool, message: string, library: array<string, mixed>|null, drift: bool}
      */
@@ -182,6 +413,7 @@ class EmbyJellyfinService implements MediaServer
         array $paths,
         bool $refreshLibrary = true,
         ?string $libraryId = null,
+        bool $createIfMissing = true,
     ): array {
         if (! $this->integration->isEmby()) {
             return $this->libraryResult(false, false, 'Managed library creation is supported only for Emby.');
@@ -246,6 +478,8 @@ class EmbyJellyfinService implements MediaServer
             && $library['type'] === $collectionType
             && $containsRequestedPaths($library);
 
+        $createAttempted = false;
+
         try {
             $existingLibraries = $this->fetchLibraries(withoutRedirecting: true, failClosed: true);
             $existingLibrary = $libraryId === null
@@ -292,22 +526,53 @@ class EmbyJellyfinService implements MediaServer
                 return $this->libraryResult(false, false, 'An Emby library already uses this managed path.', $conflictingPathLibrary, true);
             }
 
-            $response = $this->client(withoutRedirecting: true)->post('/Library/VirtualFolders', [
+            if (! $createIfMissing) {
+                return $this->libraryResult(true, false, 'Managed Emby library is pending inventory.');
+            }
+
+            $payload = [
                 'Name' => $name,
                 'CollectionType' => $collectionType,
                 'Paths' => $paths,
                 'RefreshLibrary' => $refreshLibrary,
-            ]);
+            ];
+            $libraryOptions = $this->newLibraryOptions($collectionType, $paths);
+            if ($libraryOptions !== null) {
+                $payload['LibraryOptions'] = $libraryOptions;
+            }
+
+            $createAttempted = true;
+            $response = $this->client(withoutRedirecting: true)->post('/Library/VirtualFolders', $payload);
+
+            if ($response->serverError()) {
+                $reconciledLibrary = $this->fetchLibraries(withoutRedirecting: true, failClosed: true)
+                    ->first($matchesRequest);
+
+                return $reconciledLibrary === null
+                    ? $this->libraryResult(
+                        false,
+                        true,
+                        'Emby library request has an unknown outcome.',
+                    )
+                    : $this->libraryResult(
+                        true,
+                        true,
+                        'Emby library creation was confirmed from inventory.',
+                        $reconciledLibrary,
+                    );
+            }
 
             if (! $response->successful()) {
                 return $this->libraryResult(false, false, 'Emby rejected the library request.');
             }
 
+            $createdLibrary = $this->fetchLibraries(withoutRedirecting: true, failClosed: true)->first($matchesRequest);
+
             return $this->libraryResult(
                 true,
                 true,
                 'Emby library created.',
-                $this->fetchLibraries(withoutRedirecting: true, failClosed: true)->first($matchesRequest),
+                $createdLibrary,
             );
         } catch (Exception $exception) {
             Log::warning('EmbyJellyfinService: Library creation failed', [
@@ -315,8 +580,94 @@ class EmbyJellyfinService implements MediaServer
                 'exception' => $exception::class,
             ]);
 
-            return $this->libraryResult(false, false, 'Emby library request failed.');
+            if ($createAttempted) {
+                try {
+                    $reconciledLibrary = $this->fetchLibraries(withoutRedirecting: true, failClosed: true)
+                        ->first($matchesRequest);
+                    if ($reconciledLibrary !== null) {
+                        return $this->libraryResult(
+                            true,
+                            true,
+                            'Emby library creation was confirmed from inventory.',
+                            $reconciledLibrary,
+                        );
+                    }
+                } catch (Exception) {
+                    // The create outcome remains ambiguous until a later inventory reconcile.
+                }
+            }
+
+            return $this->libraryResult(
+                false,
+                $createAttempted,
+                $createAttempted
+                    ? 'Emby library request has an unknown outcome.'
+                    : 'Emby library request failed before creation.',
+            );
         }
+    }
+
+    /**
+     * Build the LibraryOptions Emby's own web UI sends when adding a library.
+     * Without them, an API-created library has no TypeOptions, so every
+     * metadata and image downloader is off and items never get artwork or
+     * online metadata. Returns null when discovery fails, keeping the
+     * previous options-less create as the fallback.
+     *
+     * @param  list<string>  $paths
+     * @return array<string, mixed>|null
+     */
+    private function newLibraryOptions(string $collectionType, array $paths): ?array
+    {
+        try {
+            $response = $this->client(withoutRedirecting: true)->get('/Libraries/AvailableOptions', [
+                'LibraryContentType' => $collectionType,
+                'IsNewLibrary' => 'true',
+            ]);
+        } catch (Exception $exception) {
+            Log::warning('EmbyJellyfinService: Library options discovery failed', [
+                'integration_id' => $this->integration->id,
+                'exception' => $exception::class,
+            ]);
+
+            return null;
+        }
+
+        $available = $response->json();
+        if (! $response->successful() || ! is_array($available) || ! is_array($available['TypeOptions'] ?? null)) {
+            return null;
+        }
+
+        $enabledNames = fn (mixed $fetchers): array => collect(is_array($fetchers) ? $fetchers : [])
+            ->filter(fn (mixed $fetcher): bool => is_array($fetcher)
+                && is_string($fetcher['Name'] ?? null)
+                && ($fetcher['DefaultEnabled'] ?? false) === true)
+            ->pluck('Name')
+            ->all();
+
+        $typeOptions = collect($available['TypeOptions'])
+            ->filter(fn (mixed $typeOption): bool => is_array($typeOption) && is_string($typeOption['Type'] ?? null))
+            ->map(fn (array $typeOption): array => [
+                'Type' => $typeOption['Type'],
+                'MetadataFetchers' => $enabledNames($typeOption['MetadataFetchers'] ?? null),
+                'MetadataFetcherOrder' => [],
+                'ImageFetchers' => $enabledNames($typeOption['ImageFetchers'] ?? null),
+                'ImageFetcherOrder' => [],
+                'ImageOptions' => [],
+            ])
+            ->values()
+            ->all();
+
+        if ($typeOptions === []) {
+            return null;
+        }
+
+        $defaults = is_array($available['DefaultLibraryOptions'] ?? null) ? $available['DefaultLibraryOptions'] : [];
+
+        return array_replace($defaults, [
+            'PathInfos' => array_map(fn (string $path): array => ['Path' => $path], $paths),
+            'TypeOptions' => $typeOptions,
+        ]);
     }
 
     /**
@@ -355,7 +706,7 @@ class EmbyJellyfinService implements MediaServer
             $params = [
                 'IncludeItemTypes' => 'Movie',
                 'Recursive' => 'true',
-                'Fields' => 'Genres,Path,MediaSources,Overview,CommunityRating,OfficialRating,ProductionYear,RunTimeTicks,People,OriginalTitle,PremiereDate,ProductionLocations',
+                'Fields' => 'Genres,Path,MediaSources,Overview,CommunityRating,OfficialRating,ProductionYear,RunTimeTicks,People,OriginalTitle,PremiereDate,ProductionLocations,Studios,ProviderIds,DateCreated',
                 'EnableImages' => 'true',
                 'ImageTypeLimit' => 1,
             ];
@@ -367,7 +718,7 @@ class EmbyJellyfinService implements MediaServer
                 $allMovies = collect();
                 foreach ($importLibraryIds as $libraryId) {
                     $params['ParentId'] = $libraryId;
-                    $response = $this->client()->get('/Items', $params);
+                    $response = $this->client()->get('/Items', $this->userScopedParams($params));
 
                     if ($response->successful()) {
                         $data = $response->json();
@@ -379,7 +730,7 @@ class EmbyJellyfinService implements MediaServer
             }
 
             // No library filter - fetch all movies
-            $response = $this->client()->get('/Items', $params);
+            $response = $this->client()->get('/Items', $this->userScopedParams($params));
 
             if ($response->successful()) {
                 $data = $response->json();
@@ -427,7 +778,7 @@ class EmbyJellyfinService implements MediaServer
                 $allSeries = collect();
                 foreach ($importLibraryIds as $libraryId) {
                     $params['ParentId'] = $libraryId;
-                    $response = $this->client()->get('/Items', $params);
+                    $response = $this->client()->get('/Items', $this->userScopedParams($params));
 
                     if ($response->successful()) {
                         $data = $response->json();
@@ -439,7 +790,7 @@ class EmbyJellyfinService implements MediaServer
             }
 
             // No library filter - fetch all series
-            $response = $this->client()->get('/Items', $params);
+            $response = $this->client()->get('/Items', $this->userScopedParams($params));
 
             if ($response->successful()) {
                 $data = $response->json();
@@ -472,7 +823,7 @@ class EmbyJellyfinService implements MediaServer
     {
         try {
             $response = $this->client()->get("/Users/{$this->getUserId()}/Items/{$seriesId}", [
-                'Fields' => 'Genres,Overview,CommunityRating,OfficialRating,ProductionYear,People,ProviderIds,ExternalUrls',
+                'Fields' => 'Genres,Overview,CommunityRating,OfficialRating,ProductionYear,People,ProviderIds,ExternalUrls,Studios',
             ]);
 
             if ($response->successful()) {
@@ -496,9 +847,9 @@ class EmbyJellyfinService implements MediaServer
      */
     protected function getUserId(): string
     {
-        // Try to get from integration config, or use a default admin user lookup
-        if (! empty($this->integration->user_id_emby)) {
-            return $this->integration->user_id_emby;
+        // User-login integrations store the signed-in user; API-key integrations fall back to the first admin
+        if (! empty($this->integration->server_user_id)) {
+            return $this->integration->server_user_id;
         }
 
         // Fallback: fetch users and use the first admin
@@ -531,9 +882,9 @@ class EmbyJellyfinService implements MediaServer
     public function fetchSeasons(string $seriesId): Collection
     {
         try {
-            $response = $this->client()->get("/Shows/{$seriesId}/Seasons", [
+            $response = $this->client()->get("/Shows/{$seriesId}/Seasons", $this->userScopedParams([
                 'Fields' => 'Overview',
-            ]);
+            ]));
 
             if ($response->successful()) {
                 $data = $response->json();
@@ -571,7 +922,7 @@ class EmbyJellyfinService implements MediaServer
                 $params['SeasonId'] = $seasonId;
             }
 
-            $response = $this->client()->get("/Shows/{$seriesId}/Episodes", $params);
+            $response = $this->client()->get("/Shows/{$seriesId}/Episodes", $this->userScopedParams($params));
 
             if ($response->successful()) {
                 $data = $response->json();
@@ -663,7 +1014,7 @@ class EmbyJellyfinService implements MediaServer
 
         // Base parameters
         $params = [
-            'api_key' => $this->apiKey,
+            $this->authQueryParamName() => $this->apiKey,
         ];
 
         // static=true means "send file as-is, no transcoding". Only disable it
@@ -689,7 +1040,7 @@ class EmbyJellyfinService implements MediaServer
         $hasTrackPreference = $request->has('PreferredAudioTrack') || $request->has('PreferredSubtitleTrack');
         if ($hasTrackPreference) {
             try {
-                $response = $this->client()->get("/Items/{$itemId}", ['Fields' => 'MediaSources']);
+                $response = $this->client()->get("/Items/{$itemId}", $this->userScopedParams(['Fields' => 'MediaSources']));
 
                 if ($response->successful()) {
                     $mediaSources = $response->json('MediaSources') ?? [];
@@ -798,10 +1149,13 @@ class EmbyJellyfinService implements MediaServer
      *
      * @param  string  $itemId  The media server's item ID
      * @param  string  $imageType  Image type: 'Primary', 'Backdrop', 'Logo', etc.
+     * @param  int|null  $maxWidth  Have the server downscale to this width (never upscales)
      */
-    public function getDirectImageUrl(string $itemId, string $imageType = 'Primary'): string
+    public function getDirectImageUrl(string $itemId, string $imageType = 'Primary', ?int $maxWidth = null): string
     {
-        return "{$this->baseUrl}/Items/{$itemId}/Images/{$imageType}?api_key={$this->apiKey}";
+        $url = "{$this->baseUrl}/Items/{$itemId}/Images/{$imageType}?".$this->authQueryParamName()."={$this->apiKey}";
+
+        return $maxWidth ? "{$url}&maxWidth={$maxWidth}" : $url;
     }
 
     /**
@@ -868,6 +1222,14 @@ class EmbyJellyfinService implements MediaServer
      */
     public function refreshLibrary(): array
     {
+        // /Library/Refresh is admin-only; a user-login session would just get a 403.
+        if ($this->integration->usesUserLogin()) {
+            return [
+                'success' => false,
+                'message' => __('Library refresh requires an administrator API key. This integration signs in as a server user.'),
+            ];
+        }
+
         try {
             // Both Emby and Jellyfin use the same endpoint for library refresh
             $response = $this->client()->post('/Library/Refresh');
@@ -927,13 +1289,13 @@ class EmbyJellyfinService implements MediaServer
     {
         for ($attempt = 1; $attempt <= $attempts; $attempt++) {
             // Emby/Jellyfin requires /Items?Ids={id} — the /Items/{id} form 404s on some versions.
-            $response = $this->client()->get('/Items', [
+            $response = $this->client()->get('/Items', $this->userScopedParams([
                 'Ids' => $itemId,
                 // RunTimeTicks lets getStreamByteSize() return runtime alongside the byte
                 // size in a single backend round-trip. Other callers (subtitles, audio
                 // stream lookup) ignore this field.
                 'fields' => 'MediaStreams,RunTimeTicks',
-            ]);
+            ]));
 
             if ($response->successful()) {
                 $item = ($response->json('Items') ?? [])[0] ?? null;
@@ -1047,7 +1409,7 @@ class EmbyJellyfinService implements MediaServer
                 $seekPath = $seekSeconds > 0 ? ($seekSeconds * 10_000_000).'/' : '';
 
                 return [
-                    'url' => "{$this->baseUrl}/Videos/{$itemId}/{$mediaSourceId}/Subtitles/{$index}/{$seekPath}Stream.{$format}?api_key={$this->apiKey}",
+                    'url' => "{$this->baseUrl}/Videos/{$itemId}/{$mediaSourceId}/Subtitles/{$index}/{$seekPath}Stream.{$format}?".$this->authQueryParamName()."={$this->apiKey}",
                     'language' => $stream['Language'] ?? null,
                     'server_seeked' => $seekSeconds > 0,
                 ];
@@ -1161,13 +1523,18 @@ class EmbyJellyfinService implements MediaServer
         }
 
         try {
+            // Jellyfin authenticates through the Authorization header alone:
+            // pairing it with an auth query parameter is rejected by Jellyfin
+            // 12. Emby keeps its historical header + api_key query combination.
+            $query = ['static' => 'true'];
+            if (! $this->integration->isJellyfin()) {
+                $query['api_key'] = $this->apiKey;
+            }
+
             $response = Http::baseUrl($this->baseUrl)
                 ->timeout(10)
-                ->withHeaders(['X-Emby-Token' => $this->apiKey])
-                ->head('/Videos/'.$itemId.'/stream.ts', [
-                    'static' => 'true',
-                    'api_key' => $this->apiKey,
-                ]);
+                ->withHeaders($this->authHeaders())
+                ->head('/Videos/'.$itemId.'/stream.ts', $query);
 
             if (! $response->successful()) {
                 return null;

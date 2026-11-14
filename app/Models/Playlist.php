@@ -5,9 +5,18 @@ namespace App\Models;
 use App\Enums\EpgSourceType;
 use App\Enums\PlaylistChannelId;
 use App\Enums\PlaylistSourceType;
+use App\Enums\SeriesProbeScope;
 use App\Enums\Status;
+use App\Jobs\MatchMediaServerSources;
+use App\Jobs\SyncSeriesStrmFiles;
+use App\Jobs\SyncVodStrmFiles;
 use App\Jobs\UpdateXtreamStats;
+use App\Services\DvrVodIntegrationService;
+use App\Settings\GeneralSettings;
+use App\Traits\HasDefaultAuth;
 use App\Traits\ShortUrlTrait;
+use Carbon\CarbonInterface;
+use Cron\CronExpression;
 use Illuminate\Database\Eloquent\Casts\Attribute;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
@@ -22,6 +31,7 @@ use Illuminate\Support\Facades\Cache;
 
 class Playlist extends Model
 {
+    use HasDefaultAuth;
     use HasFactory;
     use ShortUrlTrait;
 
@@ -51,9 +61,14 @@ class Playlist extends Model
         'proxy_options' => 'array',
         'short_urls_enabled' => 'boolean',
         'backup_before_sync' => 'boolean',
+        'hdhr_enabled' => 'boolean',
+        'm3u_enabled' => 'boolean',
+        'xapi_enabled' => 'boolean',
+        'xmltv_enabled' => 'boolean',
         'sync_logs_enabled' => 'boolean',
         'include_series_in_m3u' => 'boolean',
         'include_vod_in_m3u' => 'boolean',
+        'sort_by_channel_number' => 'boolean',
         'auto_fetch_series_metadata' => 'boolean',
         'auto_sync_series_stream_files' => 'boolean',
         'auto_merge_channels_enabled' => 'boolean',
@@ -62,11 +77,15 @@ class Playlist extends Model
         'auto_probe_streams' => 'boolean',
         'reclassify_vod_groups_to_tmdb_genres' => 'boolean',
         'reclassify_series_categories_to_tmdb_genres' => 'boolean',
+        'prefer_media_server_sources' => 'boolean',
         'auto_probe_streams_only_unprobed' => 'boolean',
         'auto_probe_streams_include_disabled' => 'boolean',
         'auto_probe_vod_streams' => 'boolean',
         'auto_probe_vod_streams_only_unprobed' => 'boolean',
         'auto_probe_vod_streams_include_disabled' => 'boolean',
+        'auto_probe_vod_streams_retry_failed_days' => 'integer',
+        'auto_probe_vod_streams_failure_threshold' => 'integer',
+        'auto_probe_series_scope' => SeriesProbeScope::class,
         'probe_use_batching' => 'boolean',
         'probe_timeout' => 'integer',
         'find_replace_rules' => 'array',
@@ -93,11 +112,114 @@ class Playlist extends Model
         'enable_series' => 'boolean',
         'auto_retry_503_count' => 'integer',
         'auto_retry_503_last_at' => 'datetime',
+        'auto_resync_on_failure' => 'boolean',
+        'auto_resync_retries' => 'integer',
+        'resync_attempt' => 'integer',
+        'share_cache_across_playlists' => 'boolean',
     ];
+
+    protected static function booted(): void
+    {
+        // Rebuild (or clear) media source matches whenever the toggle flips.
+        // On → match the current content; off → the rebuild deletes the rows.
+        // Uses the job's own ::dispatch (not the global dispatch() helper):
+        // the helper's PendingDispatch path acquires ShouldBeUnique locks
+        // before the bus fake sees the job, which silently drops it in tests.
+        static::updated(function (Playlist $playlist): void {
+            if ($playlist->wasChanged('prefer_media_server_sources')) {
+                MatchMediaServerSources::dispatch($playlist->id);
+            }
+
+            // Stored links follow the default login: legacy DVR VOD URLs carrying the
+            // owner login are re-signed, and STRM files are rewritten with the new
+            // internal password (HasDefaultAuth rotates the secret on every change).
+            if ($playlist->wasChanged(['default_auth_mode', 'internal_auth_secret'])) {
+                app(DvrVodIntegrationService::class)->refreshStreamUrls($playlist);
+                $playlist->dispatchStrmRefresh();
+            }
+        });
+    }
+
+    /**
+     * Rewrite this playlist's STRM files outside a sync run, for whichever of its
+     * VOD/series STRM syncs are enabled.
+     */
+    public function dispatchStrmRefresh(): void
+    {
+        if ($this->auto_sync_vod_stream_files) {
+            dispatch(new SyncVodStrmFiles(notify: false, playlist: $this));
+        }
+
+        if ($this->auto_sync_series_stream_files) {
+            dispatch(new SyncSeriesStrmFiles(
+                notify: false,
+                playlist_id: $this->id,
+                user_id: $this->user_id,
+            ));
+        }
+    }
 
     public function getFolderPathAttribute(): string
     {
         return "playlist/{$this->uuid}";
+    }
+
+    /**
+     * The playlist's sync schedule as a cron expression ("24hr" is stored as a legacy alias).
+     */
+    public function syncCronExpression(): CronExpression
+    {
+        return new CronExpression(self::normalizeSyncInterval($this->sync_interval));
+    }
+
+    /**
+     * Next time a regular scheduled sync would run after the given moment, or null
+     * when the stored interval is missing or not a valid cron expression.
+     */
+    public function nextScheduledSyncAfter(CarbonInterface $from): ?CarbonInterface
+    {
+        return self::nextSyncForInterval($this->sync_interval, $from);
+    }
+
+    /**
+     * Next run of a sync interval after the given moment (defaults to now), or null
+     * when the interval is missing or not a valid cron expression. Static so forms can
+     * preview an unsaved interval.
+     */
+    public static function nextSyncForInterval(?string $interval, ?CarbonInterface $from = null): ?CarbonInterface
+    {
+        $from ??= now();
+        $expression = self::normalizeSyncInterval($interval);
+
+        if ($expression === '' || ! CronExpression::isValidExpression($expression)) {
+            return null;
+        }
+
+        return $from->copy()->setTimestamp(
+            (new CronExpression($expression))->getNextRunDate($from->toDateTimeImmutable())->getTimestamp()
+        );
+    }
+
+    private static function normalizeSyncInterval(?string $interval): string
+    {
+        return $interval === '24hr' ? '0 0 * * *' : (string) $interval;
+    }
+
+    /**
+     * Effective cache retention mode: this playlist's override when set,
+     * otherwise the global `general.cache_retention_mode` (default
+     * `automatic`). Values: automatic, never-expire, manual.
+     */
+    public function effectiveCacheRetentionMode(): string
+    {
+        $override = $this->cache_retention_mode;
+        if (is_string($override) && $override !== '') {
+            return $override;
+        }
+
+        $global = app(GeneralSettings::class)->cache_retention_mode ?? null;
+
+        return is_string($global) && $global !== '' ? $global : 'automatic';
     }
 
     public function getFilePathAttribute(): string

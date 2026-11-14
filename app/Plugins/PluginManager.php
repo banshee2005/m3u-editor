@@ -2,17 +2,25 @@
 
 namespace App\Plugins;
 
+use App\Exceptions\PluginApiRequestException;
 use App\Jobs\ExecutePluginInvocation;
+use App\Models\CustomPlaylist;
+use App\Models\MergedPlaylist;
+use App\Models\Playlist;
+use App\Models\PlaylistAlias;
+use App\Models\PlaylistAuth;
 use App\Models\Plugin;
 use App\Models\PluginInstallReview;
 use App\Models\PluginRun;
 use App\Models\User;
+use App\Plugins\Contracts\ApiEndpointPluginInterface;
 use App\Plugins\Contracts\HookablePluginInterface;
 use App\Plugins\Contracts\LifecyclePluginInterface;
 use App\Plugins\Contracts\PluginInterface;
 use App\Plugins\Contracts\PluginSelectOptionsProviderInterface;
 use App\Plugins\Contracts\ScheduledPluginInterface;
 use App\Plugins\Support\PluginActionResult;
+use App\Plugins\Support\PluginApiRequestContext;
 use App\Plugins\Support\PluginExecutionContext;
 use App\Plugins\Support\PluginSelectOptionsContext;
 use App\Plugins\Support\PluginUninstallContext;
@@ -26,10 +34,12 @@ use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Support\Str;
+use Illuminate\Validation\ValidationException;
 use InvalidArgumentException;
 use PharData;
 use RuntimeException;
@@ -70,6 +80,7 @@ class PluginManager
                 'capabilities' => $manifest?->capabilities ?? Arr::get($result->manifestData, 'capabilities', []),
                 'hooks' => $manifest?->hooks ?? Arr::get($result->manifestData, 'hooks', []),
                 'actions' => $manifest?->actions ?? Arr::get($result->manifestData, 'actions', []),
+                'api_endpoints' => $manifest?->apiEndpoints ?? [],
                 'permissions' => $manifest?->permissions ?? Arr::get($result->manifestData, 'permissions', []),
                 'schema_definition' => $manifest?->schema ?? Arr::get($result->manifestData, 'schema', []),
                 'settings_schema' => $manifest?->settings ?? Arr::get($result->manifestData, 'settings', []),
@@ -157,6 +168,7 @@ class PluginManager
             'capabilities' => $result->manifest?->capabilities ?? $plugin->capabilities,
             'hooks' => $result->manifest?->hooks ?? $plugin->hooks,
             'actions' => $result->manifest?->actions ?? $plugin->actions,
+            'api_endpoints' => $result->manifest?->apiEndpoints ?? $plugin->api_endpoints,
             'permissions' => $result->manifest?->permissions ?? $plugin->permissions,
             'schema_definition' => $result->manifest?->schema ?? $plugin->schema_definition,
             'settings_schema' => $result->manifest?->settings ?? $plugin->settings_schema,
@@ -662,6 +674,107 @@ class PluginManager
         return $metadata['owner'].'/'.$metadata['repo'];
     }
 
+    /**
+     * Answer an authenticated Xtream login's call to a manifest-declared API endpoint.
+     *
+     * Only ids listed in the trusted manifest are routable, and the plugin only ever sees
+     * the endpoint's declared fields after host validation.
+     *
+     * @param  array<string, mixed>  $input
+     * @return array<mixed>
+     *
+     * @throws PluginApiRequestException
+     */
+    public function handleApiRequest(
+        string $pluginId,
+        string $endpointId,
+        array $input,
+        Playlist|CustomPlaylist|MergedPlaylist|PlaylistAlias $playlist,
+        ?PlaylistAuth $playlistAuth = null,
+    ): array {
+        if (! config('plugins.enabled', true)) {
+            throw PluginApiRequestException::notFound();
+        }
+
+        $plugin = $this->findPluginById($pluginId);
+        if (! $plugin || ! $plugin->isInstalled() || ! $plugin->available || $plugin->getApiEndpointDefinition($endpointId) === null) {
+            throw PluginApiRequestException::notFound();
+        }
+
+        $plugin = $this->pluginReadyForApiRequest($plugin);
+
+        // Re-check against the (possibly refreshed) registry row: the declaration may have changed on disk.
+        if (! $plugin->exposesApiEndpoints() || $plugin->getApiEndpointDefinition($endpointId) === null) {
+            throw PluginApiRequestException::notFound();
+        }
+
+        $validator = Validator::make($input, $this->schemaMapper->apiEndpointRules($plugin, $endpointId));
+        if ($validator->fails()) {
+            throw PluginApiRequestException::invalidPayload($validator->errors()->keys());
+        }
+
+        try {
+            $instance = $this->resolvePluginInstance($plugin);
+            if (! $instance instanceof ApiEndpointPluginInterface) {
+                throw new RuntimeException("Plugin [{$plugin->plugin_id}] does not implement API endpoints.");
+            }
+
+            return $instance->handleApiRequest(
+                $endpointId,
+                $validator->validated(),
+                PluginApiRequestContext::make($plugin, $endpointId, $playlist, $playlistAuth, $this->resolvedSettings($plugin)),
+            );
+        } catch (ValidationException $exception) {
+            throw PluginApiRequestException::invalidPayload(array_keys($exception->errors()));
+        } catch (Throwable $exception) {
+            Log::warning('Plugin API request failed', [
+                'plugin_id' => $plugin->plugin_id,
+                'endpoint' => $endpointId,
+                'exception' => $exception,
+            ]);
+
+            throw PluginApiRequestException::failed();
+        }
+    }
+
+    /**
+     * Re-hash the plugin's files against the trusted snapshot before loading its code,
+     * the same guarantee instantiate() gives actions and hooks. The registry row is
+     * only rewritten (via validate()) when something drifted, so a busy endpoint does
+     * not write to the database on every request.
+     *
+     * @throws PluginApiRequestException
+     */
+    private function pluginReadyForApiRequest(Plugin $plugin): Plugin
+    {
+        $onDisk = $this->normalizeHashSnapshot(
+            $this->integrityService->hashesForPlugin((string) $plugin->path, $plugin->entrypoint),
+        );
+
+        $unchanged = $onDisk !== []
+            && $onDisk === $this->normalizeHashSnapshot($plugin->trusted_hashes ?? [])
+            && $onDisk === $this->currentHashSnapshot($plugin)
+            && $plugin->validation_status === 'valid'
+            && $plugin->hasVerifiedIntegrity();
+
+        if (! $unchanged) {
+            $plugin = $this->validate($plugin);
+        }
+
+        if (! $plugin->available) {
+            throw PluginApiRequestException::notFound();
+        }
+
+        try {
+            $this->assertPluginLoadable($plugin, requireEnabled: true);
+            $this->assertPluginRunnable($plugin);
+        } catch (RuntimeException) {
+            throw PluginApiRequestException::forbidden();
+        }
+
+        return $plugin;
+    }
+
     public function executeAction(
         Plugin $plugin,
         string $action,
@@ -792,26 +905,87 @@ class PluginManager
      */
     public function selectOptions(Plugin $plugin, string $provider, array $state = [], array $field = []): array
     {
-        $plugin = $this->validate($plugin);
-        $this->assertPluginLoadable($plugin, requireEnabled: false);
-        $this->assertPluginTrustedForUi($plugin);
+        $plugin = $this->validatedUiPlugin($plugin);
+        $cache = app(PluginUiRequestCache::class);
 
-        $instance = $this->resolvePluginInstance($plugin);
+        return $cache->remember('options', $this->uiProviderKey($plugin, $provider, $state, $field), function () use ($plugin, $provider, $state, $field): array {
+            $instance = $this->resolvePluginInstance($plugin);
 
-        if (! $instance instanceof PluginSelectOptionsProviderInterface) {
-            throw new RuntimeException("Plugin [{$plugin->plugin_id}] does not provide dynamic select options.");
-        }
+            if (! $instance instanceof PluginSelectOptionsProviderInterface) {
+                throw new RuntimeException("Plugin [{$plugin->plugin_id}] does not provide dynamic select options.");
+            }
 
-        return $this->normalizeSelectOptions($instance->selectOptions(
+            return $this->normalizeSelectOptions($instance->selectOptions(
+                $provider,
+                $this->uiProviderContext($plugin, $state, $field),
+            ));
+        });
+    }
+
+    public function fieldVisible(Plugin $plugin, string $provider, array $state = [], array $field = []): bool
+    {
+        $plugin = $this->validatedUiPlugin($plugin);
+
+        return app(PluginUiRequestCache::class)->remember('visibility', $this->uiProviderKey($plugin, $provider, $state, $field), function () use ($plugin, $provider, $state, $field): bool {
+            $instance = $this->resolvePluginInstance($plugin);
+
+            if (! is_callable([$instance, 'isFieldVisible'])) {
+                throw new RuntimeException(__('Plugin [:plugin] does not provide field visibility.', ['plugin' => $plugin->plugin_id]));
+            }
+
+            $visible = $instance->isFieldVisible($provider, $this->uiProviderContext($plugin, $state, $field));
+            if (! is_bool($visible)) {
+                throw new RuntimeException(__('Plugin field visibility must return a boolean.'));
+            }
+
+            return $visible;
+        });
+    }
+
+    private function validatedUiPlugin(Plugin $plugin): Plugin
+    {
+        // Recheck registry state even on cache hits so blocking or uninstalling takes effect immediately.
+        $plugin = $plugin->fresh() ?? throw new RuntimeException(__('Plugin is no longer available.'));
+        $cache = app(PluginUiRequestCache::class);
+        $key = [spl_object_id($plugin->getConnection()), $plugin->getKey(), $plugin->getAttributes()];
+        $validated = $cache->remember('validation', $key, function () use ($plugin, $cache): Plugin {
+            $validated = $this->validate($plugin);
+
+            // Validation updates registry metadata; reuse the result under both before and after keys.
+            return $cache->remember('validation', [
+                spl_object_id($validated->getConnection()),
+                $validated->getKey(),
+                $validated->getAttributes(),
+            ], fn (): Plugin => $validated);
+        });
+        $this->assertPluginLoadable($validated, requireEnabled: false);
+        $this->assertPluginTrustedForUi($validated);
+
+        return $validated;
+    }
+
+    private function uiProviderKey(Plugin $plugin, string $provider, array $state, array $field): array
+    {
+        return [
+            spl_object_id($plugin->getConnection()),
+            $plugin->getKey(),
+            $plugin->getAttributes(),
+            auth()->user()?->getAttributes(),
             $provider,
-            new PluginSelectOptionsContext(
-                plugin: $plugin->fresh() ?? $plugin,
-                user: auth()->user(),
-                settings: $this->resolvedSettings($plugin),
-                state: $state,
-                field: $field,
-            ),
-        ));
+            $state,
+            $field,
+        ];
+    }
+
+    private function uiProviderContext(Plugin $plugin, array $state, array $field): PluginSelectOptionsContext
+    {
+        return new PluginSelectOptionsContext(
+            plugin: $plugin,
+            user: auth()->user(),
+            settings: $this->resolvedSettings($plugin),
+            state: $state,
+            field: $field,
+        );
     }
 
     public function instantiate(Plugin $plugin): PluginInterface

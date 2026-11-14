@@ -11,9 +11,13 @@ use App\Models\MergedPlaylist;
 use App\Models\Playlist;
 use App\Models\PlaylistAlias;
 use App\Services\PlaylistUrlService;
+use App\Support\ChannelNumber;
+use Dedoc\Scramble\Attributes\Group as ApiGroup;
+use Dedoc\Scramble\Attributes\Response as ApiResponse;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Redirect;
 
 /**
@@ -22,6 +26,7 @@ use Illuminate\Support\Facades\Redirect;
  * Implements the subset of Dispatcharr API endpoints that emby-xtream
  * expects, using the existing PlaylistAuth credentials for authentication.
  */
+#[ApiGroup('Dispatcharr', 'Dispatcharr-compatible endpoints for clients built against Dispatcharr, such as the emby-xtream plugin.', weight: 100)]
 class DispatcharrController extends Controller
 {
     /**
@@ -113,6 +118,47 @@ class DispatcharrController extends Controller
 
         $profiles = [];
 
+        // A PlaylistAlias wrapping a CustomPlaylist exposes its own channels()/groupTags()
+        // that already delegate to the effective CustomPlaylist (see PlaylistAlias::groups()/
+        // groupTags()), so it needs the same tag-based branch below - the Group-model branch
+        // it fell through to otherwise calls whereHas('channels') on a Spatie Tag, which has
+        // no such relation.
+        if ($playlist instanceof CustomPlaylist || ($playlist instanceof PlaylistAlias && $playlist->custom_playlist_id)) {
+            // CustomPlaylist groups are Spatie tags, not Group models - they have
+            // no channels()/enabled_live_channels() relations, so membership is
+            // resolved through the taggables table instead.
+            $channelIds = $playlist->channels()
+                ->where('channels.enabled', true)
+                ->where('channels.is_vod', false)
+                ->pluck('channels.id');
+
+            $tags = $playlist->groupTags()
+                ->whereIn('id', function ($query) use ($channelIds) {
+                    $query->select('tag_id')
+                        ->from('taggables')
+                        ->where('taggable_type', Channel::class)
+                        ->whereIn('taggable_id', $channelIds);
+                })
+                ->orderBy('order_column')
+                ->get();
+
+            foreach ($tags as $tag) {
+                $taggedChannelIds = DB::table('taggables')
+                    ->where('taggable_type', Channel::class)
+                    ->where('tag_id', $tag->id)
+                    ->whereIn('taggable_id', $channelIds)
+                    ->pluck('taggable_id');
+
+                $profiles[] = [
+                    'id' => $tag->id,
+                    'name' => $tag->name,
+                    'channels' => $taggedChannelIds->values()->all(),
+                ];
+            }
+
+            return response()->json($profiles);
+        }
+
         // Build one profile per live group with its enabled channel IDs
         $groups = $playlist->groups()
             ->whereHas('channels', fn ($q) => $q->where('enabled', true)->where('is_vod', false))
@@ -151,7 +197,8 @@ class DispatcharrController extends Controller
         $channelsQuery = $playlist->channels()
             ->where('channels.enabled', true)
             ->where('channels.is_vod', false)
-            ->orderBy('channels.channel');
+            ->orderBy('channels.channel')
+            ->orderByRaw('COALESCE(channels.channel_minor, 0)');
 
         $total = $channelsQuery->count();
 
@@ -166,7 +213,10 @@ class DispatcharrController extends Controller
                 'id' => $channel->id,
                 'uuid' => $channel->uuid,
                 'name' => $channel->name_custom ?? $channel->name,
-                'channel_number' => $channel->channel ?: null,
+                // Dispatcharr stores channel numbers as floats, so a sub-channel reports as 5.1
+                'channel_number' => $channel->channel
+                    ? ($channel->channel_minor ? (float) ChannelNumber::format($channel->channel, $channel->channel_minor) : $channel->channel)
+                    : null,
                 'tvg_id' => $channel->source_id ?? $channel->stream_id ?? (string) $channel->id,
                 'tvc_guide_stationid' => '',
             ];
@@ -195,12 +245,19 @@ class DispatcharrController extends Controller
     }
 
     /**
-     * GET /proxy/ts/stream/{uuid}
+     * Stream a channel
      *
-     * Stream proxy endpoint. Looks up the channel by its stable uuid,
-     * resolves the playlist from the authenticated bearer token, then redirects
-     * to the actual stream URL or proxies through m3u-proxy.
+     * Dispatcharr-compatible stream endpoint used by the emby-xtream plugin. Looks up the
+     * channel by its stable UUID and resolves the playlist from the optional Dispatcharr
+     * bearer token (falling back to the channel's own playlist), then streams through
+     * m3u-proxy when the playlist has the proxy enabled, or redirects to the stream URL.
+     *
+     * @response JsonResponse<array{error: 'Channel not found'|'Playlist not found'}, 404>
+     *
+     * @unauthenticated
      */
+    #[ApiResponse(200, 'The stream, when the playlist has the proxy enabled.', mediaType: 'video/mp2t', type: 'string', format: 'binary')]
+    #[ApiResponse(302, 'Redirect to the channel stream URL, when the playlist does not use the proxy.', mediaType: 'text/html')]
     public function proxyStream(Request $request, string $uuid): RedirectResponse|JsonResponse
     {
         $channel = Channel::where('uuid', $uuid)->first();
@@ -252,14 +309,7 @@ class DispatcharrController extends Controller
             return response()->json(['detail' => 'Playlist not found'], 404);
         }
 
-        $channel = $playlist->channels()
-            ->where('channels.is_vod', true)
-            ->where('channels.enabled', true)
-            ->where(function ($q) use ($streamId) {
-                $q->where('channels.source_id', (string) $streamId)
-                    ->orWhere('channels.id', $streamId);
-            })
-            ->first();
+        $channel = $this->resolveVodChannelByStreamId($playlist, $streamId);
 
         if (! $channel) {
             return response()->json(['detail' => 'Movie not found'], 404);
@@ -283,14 +333,7 @@ class DispatcharrController extends Controller
             return response()->json(['detail' => 'Playlist not found'], 404);
         }
 
-        $channel = $playlist->channels()
-            ->where('channels.is_vod', true)
-            ->where('channels.enabled', true)
-            ->where(function ($q) use ($streamId) {
-                $q->where('channels.source_id', (string) $streamId)
-                    ->orWhere('channels.id', $streamId);
-            })
-            ->first();
+        $channel = $this->resolveVodChannelByStreamId($playlist, $streamId);
 
         if (! $channel) {
             return response()->json([], 200);
@@ -305,6 +348,25 @@ class DispatcharrController extends Controller
                 'name' => $channel->name_custom ?? $channel->name,
             ],
         ]);
+    }
+
+    /**
+     * Resolve a VOD channel by the Xtream stream ID the editor's own
+     * get_vod_streams listing emits for it, i.e. its internal id. A separate
+     * movie's imported provider `source_id` can collide with that internal
+     * id, so checking `id` first and only falling back to `source_id` when
+     * no internal match exists keeps the editor's own listing authoritative
+     * over the provider-ID compatibility lookup.
+     */
+    private function resolveVodChannelByStreamId(Playlist|CustomPlaylist|MergedPlaylist|PlaylistAlias $playlist, int $streamId): ?Channel
+    {
+        $baseQuery = fn () => $playlist->channels()
+            ->where('channels.is_vod', true)
+            ->where('channels.enabled', true);
+
+        $channel = $baseQuery()->where('channels.id', $streamId)->first();
+
+        return $channel ?? $baseQuery()->where('channels.source_id', (string) $streamId)->first();
     }
 
     /**

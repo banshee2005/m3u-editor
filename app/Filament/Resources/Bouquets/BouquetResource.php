@@ -2,6 +2,8 @@
 
 namespace App\Filament\Resources\Bouquets;
 
+use App\Enums\BouquetKind;
+use App\Filament\Actions\RegexTesterAction;
 use App\Filament\Clusters\PlaylistAliases\PlaylistAliasesCluster;
 use App\Filament\Forms\Components\CustomPlaylistGroupModalSelect;
 use App\Filament\Forms\Components\MergedSourceGroupModalSelect;
@@ -14,8 +16,10 @@ use App\Models\Bouquet;
 use App\Models\CustomPlaylist;
 use App\Models\MergedPlaylist;
 use App\Models\Playlist;
+use App\Rules\ValidRegexPattern;
 use App\Traits\HasUserFiltering;
 use BackedEnum;
+use Closure;
 use Filament\Actions\Action;
 use Filament\Actions\DeleteAction;
 use Filament\Actions\DeleteBulkAction;
@@ -85,15 +89,30 @@ class BouquetResource extends Resource
                 ->rules(fn (Get $get, ?Bouquet $record): array => [
                     Rule::unique('bouquets', 'name')
                         ->where('user_id', auth()->id())
-                        ->where(fn ($query) => $get('custom_playlist_id')
-                            ? $query->where('custom_playlist_id', $get('custom_playlist_id'))
-                            : $query->where('playlist_id', $get('playlist_id')))
+                        ->where(function ($query) use ($get) {
+                            if ($get('custom_playlist_id')) {
+                                return $query->where('custom_playlist_id', $get('custom_playlist_id'));
+                            }
+                            if ($get('merged_playlist_id')) {
+                                return $query->where('merged_playlist_id', $get('merged_playlist_id'));
+                            }
+
+                            return $query->where('playlist_id', $get('playlist_id'));
+                        })
                         ->ignore($record?->id),
                 ])
                 ->helperText(__('A short name for this bouquet. Unique per playlist.')),
             Forms\Components\Textarea::make('description')
                 ->columnSpanFull()
                 ->helperText(__('Optional description for your reference.')),
+            Forms\Components\ToggleButtons::make('kind')
+                ->label(__('Bouquet type'))
+                ->options(BouquetKind::class)
+                ->default(BouquetKind::Allow->value)
+                ->inline()
+                ->live()
+                ->columnSpanFull()
+                ->helperText(fn (Get $get): string => self::kindOf($get)->getDescription()),
 
             Schemas\Components\Fieldset::make(__('Target Playlist'))
                 ->columnSpanFull()
@@ -167,14 +186,28 @@ class BouquetResource extends Resource
                         'group_selections.selected_groups',
                         'live',
                         __('Live groups'),
-                        __('Aliases using this bouquet will include live channels from these groups.'),
-                        __('Aliases using this bouquet will include live channels from these groups. Each selection is scoped to the source playlist it was picked from.'),
+                        fn (Get $get): string => self::isBlockForm($get)
+                            ? __('Aliases using this bouquet will hide live channels from these groups.')
+                            : __('Aliases using this bouquet will include live channels from these groups.'),
+                        fn (Get $get): string => self::isBlockForm($get)
+                            ? __('Aliases using this bouquet will hide live channels from these groups. Each selection is scoped to the source playlist it was picked from.')
+                            : __('Aliases using this bouquet will include live channels from these groups. Each selection is scoped to the source playlist it was picked from.'),
                     ),
                     Forms\Components\Toggle::make('auto_include_new_live')
                         ->label(__('Automatically include new live groups'))
                         ->default(false)
                         ->visible(fn (Get $get): bool => (bool) $get('playlist_id') || (bool) $get('merged_playlist_id'))
-                        ->helperText(__('Newly appearing live groups from the provider are automatically added to this bouquet on sync, in addition to the groups selected above.')),
+                        ->helperText(__('Newly appearing live groups from the provider are automatically added to this bouquet on sync, in addition to the groups selected above.'))
+                        ->live(),
+                    Forms\Components\TagsInput::make('auto_include_live_patterns')
+                        ->label(__('Only include new live groups matching'))
+                        ->placeholder(__('e.g. ^FR\\|'))
+                        ->visible(fn (Get $get): bool => (bool) $get('auto_include_new_live'))
+                        ->splitKeys(['Tab', 'Return'])
+                        ->rules([new ValidRegexPattern])
+                        ->helperText(__('Optional regex patterns (case-sensitive, no delimiters). When set, only new groups whose name matches at least one pattern are added. Leave empty to add every new group. Press [tab] or [return] to add item.'))
+                        ->hintAction(RegexTesterAction::make(name: 'test-auto-include-live', flags: 'u', samplesContext: 'groups'))
+                        ->columnSpanFull(),
                 ]),
 
             Schemas\Components\Fieldset::make(__('VOD groups'))
@@ -184,25 +217,45 @@ class BouquetResource extends Resource
                         'group_selections.selected_vod_groups',
                         'vod',
                         __('VOD groups'),
-                        __('Aliases using this bouquet will include VOD channels from these groups.'),
-                        __('Aliases using this bouquet will include VOD channels from these groups. Each selection is scoped to the source playlist it was picked from.'),
+                        fn (Get $get): string => self::isBlockForm($get)
+                            ? __('Aliases using this bouquet will hide VOD channels from these groups.')
+                            : __('Aliases using this bouquet will include VOD channels from these groups.'),
+                        fn (Get $get): string => self::isBlockForm($get)
+                            ? __('Aliases using this bouquet will hide VOD channels from these groups. Each selection is scoped to the source playlist it was picked from.')
+                            : __('Aliases using this bouquet will include VOD channels from these groups. Each selection is scoped to the source playlist it was picked from.'),
                     ),
                     Forms\Components\Toggle::make('auto_include_new_vod')
                         ->label(__('Automatically include new VOD groups'))
                         ->default(false)
                         ->visible(fn (Get $get): bool => (bool) $get('playlist_id') || (bool) $get('merged_playlist_id'))
-                        ->helperText(__('Newly appearing VOD groups from the provider are automatically added to this bouquet on sync, in addition to the groups selected above.')),
+                        ->helperText(__('Newly appearing VOD groups from the provider are automatically added to this bouquet on sync, in addition to the groups selected above.'))
+                        ->live(),
+                    Forms\Components\TagsInput::make('auto_include_vod_patterns')
+                        ->label(__('Only include new VOD groups matching'))
+                        ->placeholder(__('e.g. ^FR\\|'))
+                        ->visible(fn (Get $get): bool => (bool) $get('auto_include_new_vod'))
+                        ->splitKeys(['Tab', 'Return'])
+                        ->rules([new ValidRegexPattern])
+                        ->helperText(__('Optional regex patterns (case-sensitive, no delimiters). When set, only new groups whose name matches at least one pattern are added. Leave empty to add every new group. Press [tab] or [return] to add item.'))
+                        ->hintAction(RegexTesterAction::make(name: 'test-auto-include-vod', flags: 'u', samplesContext: 'vod_groups'))
+                        ->columnSpanFull(),
                 ]),
 
             Schemas\Components\Fieldset::make(__('Series categories'))
                 ->columnSpanFull()
-                ->schema(self::groupPickers(
-                    'group_selections.selected_categories',
-                    'categories',
-                    __('Series categories'),
-                    __('Aliases using this bouquet will include series from these categories.'),
-                    __('Aliases using this bouquet will include series from these categories. Each selection is scoped to the source playlist it was picked from.'),
-                )),
+                ->schema([
+                    ...self::groupPickers(
+                        'group_selections.selected_categories',
+                        'categories',
+                        __('Series categories'),
+                        fn (Get $get): string => self::isBlockForm($get)
+                            ? __('Aliases using this bouquet will hide series from these categories.')
+                            : __('Aliases using this bouquet will include series from these categories.'),
+                        fn (Get $get): string => self::isBlockForm($get)
+                            ? __('Aliases using this bouquet will hide series from these categories. Each selection is scoped to the source playlist it was picked from.')
+                            : __('Aliases using this bouquet will include series from these categories. Each selection is scoped to the source playlist it was picked from.'),
+                    ),
+                ]),
         ];
     }
 
@@ -213,12 +266,13 @@ class BouquetResource extends Resource
      *
      * @return array<int, Field>
      */
-    protected static function groupPickers(string $statePath, string $type, string $label, string $helperText, string $mergedHelperText): array
+    protected static function groupPickers(string $statePath, string $type, string $label, string|Closure $helperText, string|Closure $mergedHelperText): array
     {
         return [
             SourceGroupModalSelect::make($statePath, $type)
                 ->label($label)
                 ->helperText($helperText),
+            SourceGroupModalSelect::customGroups($statePath, $type),
             CustomPlaylistGroupModalSelect::make($statePath, $type)
                 ->label($label)
                 ->helperText($helperText),
@@ -235,6 +289,20 @@ class BouquetResource extends Resource
         $set('group_selections.selected_categories', []);
         $set('auto_include_new_live', false);
         $set('auto_include_new_vod', false);
+        $set('auto_include_live_patterns', []);
+        $set('auto_include_vod_patterns', []);
+    }
+
+    protected static function kindOf(Get $get): BouquetKind
+    {
+        $kind = $get('kind');
+
+        return $kind instanceof BouquetKind ? $kind : (BouquetKind::tryFrom((string) $kind) ?? BouquetKind::Allow);
+    }
+
+    protected static function isBlockForm(Get $get): bool
+    {
+        return self::kindOf($get) === BouquetKind::Block;
     }
 
     public static function table(Table $table): Table
@@ -248,6 +316,9 @@ class BouquetResource extends Resource
                     ->description(fn (Bouquet $record): string => $record->description ?? '')
                     ->searchable()
                     ->sortable(),
+                Tables\Columns\TextColumn::make('kind')
+                    ->label(__('Type'))
+                    ->badge(),
                 Tables\Columns\TextColumn::make('target')
                     ->label(__('Playlist'))
                     ->getStateUsing(fn (Bouquet $record): string => ($record->targetPlaylist()?->name ?? 'N/A').' ('.$record->targetTypeLabel().')')

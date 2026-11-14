@@ -256,10 +256,9 @@ it('returns live streams successfully', function () {
     $channel1Data = collect($jsonResponse)->firstWhere('stream_id', $enabledChannel1->id);
     $this->assertNotNull($channel1Data, 'Channel 1 should be in response');
     $this->assertStringContainsString('icon1.png', $channel1Data['stream_icon']);
-    // direct_source field is present in the response structure
+    // direct_source is intentionally always empty so upstream URLs/credentials are never exposed (#1386)
     $this->assertArrayHasKey('direct_source', $channel1Data);
-    // Note: direct_source is currently not implemented and returns empty string
-    $this->assertIsString($channel1Data['direct_source']);
+    $this->assertSame('', $channel1Data['direct_source']);
 });
 
 it('includes stream stats when probed for get live streams', function () {
@@ -387,6 +386,31 @@ it('falls back to VOD metadata when the channel year is missing', function () {
         ->assertJsonPath('0.year', 2024);
 });
 
+it('reports the provider added date for vod streams, falling back to created_at', function () {
+    $group = Group::factory()->for($this->user)->create();
+    Channel::factory()->for($this->playlist)->for($group)->create([
+        'enabled' => true,
+        'is_vod' => true,
+        'title' => 'Provider Dated',
+        'source_added_at' => '2021-03-04 05:06:07',
+        'created_at' => '2026-10-14 00:00:00',
+    ]);
+    Channel::factory()->for($this->playlist)->for($group)->create([
+        'enabled' => true,
+        'is_vod' => true,
+        'title' => 'Undated',
+        'source_added_at' => null,
+        'created_at' => '2026-10-14 00:00:00',
+    ]);
+
+    $streams = collect($this->getJson(getXtreamApiUrl($this->username, $this->password, 'get_vod_streams'))
+        ->assertOk()
+        ->json())->keyBy('name');
+
+    expect($streams['Provider Dated']['added'])->toBe((string) Carbon\Carbon::parse('2021-03-04 05:06:07')->timestamp)
+        ->and($streams['Undated']['added'])->toBe((string) Carbon\Carbon::parse('2026-10-14 00:00:00')->timestamp);
+});
+
 // Tests for get_vod_info - returns VOD channel (movie) info, not Series
 it('returns vod info successfully', function () {
     $group = Group::factory()->for($this->user)->create();
@@ -418,6 +442,31 @@ it('returns vod info successfully', function () {
         ])
         ->assertJsonPath('movie_data.stream_id', $vodChannel->id)
         ->assertJsonPath('movie_data.name', 'Test Movie');
+});
+
+it('uses the custom title over the provider title on get vod info', function () {
+    // Issue #1648: get_vod_info built its name/title straight from provider
+    // data, ignoring title_custom - unlike get_vod_streams, which already
+    // preferred it. A Find & Replace / manual rename never showed up here.
+    $group = Group::factory()->for($this->user)->create();
+    $vodChannel = Channel::factory()->for($this->playlist)->for($group)->create([
+        'enabled' => true,
+        'is_vod' => true,
+        'name' => 'Provider Movie',
+        'title' => 'Provider Movie',
+        'title_custom' => 'Renamed Movie',
+        'last_metadata_fetch' => now(),
+        'info' => [],
+    ]);
+
+    $response = $this->getJson(getXtreamApiUrl($this->username, $this->password, 'get_vod_info', ['vod_id' => $vodChannel->id]));
+
+    $response->assertOk()
+        ->assertJsonPath('info.name', 'Renamed Movie')
+        ->assertJsonPath('movie_data.name', 'Renamed Movie')
+        ->assertJsonPath('movie_data.title', 'Renamed Movie')
+        // o_name intentionally stays the original, untouched provider name.
+        ->assertJsonPath('info.o_name', 'Provider Movie');
 });
 
 it('falls back to VOD metadata when the channel year is missing for get vod info', function () {
@@ -841,6 +890,35 @@ it('suppresses episode rating on get series info when tmdb vote_count is below t
     expect($episodes[0]['info']['rating'])->toBe('');
 });
 
+it('returns the season trailer on get series info', function () {
+    $category = Category::factory()->for($this->user)->for($this->playlist)->create();
+    $series = Series::factory()->for($this->playlist)->create([
+        'user_id' => $this->user->id,
+        'category_id' => $category->id,
+        'enabled' => true,
+        'name' => 'Series With Season Trailers',
+        'metadata' => ['tmdb' => ''],
+    ]);
+
+    foreach ([1 => ['youtube_trailer' => 'https://www.youtube.com/watch?v=abc123'], 2 => []] as $seasonNumber => $metadata) {
+        Season::factory()->create([
+            'user_id' => $this->user->id,
+            'playlist_id' => $this->playlist->id,
+            'category_id' => $category->id,
+            'series_id' => $series->id,
+            'season_number' => $seasonNumber,
+            'metadata' => $metadata,
+        ]);
+    }
+
+    $response = $this->getJson(getXtreamApiUrl($this->username, $this->password, 'get_series_info', ['series_id' => $series->id]));
+
+    $response->assertOk();
+    $trailers = collect($response->json('seasons'))->pluck('youtube_trailer', 'season_number');
+    expect($trailers[1])->toBe('https://www.youtube.com/watch?v=abc123')
+        ->and($trailers[2])->toBe('');
+});
+
 it('surfaces episode rating on get series info when tmdb vote_count is at or above threshold', function () {
     $category = Category::factory()->for($this->user)->for($this->playlist)->create();
     $series = Series::factory()->for($this->playlist)->create([
@@ -1245,6 +1323,25 @@ it('does not double-proxy an already app-hosted vod cover when logo proxy is ena
     $response->assertOk()
         ->assertJsonPath('info.cover_big', $localCover)
         ->assertJsonPath('info.movie_image', $localCover);
+});
+
+it('requests the poster size for proxied vod stream icons when logo proxy is enabled', function () {
+    $this->playlist->update(['enable_logo_proxy' => true]);
+
+    $group = Group::factory()->for($this->user)->create();
+    Channel::factory()->for($this->playlist)->for($group)->create([
+        'enabled' => true,
+        'is_vod' => true,
+        'title' => 'Proxied VOD',
+        'logo' => 'https://image.tmdb.org/t/p/original/poster.jpg',
+    ]);
+
+    $response = $this->getJson(getXtreamApiUrl($this->username, $this->password, 'get_vod_streams'));
+
+    $response->assertOk();
+    $streamIcon = $response->json('0.stream_icon');
+    expect($streamIcon)->toStartWith(url('/'))
+        ->and($streamIcon)->toEndWith('?p=poster');
 });
 
 it('orders series categories by sort order for a regular playlist', function () {

@@ -3,6 +3,7 @@
 namespace App\Services;
 
 use App\Settings\GeneralSettings;
+use Illuminate\Http\Client\Response;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
@@ -51,7 +52,15 @@ class TmdbService
      * collection. Each page is cached individually so this is mostly a
      * safety bound on TMDB API calls, not on member rows.
      */
-    public const MAX_DYNAMIC_GROUP_PAGES = 5;
+    public const MAX_DYNAMIC_GROUP_PAGES = 10;
+
+    /**
+     * Minimum title similarity (0-100) required for the year-only fallback match
+     * in searchMovie() (Strategy 3). A shared release year alone isn't enough to
+     * accept a result - without this floor, an unrelated title that merely shares
+     * a year with the search can get matched (issue #1590).
+     */
+    protected const MIN_YEAR_ONLY_MATCH_SIMILARITY = 35.0;
 
     protected ?string $apiKey;
 
@@ -319,25 +328,46 @@ class TmdbService
                     }
                 }
 
-                // Strategy 3: Take first result if year matches exactly
+                // Strategy 3: Take first result if year matches exactly - but only
+                // when the title is at least loosely similar too. A shared year alone
+                // isn't a strong enough signal: results with the same release year but
+                // an unrelated title would otherwise get matched (issue #1590).
                 if (! empty($results) && $year) {
+                    $normalizedForFallback = $this->normalizeForComparison($normalizedTitle);
                     foreach ($results as $result) {
                         $resultYear = isset($result['release_date']) ? (int) substr($result['release_date'], 0, 4) : null;
-                        if ($resultYear === $year) {
-                            Log::debug('TMDB: Using first result with matching year', [
+                        if ($resultYear !== $year) {
+                            continue;
+                        }
+
+                        $resultSimilarity = $this->calculateSimilarity(
+                            $normalizedForFallback,
+                            $this->normalizeForComparison($result['title'] ?? ''),
+                        );
+                        if ($resultSimilarity < self::MIN_YEAR_ONLY_MATCH_SIMILARITY) {
+                            Log::debug('TMDB: Skipping year-only match, title too dissimilar', [
                                 'title' => $result['title'] ?? 'N/A',
                                 'year' => $resultYear,
+                                'similarity' => $resultSimilarity,
                             ]);
-                            $externalIds = $this->getMovieExternalIds($result['id']);
 
-                            return [
-                                'tmdb_id' => $result['id'],
-                                'imdb_id' => $externalIds['imdb_id'] ?? null,
-                                'title' => $result['title'] ?? null,
-                                'release_date' => $result['release_date'] ?? null,
-                                'confidence' => 50,
-                            ];
+                            continue;
                         }
+
+                        Log::debug('TMDB: Using first result with matching year', [
+                            'title' => $result['title'] ?? 'N/A',
+                            'year' => $resultYear,
+                            'similarity' => $resultSimilarity,
+                        ]);
+                        $externalIds = $this->getMovieExternalIds($result['id']);
+
+                        return [
+                            'tmdb_id' => $result['id'],
+                            'imdb_id' => $externalIds['imdb_id'] ?? null,
+                            'title' => $result['title'] ?? null,
+                            'release_date' => $result['release_date'] ?? null,
+                            'confidence' => 50,
+                        ];
                     }
                 }
 
@@ -892,7 +922,7 @@ class TmdbService
                 [
                     'api_key' => $this->apiKey,
                     'language' => $this->language,
-                    'append_to_response' => 'external_ids,credits,videos,images',
+                    'append_to_response' => 'external_ids,credits,videos,images,recommendations,content_ratings',
                     'include_image_language' => substr($this->language, 0, 2).',en,null',
                 ]
             );
@@ -957,19 +987,7 @@ class TmdbService
                 }
             }
 
-            // Extract YouTube trailer
-            $youtubeTrailer = null;
-            if (! empty($data['videos']['results'])) {
-                $trailer = collect($data['videos']['results'])
-                    ->firstWhere(function ($video) {
-                        return $video['site'] === 'YouTube'
-                            && in_array($video['type'], ['Trailer', 'Teaser']);
-                    });
-
-                if ($trailer) {
-                    $youtubeTrailer = 'https://www.youtube.com/watch?v='.$trailer['key'];
-                }
-            }
+            $youtubeTrailer = $this->pickYoutubeTrailer($data, ['Trailer', 'Teaser']);
 
             return [
                 'tmdb_id' => $data['id'] ?? null,
@@ -992,6 +1010,9 @@ class TmdbService
                 'cast_list' => $castList,
                 'director' => $director,
                 'youtube_trailer' => $youtubeTrailer,
+                'certification' => $this->pickUsContentRating($data['content_ratings']['results'] ?? []),
+                'networks' => $this->reshapeCompanies($data['networks'] ?? []),
+                'recommendations' => $this->reshapeRecommendations($data['recommendations']['results'] ?? [], 'tv'),
             ];
         } catch (\Exception $e) {
             Log::error('TMDB get TV series details error', [
@@ -1020,7 +1041,7 @@ class TmdbService
                 [
                     'api_key' => $this->apiKey,
                     'language' => $this->language,
-                    'append_to_response' => 'external_ids,credits,videos,images',
+                    'append_to_response' => 'external_ids,credits,videos,images,recommendations,release_dates',
                     'include_image_language' => substr($this->language, 0, 2).',en,null',
                 ]
             );
@@ -1077,18 +1098,7 @@ class TmdbService
                     ->toArray();
             }
 
-            // Extract YouTube trailer
-            $youtubeTrailer = null;
-            if (! empty($data['videos']['results'])) {
-                $trailer = collect($data['videos']['results'])
-                    ->where('site', 'YouTube')
-                    ->where('type', 'Trailer')
-                    ->first();
-
-                if ($trailer) {
-                    $youtubeTrailer = 'https://www.youtube.com/watch?v='.$trailer['key'];
-                }
-            }
+            $youtubeTrailer = $this->pickYoutubeTrailer($data, ['Trailer']);
 
             return [
                 'tmdb_id' => $data['id'] ?? null,
@@ -1109,6 +1119,9 @@ class TmdbService
                 'cast_list' => $castList,
                 'director' => $directors,
                 'youtube_trailer' => $youtubeTrailer,
+                'certification' => $this->pickUsCertification($data['release_dates']['results'] ?? []),
+                'studios' => $this->reshapeCompanies($data['production_companies'] ?? []),
+                'recommendations' => $this->reshapeRecommendations($data['recommendations']['results'] ?? [], 'movie'),
             ];
         } catch (\Exception $e) {
             Log::error('TMDB get movie details error', [
@@ -1118,6 +1131,148 @@ class TmdbService
 
             return null;
         }
+    }
+
+    /**
+     * Get full details for a VOD item's TMDB ID, trying the movie endpoint first
+     * and falling back to the TV series endpoint when the ID isn't a movie.
+     *
+     * Movie and TV series have separate id numbering on TMDB, so a stored
+     * tmdb_id that was actually matched (or manually picked) as a TV series
+     * previously returned nothing from getMovieDetails(), silently leaving
+     * VOD items like a TV series mapped onto a movie id with no plot/artwork
+     * ever fetched (issue #1590). The TV result is remapped onto the same
+     * movie-shaped keys so callers don't need to branch on media type.
+     *
+     * @param  string|null  $knownMediaType  'movie' or 'tv' if already known (e.g. from a
+     *                                       previous successful lookup), to skip straight to
+     *                                       the right endpoint instead of trying movie first.
+     * @return array|null Movie-shaped details, with 'media_type' set to 'movie' or 'tv'
+     */
+    public function getMovieDetailsWithTvFallback(int $tmdbId, ?string $knownMediaType = null): ?array
+    {
+        if ($knownMediaType === 'tv') {
+            $tvFirst = $this->mapTvDetailsToMovieShape($tmdbId);
+            if ($tvFirst) {
+                return $tvFirst;
+            }
+        }
+
+        $details = $this->getMovieDetails($tmdbId);
+        if ($details) {
+            $details['media_type'] = 'movie';
+
+            return $details;
+        }
+
+        if ($knownMediaType === 'tv') {
+            // Already tried above.
+            return null;
+        }
+
+        $tvDetails = $this->mapTvDetailsToMovieShape($tmdbId);
+        if ($tvDetails) {
+            Log::info('TMDB: Movie lookup failed, found a matching TV series instead', [
+                'tmdb_id' => $tmdbId,
+            ]);
+        }
+
+        return $tvDetails;
+    }
+
+    /**
+     * Fetch TV series details and remap them onto the same keys getMovieDetails()
+     * returns, so callers can handle either media type uniformly.
+     */
+    private function mapTvDetailsToMovieShape(int $tmdbId): ?array
+    {
+        $tvDetails = $this->getTvSeriesDetails($tmdbId);
+        if (! $tvDetails) {
+            return null;
+        }
+
+        return [
+            'tmdb_id' => $tvDetails['tmdb_id'],
+            'imdb_id' => $tvDetails['imdb_id'],
+            'title' => $tvDetails['name'],
+            'original_title' => $tvDetails['original_name'],
+            'overview' => $tvDetails['overview'],
+            'poster_url' => $tvDetails['poster_url'],
+            'backdrop_url' => $tvDetails['backdrop_url'],
+            'logo_url' => $tvDetails['logo_url'],
+            'release_date' => $tvDetails['first_air_date'],
+            'genres' => $tvDetails['genres'],
+            'vote_average' => $tvDetails['vote_average'],
+            'vote_count' => $tvDetails['vote_count'],
+            'runtime' => null,
+            'status' => $tvDetails['status'],
+            'cast' => $tvDetails['cast'],
+            'cast_list' => $tvDetails['cast_list'],
+            'director' => $tvDetails['director'],
+            'youtube_trailer' => $tvDetails['youtube_trailer'],
+            'certification' => $tvDetails['certification'],
+            'studios' => $tvDetails['networks'],
+            'recommendations' => $tvDetails['recommendations'],
+            'media_type' => 'tv',
+        ];
+    }
+
+    /**
+     * Pick the US certification (e.g. "PG-13", "R") from a TMDB movie
+     * `release_dates.results` array.
+     *
+     * TMDB lists one entry per release (premiere, theatrical, digital, ...) and many
+     * carry a blank certification, so blanks are skipped and theatrical releases are
+     * preferred, then limited theatrical, digital, physical, TV and premiere.
+     *
+     * @param  array<int, array{iso_3166_1?: string, release_dates?: array<int, array{certification?: string, type?: int}>}>  $countries
+     */
+    private function pickUsCertification(array $countries): ?string
+    {
+        $usReleases = collect($countries)->firstWhere('iso_3166_1', 'US')['release_dates'] ?? [];
+
+        $typePriority = [3 => 0, 2 => 1, 4 => 2, 5 => 3, 6 => 4, 1 => 5];
+
+        $certification = collect($usReleases)
+            ->filter(fn (array $release): bool => trim($release['certification'] ?? '') !== '')
+            ->sortBy(fn (array $release): int => $typePriority[$release['type'] ?? 0] ?? 99)
+            ->first()['certification'] ?? null;
+
+        return $certification !== null ? trim($certification) : null;
+    }
+
+    /**
+     * Pick the US TV rating (e.g. "TV-MA", "TV-14") from a TMDB series
+     * `content_ratings.results` array.
+     *
+     * @param  array<int, array{iso_3166_1?: string, rating?: string}>  $ratings
+     */
+    private function pickUsContentRating(array $ratings): ?string
+    {
+        $rating = trim(collect($ratings)->firstWhere('iso_3166_1', 'US')['rating'] ?? '');
+
+        return $rating !== '' ? $rating : null;
+    }
+
+    /**
+     * Reshape a TMDB series `networks` or movie `production_companies` array to
+     * id/name/logo - both share the same shape. Network ids match TV_NETWORKS /
+     * `with_networks`, and `name` is what NfoService writes as <studio>.
+     *
+     * @param  array<int, array{id?: int, name?: string, logo_path?: string|null}>  $companies
+     * @return list<array{id: int, name: string, logo: string|null}>
+     */
+    private function reshapeCompanies(array $companies): array
+    {
+        return collect($companies)
+            ->filter(fn (array $company): bool => ! empty($company['id']) && ! empty($company['name']))
+            ->map(fn (array $company): array => [
+                'id' => (int) $company['id'],
+                'name' => $company['name'],
+                'logo' => ! empty($company['logo_path']) ? 'https://image.tmdb.org/t/p/w300'.$company['logo_path'] : null,
+            ])
+            ->values()
+            ->all();
     }
 
     /**
@@ -1157,8 +1312,23 @@ class TmdbService
         });
 
         return isset($candidates[0]['file_path'])
-            ? 'https://image.tmdb.org/t/p/w500'.$candidates[0]['file_path']
+            ? self::rasterLogoUrl('https://image.tmdb.org/t/p/w500'.$candidates[0]['file_path'])
             : null;
+    }
+
+    /**
+     * [$url] with a TMDB SVG title logo swapped for the PNG rendition TMDB
+     * serves at the same path. Clients draw title logos as raster images (an
+     * SVG fails and shows the plain title instead), and resizing skips SVG.
+     * Any other URL is returned unchanged.
+     */
+    public static function rasterLogoUrl(?string $url): ?string
+    {
+        if ($url === null || ! str_starts_with($url, 'https://image.tmdb.org/')) {
+            return $url;
+        }
+
+        return preg_replace('/\.svg$/i', '.png', $url);
     }
 
     /**
@@ -1179,6 +1349,32 @@ class TmdbService
                 'photo' => ! empty($p['profile_path'])
                     ? 'https://image.tmdb.org/t/p/w185'.$p['profile_path']
                     : null,
+            ])
+            ->values()
+            ->all();
+    }
+
+    /**
+     * Reshape a TMDB `recommendations.results` page into the minimal shape
+     * needed to later match a recommendation against the user's own library
+     * (by `tmdb_id`) or, for AIOStreams, to link straight to a `tmdb:{id}`
+     * meta lookup. Capped at 12 - this is a "more like this" row, not a feed.
+     *
+     * @param  array<int, array<string, mixed>>  $results
+     * @return array<int, array{tmdb_id: int, title: string, poster_url: ?string, media_type: string}>
+     */
+    private function reshapeRecommendations(array $results, string $mediaType): array
+    {
+        return collect($results)
+            ->filter(fn ($r) => ! empty($r['id']))
+            ->take(12)
+            ->map(fn ($r) => [
+                'tmdb_id' => (int) $r['id'],
+                'title' => $r['title'] ?? $r['name'] ?? '',
+                'poster_url' => ! empty($r['poster_path'])
+                    ? 'https://image.tmdb.org/t/p/w342'.$r['poster_path']
+                    : null,
+                'media_type' => $mediaType,
             ])
             ->values()
             ->all();
@@ -2022,58 +2218,190 @@ class TmdbService
         $this->waitForRateLimit();
 
         try {
-            $response = Http::timeout(15)->get(
-                self::BASE_URL."/tv/{$tmdbId}/season/{$seasonNumber}",
-                [
-                    'api_key' => $this->apiKey,
-                    'language' => $this->language,
-                    'append_to_response' => 'credits,videos',
-                ]
-            );
+            $response = $this->requestSeasonDetails($tmdbId, $seasonNumber);
 
             if (! $response->successful()) {
-                Log::warning('TMDB: Failed to get season details', [
-                    'tmdb_id' => $tmdbId,
-                    'season' => $seasonNumber,
-                    'status' => $response->status(),
-                ]);
+                $this->logSeasonDetailsFailure($tmdbId, $seasonNumber, $response->status());
 
                 return null;
             }
 
-            $data = $response->json();
-
-            return [
-                'season_number' => $data['season_number'] ?? $seasonNumber,
-                'name' => $data['name'] ?? null,
-                'overview' => $data['overview'] ?? null,
-                'air_date' => $data['air_date'] ?? null,
-                'poster_path' => $data['poster_path'] ?? null,
-                'poster_url' => isset($data['poster_path']) ? "https://image.tmdb.org/t/p/w500{$data['poster_path']}" : null,
-                'episodes' => collect($data['episodes'] ?? [])->map(function ($episode) {
-                    return [
-                        'id' => $episode['id'] ?? null,
-                        'tmdb_id' => $episode['id'] ?? null,
-                        'episode_number' => $episode['episode_number'] ?? null,
-                        'name' => $episode['name'] ?? null,
-                        'overview' => $episode['overview'] ?? null,
-                        'air_date' => $episode['air_date'] ?? null,
-                        'still_path' => $episode['still_path'] ?? null,
-                        'vote_average' => $episode['vote_average'] ?? null,
-                        'vote_count' => $episode['vote_count'] ?? null,
-                        'runtime' => $episode['runtime'] ?? null,
-                    ];
-                })->toArray(),
-            ];
+            return $this->mapSeasonDetails((array) $response->json(), $seasonNumber);
         } catch (\Exception $e) {
-            Log::error('TMDB get season details error', [
-                'tmdb_id' => $tmdbId,
-                'season' => $seasonNumber,
-                'error' => $e->getMessage(),
-            ]);
+            $this->logSeasonDetailsError($tmdbId, $seasonNumber, $e);
 
             return null;
         }
+    }
+
+    /**
+     * Retrieve a season while preserving the distinction between absence and failures.
+     *
+     * Unlike getSeasonDetails(), the response is validated against the requested season
+     * and a verified TMDB "resource not found" is reported separately from errors.
+     *
+     * @return array{status: 'found'|'not_found'|'error', payload?: array<string, mixed>}
+     */
+    public function getSeasonDetailsResult(int $tmdbId, int $seasonNumber): array
+    {
+        if ($tmdbId < 1 || $seasonNumber < 0 || ! $this->isConfigured()) {
+            return ['status' => 'error'];
+        }
+
+        $cacheKey = "tmdb_season_result_v1_{$tmdbId}_{$seasonNumber}_{$this->language}";
+        $cached = Cache::get($cacheKey);
+        if (is_array($cached)) {
+            /** @var array{status: 'found'|'not_found', payload?: array<string, mixed>} $cached */
+            return $cached;
+        }
+
+        try {
+            $this->waitForRateLimit();
+            $response = $this->requestSeasonDetails($tmdbId, $seasonNumber);
+
+            if ($response->status() === 404 && $this->isTmdbResourceNotFound($response->json())) {
+                $result = ['status' => 'not_found'];
+                Cache::put($cacheKey, $result, now()->addHour());
+
+                return $result;
+            }
+
+            if (! $response->successful()) {
+                $this->logSeasonDetailsFailure($tmdbId, $seasonNumber, $response->status());
+
+                return ['status' => 'error'];
+            }
+
+            $data = $response->json();
+            if (! $this->isValidSeasonDetails($data, $seasonNumber)) {
+                return ['status' => 'error'];
+            }
+
+            $result = ['status' => 'found', 'payload' => $this->mapSeasonDetails($data, $seasonNumber)];
+            Cache::put($cacheKey, $result, now()->addHour());
+
+            return $result;
+        } catch (\Throwable $e) {
+            $this->logSeasonDetailsError($tmdbId, $seasonNumber, $e);
+
+            return ['status' => 'error'];
+        }
+    }
+
+    private function requestSeasonDetails(int $tmdbId, int $seasonNumber): Response
+    {
+        return Http::timeout(15)->get(
+            self::BASE_URL."/tv/{$tmdbId}/season/{$seasonNumber}",
+            [
+                'api_key' => $this->apiKey,
+                'language' => $this->language,
+                'append_to_response' => 'videos',
+            ]
+        );
+    }
+
+    /**
+     * Pick the first YouTube video of an allowed type from a TMDB response's
+     * appended `videos` and return its watch URL.
+     *
+     * @param  array<string, mixed>  $data
+     * @param  list<string>  $types
+     */
+    private function pickYoutubeTrailer(array $data, array $types): ?string
+    {
+        $trailer = collect($data['videos']['results'] ?? [])
+            ->first(fn ($video) => ($video['site'] ?? null) === 'YouTube'
+                && in_array($video['type'] ?? null, $types, true)
+                && ! empty($video['key']));
+
+        return $trailer ? 'https://www.youtube.com/watch?v='.$trailer['key'] : null;
+    }
+
+    /**
+     * Map a TMDB season response to the shape shared by both season lookups.
+     *
+     * `season_id` is TMDB's ID for the season itself, not the series ID used to request it.
+     *
+     * @param  array<string, mixed>  $data
+     * @return array<string, mixed>
+     */
+    private function mapSeasonDetails(array $data, int $seasonNumber): array
+    {
+        $posterPath = $data['poster_path'] ?? null;
+
+        return [
+            'season_id' => $data['id'] ?? null,
+            'season_number' => $data['season_number'] ?? $seasonNumber,
+            'name' => $data['name'] ?? null,
+            'overview' => $data['overview'] ?? null,
+            'air_date' => $data['air_date'] ?? null,
+            'poster_path' => $posterPath,
+            'poster_url' => is_string($posterPath) ? "https://image.tmdb.org/t/p/w500{$posterPath}" : null,
+            'youtube_trailer' => $this->pickYoutubeTrailer($data, ['Trailer', 'Teaser']),
+            'episodes' => collect($data['episodes'] ?? [])->map(function ($episode) {
+                return [
+                    'id' => $episode['id'] ?? null,
+                    'tmdb_id' => $episode['id'] ?? null,
+                    'episode_number' => $episode['episode_number'] ?? null,
+                    'name' => $episode['name'] ?? null,
+                    'overview' => $episode['overview'] ?? null,
+                    'air_date' => $episode['air_date'] ?? null,
+                    'still_path' => $episode['still_path'] ?? null,
+                    'vote_average' => $episode['vote_average'] ?? null,
+                    'vote_count' => $episode['vote_count'] ?? null,
+                    'runtime' => $episode['runtime'] ?? null,
+                ];
+            })->toArray(),
+        ];
+    }
+
+    /**
+     * @phpstan-assert-if-true array<string, mixed> $data
+     */
+    private function isValidSeasonDetails(mixed $data, int $seasonNumber): bool
+    {
+        if (! is_array($data)
+            || ! is_int($data['id'] ?? null)
+            || $data['id'] < 1
+            || ($data['season_number'] ?? null) !== $seasonNumber
+            || ! is_array($data['episodes'] ?? null)
+            || ! array_is_list($data['episodes'])) {
+            return false;
+        }
+
+        foreach ($data['episodes'] as $episode) {
+            if (! is_array($episode)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * TMDB status code 34 is its documented "resource not found" response.
+     */
+    private function isTmdbResourceNotFound(mixed $data): bool
+    {
+        return is_array($data) && ($data['status_code'] ?? null) === 34;
+    }
+
+    private function logSeasonDetailsFailure(int $tmdbId, int $seasonNumber, int $status): void
+    {
+        Log::warning('TMDB: Failed to get season details', [
+            'tmdb_id' => $tmdbId,
+            'season' => $seasonNumber,
+            'status' => $status,
+        ]);
+    }
+
+    private function logSeasonDetailsError(int $tmdbId, int $seasonNumber, \Throwable $e): void
+    {
+        Log::error('TMDB get season details error', [
+            'tmdb_id' => $tmdbId,
+            'season' => $seasonNumber,
+            'error' => $e->getMessage(),
+        ]);
     }
 
     /**
@@ -2862,21 +3190,40 @@ class TmdbService
     /**
      * Get all seasons for a TV series.
      *
+     * Pass $withEpisodesFor to also attach each listed season's `episodes`
+     * (runtime, vote_average, ...) in the same request via TMDB's
+     * `append_to_response=season/N` - TMDB caps appends at 20 per request, so
+     * anything past that is ignored rather than costing extra calls.
+     *
+     * Pass $nullOnError to get null (instead of []) when the lookup failed, so a
+     * caller can tell a failure apart from a series TMDB verifiably has no seasons
+     * for (an empty season list, or TMDB's "resource not found").
+     *
      * @param  int  $tmdbId  The TMDB ID of the TV series
-     * @return array Array of season data
+     * @param  array<int, int>  $withEpisodesFor  Season numbers to attach episodes for
+     * @return array|null Array of season data, or null on failure when $nullOnError is set
      */
-    public function getAllSeasons(int $tmdbId): array
+    public function getAllSeasons(int $tmdbId, array $withEpisodesFor = [], bool $nullOnError = false): ?array
     {
+        $failed = $nullOnError ? null : [];
+
         $this->waitForRateLimit();
+
+        $appendSeasons = array_slice(array_values(array_unique($withEpisodesFor)), 0, 20);
 
         try {
             $response = Http::timeout(15)->get(
                 self::BASE_URL."/tv/{$tmdbId}",
-                [
+                array_filter([
                     'api_key' => $this->apiKey,
                     'language' => $this->language,
-                ]
+                    'append_to_response' => implode(',', array_map(fn ($number) => "season/{$number}", $appendSeasons)),
+                ], fn ($value) => $value !== '')
             );
+
+            if ($response->status() === 404 && $this->isTmdbResourceNotFound($response->json())) {
+                return [];
+            }
 
             if (! $response->successful()) {
                 Log::warning('TMDB: Failed to get TV series for seasons', [
@@ -2884,19 +3231,29 @@ class TmdbService
                     'status' => $response->status(),
                 ]);
 
-                return [];
+                return $failed;
             }
 
             $data = $response->json();
+            if (! is_array($data['seasons'] ?? null)) {
+                return $failed;
+            }
 
-            return $data['seasons'] ?? [];
+            return array_map(function ($season) use ($data) {
+                $appended = $data['season/'.($season['season_number'] ?? '')] ?? null;
+                if (is_array($appended['episodes'] ?? null)) {
+                    $season['episodes'] = $appended['episodes'];
+                }
+
+                return $season;
+            }, $data['seasons']);
         } catch (\Exception $e) {
             Log::error('TMDB get all seasons error', [
                 'tmdb_id' => $tmdbId,
                 'error' => $e->getMessage(),
             ]);
 
-            return [];
+            return $failed;
         }
     }
 }

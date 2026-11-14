@@ -3,8 +3,12 @@
 
 @import '../../vendor/filament/filament/resources/css/theme.css';
 
+@import "./globals/brand.css";
 @import "./globals/global.scss";
 
+@import "./components/navigation.css";
+@import "./components/surfaces.css";
+@import "./components/controls.css";
 @import "./components/tables.scss";
 @import "./components/widgets.css";
 @import "./components/logs.css";
@@ -85,11 +89,6 @@
     max-height: calc(100vh - 64px);
     overflow-y: auto;
 } */
-
-/* Copilot Chat — widen the slide-over drawer from max-w-md to max-w-2xl */
-.copilot-chat-widget {
-    max-width: 42rem !important;
-}
 
 /* DVR Status Animations */
 @keyframes dvr-status-spin {

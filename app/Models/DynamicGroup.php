@@ -6,7 +6,9 @@ use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Database\Eloquent\Relations\BelongsToMany;
 use Illuminate\Database\Eloquent\Relations\MorphToMany;
+use Illuminate\Support\Facades\DB;
 
 /**
  * Per-playlist virtual group computed from TMDB list endpoints.
@@ -51,6 +53,13 @@ class DynamicGroup extends Model
         'last_synced_at' => 'datetime',
     ];
 
+    protected static function booted(): void
+    {
+        static::deleted(function (DynamicGroup $group): void {
+            $group->removeRuleFromPlaylistConfig();
+        });
+    }
+
     public function playlist(): BelongsTo
     {
         return $this->belongsTo(Playlist::class);
@@ -59,6 +68,18 @@ class DynamicGroup extends Model
     public function user(): BelongsTo
     {
         return $this->belongsTo(User::class);
+    }
+
+    /**
+     * Enabled, already-materialized groups owned by $userId on a playlist they also own.
+     */
+    public function scopePublishableBy(Builder $query, int $userId): Builder
+    {
+        return $query
+            ->where('user_id', $userId)
+            ->where('enabled', true)
+            ->whereNotNull('last_synced_at')
+            ->whereHas('playlist', fn (Builder $playlistQuery) => $playlistQuery->where('user_id', $userId));
     }
 
     /**
@@ -75,6 +96,33 @@ class DynamicGroup extends Model
     public function series(): MorphToMany
     {
         return $this->morphedByMany(Series::class, 'item', 'dynamic_group_items');
+    }
+
+    /**
+     * Cached files this group's auto-cache manages.
+     */
+    public function cachedContentFiles(): BelongsToMany
+    {
+        return $this->belongsToMany(CachedContentFile::class, 'cached_content_file_dynamic_groups')
+            ->withPivot('dropped_at')
+            ->withTimestamps();
+    }
+
+    /**
+     * Members the group's auto-cache covers: enabled members in TMDB rank
+     * order, capped at $maxItems.
+     */
+    public function cacheMembers(?int $maxItems): MorphToMany
+    {
+        $members = $this->type === 'series' ? $this->series() : $this->channels();
+        $members->where($members->getRelated()->qualifyColumn('enabled'), true)
+            ->orderByPivot('position');
+
+        if ($maxItems !== null) {
+            $members->limit($maxItems);
+        }
+
+        return $members;
     }
 
     /**
@@ -134,5 +182,126 @@ class DynamicGroup extends Model
     {
         return collect($config ?? [])
             ->contains(fn (array $rule): bool => (bool) ($rule['enabled'] ?? false));
+    }
+
+    /**
+     * Normalized (type, source, name) identity for a `dynamic_groups_config`
+     * rule. SyncDynamicGroups keys DynamicGroup rows to rules by this triple,
+     * so any code matching a row back to its rule must use the same
+     * normalization or the two drift apart (a deleted group would then be
+     * recreated on the next sync, see issue #1550).
+     *
+     * @param  array<string, mixed>  $rule
+     * @return array{type: string, source: string, name: string}
+     */
+    public static function ruleIdentity(array $rule): array
+    {
+        return [
+            'type' => (string) ($rule['type'] ?? ''),
+            'source' => (string) ($rule['source'] ?? ''),
+            'name' => trim((string) ($rule['name'] ?? '')),
+        ];
+    }
+
+    /**
+     * Whether a `dynamic_groups_config` rule is the one this row was
+     * materialized from.
+     *
+     * @param  array<string, mixed>  $rule
+     */
+    public function matchesRule(array $rule): bool
+    {
+        return self::ruleIdentity($rule) === self::ruleIdentity($this->only(['type', 'source', 'name']));
+    }
+
+    /**
+     * This group's rule in the playlist's `dynamic_groups_config`, or null
+     * when the rule is gone (removed, or renamed and not re-synced yet).
+     *
+     * @return array<string, mixed>|null
+     */
+    public function configRule(): ?array
+    {
+        return collect($this->playlist?->dynamic_groups_config ?? [])
+            ->first(fn (array $rule): bool => $this->matchesRule($rule));
+    }
+
+    /**
+     * Auto-cache settings from this group's rule in the playlist's
+     * `dynamic_groups_config`, or null when the rule is gone (removed, or
+     * renamed and not re-synced yet).
+     *
+     * @return array{enabled: bool, never_expire: bool, keep_days: int, max_items: int|null}|null
+     */
+    public function cacheSettings(): ?array
+    {
+        $rule = $this->configRule();
+
+        if ($rule === null) {
+            return null;
+        }
+
+        $maxItems = (int) ($rule['cache_max_items'] ?? 0);
+
+        return [
+            'enabled' => (bool) ($rule['enabled'] ?? false) && (bool) ($rule['cache_enabled'] ?? false),
+            'never_expire' => (bool) ($rule['cache_never_expire'] ?? false),
+            'keep_days' => max(0, (int) ($rule['cache_keep_days'] ?? 0)),
+            'max_items' => $maxItems > 0 ? $maxItems : null,
+        ];
+    }
+
+    /**
+     * Wrap the delete in a transaction so the row delete and the
+     * `deleted` hook's rule removal commit together. Without it, a failed
+     * playlist save would leave the rule behind and the next sync would
+     * recreate the group.
+     */
+    public function delete(): ?bool
+    {
+        return DB::transaction(fn (): ?bool => parent::delete());
+    }
+
+    /**
+     * Strip every rule in the owning playlist's `dynamic_groups_config` that
+     * matches this row (see ruleIdentity()), then persist quietly. Called
+     * from the model's `deleted` hook so the three Filament delete surfaces
+     * (VOD / Series listing DeleteActions, View page DeleteAction) and any
+     * future bulk delete stay in lockstep with SyncDynamicGroups, which
+     * would otherwise recreate the deleted row on the next sync.
+     *
+     * Only model-level deletes reach this hook. SyncDynamicGroups' stale-row
+     * cleanup deliberately uses a query-builder delete so that disabling a
+     * rule (or syncing while TMDB is unconfigured) never strips rules here.
+     *
+     * `saveQuietly()` is intentional: Playlist::updated in AppServiceProvider
+     * dispatches PlaylistUpdated, which fans out the user's "updated"
+     * post-processes (webhooks/scripts) and re-syncs the primary profile.
+     * Deleting a derived group is not a playlist edit and must not trigger
+     * either side effect.
+     */
+    public function removeRuleFromPlaylistConfig(): void
+    {
+        $playlist = $this->playlist;
+        if ($playlist === null) {
+            return;
+        }
+
+        $config = $playlist->dynamic_groups_config;
+        if ($config === null) {
+            return;
+        }
+
+        $filtered = array_values(array_filter(
+            $config,
+            fn (array $rule): bool => ! $this->matchesRule($rule),
+        ));
+
+        if (count($filtered) === count($config)) {
+            return;
+        }
+
+        $playlist->dynamic_groups_config = $filtered;
+        $playlist->saveQuietly();
     }
 }

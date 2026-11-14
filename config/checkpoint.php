@@ -87,11 +87,19 @@ return [
             'guzzlehttp/promises',
             // ── Core Laravel ecosystem — trusted first-party packages ────────
             'laravel/framework',
+            // v4.4.8 was the security patch for GHSA-mhf7-xp6r-6qrc (Authorize
+            // bypass via reordered parameter keys and #[Json] execution order)
+            'livewire/livewire',
             // transitive deps of laravel/framework, bumped alongside it
             'nesbot/carbon',
             'symfony/http-foundation',
             'symfony/http-kernel',
             'symfony/mime',
+            // v8.1.11 was the security patch for CVE-2026-118517, CVE-2026-118516
+            // and GHSA-hwfg-qwvh-2wfx (sanitizer host bypass, route host matching, YAML DoS)
+            'symfony/html-sanitizer',
+            'symfony/routing',
+            'symfony/yaml',
             // ── Well-known, widely-audited ecosystem packages ────────────────
             'league/flysystem',
             'vlucas/phpdotenv',
@@ -147,7 +155,6 @@ return [
             'phpstan/phpstan',
             'phpunit/phpunit',
             'pragmarx/google2fa',
-            'prism-php/prism',
             'psy/psysh',
             'ralouphie/getallheaders',
             'react/promise',
@@ -191,6 +198,11 @@ return [
         // not a secret.
         '2a3eaf0a6403',
 
+        // DocumentXtreamApiResponses: 'password' => 'test_pass' is example data
+        // in the API docs, mirroring the Xtream panel `user_info` shape. Not a
+        // credential.
+        '81cff0596bab',
+
         // public/js/saade/filament-laravel-log — published vendor assets that
         // embed tiny base64 PNG sprites inline in CSS. Not credentials.
         'db4f9de8969c',
@@ -203,6 +215,11 @@ return [
         'ee841f8511f7',
         'c37d08a52506',
         'bf81dd0fb63f',
+
+        // PlaylistUrlService::credentialRoute(): 'm3ucredential'.$key.'token'
+        // is an inert placeholder swapped for the rawurlencode()d credential
+        // after route() runs. Not a secret.
+        '233f9c384b05',
 
         // ── Command Injection ────────────────────────────────────────────────
         // GitInfoService::getFromGitCommands — $basePath is base_path() which
@@ -268,6 +285,29 @@ return [
         '361a8a8465de',
         '53e3187b2a5f',
         'a215f7e698e0',
+        // SortService bulkSortByRatingExpression(): shared helper used by all four
+        // bulkSort{GroupChannels,CategorySeries,PlaylistVod,PlaylistSeries}ByRating
+        // methods (consolidated from separate near-duplicate methods, same guarantees
+        // as the release-date methods above). $table/$whereSql are hardcoded string
+        // literals passed only by SortService's own call sites, never user input;
+        // $isNullExprByDriver/$valueExprByDriver are compile-time SQL literals keyed
+        // by the PDO driver name; $direction is ternary-validated to 'ASC'|'DESC';
+        // group/category/playlist ids are passed as bound ? placeholders.
+        '17d06f104bc5',
+        '03d5bc0d50c7',
+        'e9351da168bc',
+        '887429bb5f5a',
+        'bd47bbeb172a',
+        // Same helper renamed to bulkSortByExpression() and given an optional
+        // $joinSqlByDriver (plus bound $joinBindings) for the series "most recent
+        // activity" sort. The join SQL comes only from seriesRecentActivityExprs(),
+        // built from compile-time literals and a hardcoded $episodeScopeSql passed
+        // by SortService's own call sites; category/playlist ids and today's date
+        // are bound ? placeholders. The last hash is that sort's fallback-driver
+        // selectRaw(), which interpolates the same literal expression.
+        'e6ca20c46d15',
+        'ca85fe8662a8',
+        '47a7230258a5',
 
         // SortService natural-sort rewrite (issue #1369): same guarantees as the
         // original SortService entries above, just on new lines/hashes.
@@ -288,6 +328,14 @@ return [
         '66a1a4c351d7',
         '6b5bb290e977',
         '4c12ed674220',
+        // OTA sub-channel numbers (issue #1604): the group sort-by-channel branches
+        // gained $tiebreak, a hardcoded SQL literal chosen by `$column === 'channel'`
+        // with the same ternary-validated $direction; the recount statements gained
+        // a literal `channel_minor = NULL`. Same guarantees as above, new hashes.
+        'f8dbb7ab0f2d',
+        '74d70cc2f5d5',
+        'fcd1c278e168',
+        'aa24a598f9c3',
 
         // Migration 2026_04_06: one-time data migration building a CASE
         // expression from UUIDs generated in the same migration — no user input.
@@ -338,6 +386,9 @@ return [
         // from likeOperator() which returns 'LIKE'|'ILIKE'. The actual user
         // input $genre is bound via the ? placeholder.
         '3489035c968f',
+        // Same call, now wrapped in a closure to fix a NULL-group exclusion bug
+        // (issue #1733) - finding text changed enough to produce a new hash.
+        '498c2c960be3',
 
         // ChannelController: $sortOrder was unsanitized — now validated to
         // 'ASC'|'DESC' before use. Hashes left here in case pattern still
@@ -361,6 +412,13 @@ return [
         // ? placeholder. No request/user input reaches the interpolated SQL.
         '4b62ac19b9b5', // channels query (live/vod split)
         '71f612830296', // series + episodes queries (COUNT(*) per bucket)
+
+        // BenchmarkEpgMapping::explainSlowestQueries (epg:benchmark-mapping
+        // --explain, a local CLI-only command): prefixes EXPLAIN to SQL captured
+        // from the app's own QueryExecuted events, i.e. statements the query
+        // builder already compiled with ? placeholders. Their values are passed
+        // back as bindings, never interpolated. No request/user input reaches it.
+        '785553ec1889',
 
         // ── XSS — controlled server-side rendering ───────────────────────────
         // regex-tester.blade.php: {!! !!} renders output from a Livewire

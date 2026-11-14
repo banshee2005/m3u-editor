@@ -14,7 +14,10 @@ use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Database\Eloquent\Relations\HasManyThrough;
+use Illuminate\Database\Eloquent\Relations\HasOne;
 use Illuminate\Database\Eloquent\Relations\MorphMany;
+use Illuminate\Database\Eloquent\Relations\MorphOne;
+use Illuminate\Database\Query\Builder as QueryBuilder;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\URL;
@@ -45,6 +48,7 @@ class Episode extends Model
         'info' => 'array',
         'stream_stats' => 'array',
         'stream_stats_probed_at' => 'datetime',
+        'stream_stats_inferred_from_id' => 'integer',
         'probe_enabled' => 'boolean',
         'is_custom' => 'boolean',
         'aio_last_resolved_at' => 'datetime',
@@ -96,6 +100,70 @@ class Episode extends Model
     public function playlist(): BelongsTo
     {
         return $this->belongsTo(Playlist::class);
+    }
+
+    /**
+     * TMDB/TVDB identity of this episode (the parent series' ids plus season
+     * and episode number), used to find a cached copy shared by another of
+     * the same user's playlists. Episodes without an external id get a
+     * per-episode key so they never match anything else.
+     */
+    public function cacheFingerprint(): string
+    {
+        $series = $this->series;
+        $seriesTmdb = ($series && $series->tmdb_id !== null) ? (string) $series->tmdb_id : null;
+        $seriesTvdb = ($series && $series->tvdb_id !== null) ? (string) $series->tvdb_id : null;
+        $episodeTmdb = $this->tmdb_id !== null ? (string) $this->tmdb_id : null;
+
+        $effectiveTmdb = $seriesTmdb ?? $episodeTmdb;
+        $hasExternalId = ($effectiveTmdb !== null && $effectiveTmdb !== '')
+            || ($seriesTvdb !== null && $seriesTvdb !== '');
+
+        return CachedContentFile::fingerprintFor([
+            'content_type' => 'episode',
+            'tmdb_id' => $effectiveTmdb,
+            'tvdb_id' => $seriesTvdb,
+            'season_number' => $this->season,
+            'episode_number' => $this->episode_num,
+            'local_key' => $hasExternalId ? null : 'ep'.$this->id,
+        ]);
+    }
+
+    /**
+     * The cached file downloaded for this episode, if any (any status).
+     */
+    public function cachedContentFile(): MorphOne
+    {
+        return $this->morphOne(CachedContentFile::class, 'cacheable');
+    }
+
+    /**
+     * Provider URL a cache download fetches (honors a custom URL override).
+     */
+    public function cacheSourceUrl(): string
+    {
+        return (string) $this->url;
+    }
+
+    /**
+     * Whether a Completed cached file can serve this episode: its own, or
+     * one shared by another of the same user's playlists.
+     */
+    public function isCached(): bool
+    {
+        if (! $this->playlist_id) {
+            return false;
+        }
+
+        return CachedContentFile::query()->servableFor($this)->exists();
+    }
+
+    /**
+     * The media-server source match when this episode is the provider episode.
+     */
+    public function mediaSourceMatch(): HasOne
+    {
+        return $this->hasOne(MediaSourceMatch::class);
     }
 
     /**
@@ -182,6 +250,20 @@ class Episode extends Model
     }
 
     /**
+     * Enabled episodes in their series' latest enabled season.
+     */
+    public function scopeInLatestSeason(Builder $query): Builder
+    {
+        return $query->where('episodes.enabled', true)
+            ->where('episodes.season', '=', function (QueryBuilder $latest): void {
+                $latest->selectRaw('MAX(latest.season)')
+                    ->from('episodes as latest')
+                    ->whereColumn('latest.series_id', 'episodes.series_id')
+                    ->where('latest.enabled', true);
+            });
+    }
+
+    /**
      * The next enabled episode in the same series: the next episode in this
      * season, or - failing that - the first episode of the next season.
      *
@@ -236,6 +318,51 @@ class Episode extends Model
     public function scopeEligibleForProbe(Builder $query): Builder
     {
         return $query->notAioManaged()->where('probe_enabled', true);
+    }
+
+    /**
+     * Episodes that incremental probing should pick up: never probed, or a failed probe
+     * (probed_at set, no stream_stats) whose last attempt is at least $retryFailedAfterDays old.
+     * A retry window of 0 retries failures on every run.
+     */
+    public function scopeDueForProbe(Builder $query, int $retryFailedAfterDays): Builder
+    {
+        return $query->where(fn (Builder $q) => $q
+            ->whereNull('stream_stats_probed_at')
+            ->orWhere(fn (Builder $q) => $q
+                ->whereNull('stream_stats')
+                ->where('stream_stats_probed_at', '<=', now()->subDays($retryFailedAfterDays))));
+    }
+
+    /**
+     * Copy this episode's measured stream stats onto sibling episodes that have no measurement
+     * of their own (unprobed, failed, or previously inferred), marking each copy as inferred
+     * from this episode. Used by sampled series probing, see SeriesProbeScope.
+     *
+     * @param  array<int>  $siblingIds
+     */
+    public function shareStreamStatsWith(array $siblingIds): int
+    {
+        if (empty($siblingIds) || empty($this->stream_stats) || $this->stream_stats_inferred_from_id) {
+            return 0;
+        }
+
+        $updated = 0;
+        foreach (array_chunk($siblingIds, 500) as $chunk) {
+            $updated += static::query()
+                ->whereKey($chunk)
+                ->whereKeyNot($this->id)
+                ->where(fn (Builder $q) => $q
+                    ->whereNull('stream_stats')
+                    ->orWhereNotNull('stream_stats_inferred_from_id'))
+                ->update([
+                    'stream_stats' => json_encode($this->stream_stats),
+                    'stream_stats_probed_at' => now(),
+                    'stream_stats_inferred_from_id' => $this->id,
+                ]);
+        }
+
+        return $updated;
     }
 
     public function getFloatingPlayerAttributes(?string $username = null, ?string $password = null): array
@@ -320,7 +447,7 @@ class Episode extends Model
             $password = urlencode($password);
         } else {
             $username = urlencode($user->name ?? 'admin');
-            $password = urlencode($playlist->uuid);
+            $password = urlencode($playlist->getInternalAuthPassword());
         }
 
         // Build the proxy URL path

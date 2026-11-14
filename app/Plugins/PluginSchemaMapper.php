@@ -9,6 +9,7 @@ use Filament\Forms\Components\TagsInput;
 use Filament\Forms\Components\Textarea;
 use Filament\Forms\Components\TextInput;
 use Filament\Forms\Components\Toggle;
+use Filament\Schemas\Components\Component;
 use Filament\Schemas\Components\Section;
 use Filament\Schemas\Components\Utilities\Get;
 use Filament\Schemas\Components\Utilities\Set;
@@ -16,7 +17,6 @@ use Illuminate\Contracts\Validation\ValidationRule;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Facades\Log;
-use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
 use Illuminate\Validation\Rule;
 use Illuminate\Validation\Rules\Exists;
@@ -63,6 +63,22 @@ class PluginSchemaMapper
         return $this->rulesForFields($action['fields'] ?? [], '', $plugin);
     }
 
+    /**
+     * Validation rules for an API endpoint's payload. Text values are length-capped
+     * because the caller is outside the app, unlike action forms.
+     *
+     * @return array<string, array<int, mixed>>
+     */
+    public function apiEndpointRules(Plugin $plugin, string $endpointId): array
+    {
+        $endpoint = $plugin->getApiEndpointDefinition($endpointId);
+        $maxLength = (int) config('plugins.api.max_text_length', 2048);
+
+        return collect($this->rulesForFields($endpoint['fields'] ?? [], '', $plugin))
+            ->map(fn (array $rules): array => in_array('string', $rules, true) ? [...$rules, 'max:'.$maxLength] : $rules)
+            ->all();
+    }
+
     public function defaultsForFields(array $fields, array $existing = []): array
     {
         $defaults = [];
@@ -104,7 +120,7 @@ class PluginSchemaMapper
         $type = $field['type'] ?? 'text';
 
         if ($type === 'section') {
-            return $this->sectionComponent($field, $prefix, $existing, $plugin, $dependencyResetTargets);
+            return $this->applyVisibility($this->sectionComponent($field, $prefix, $existing, $plugin, $dependencyResetTargets), $field, $prefix, $plugin);
         }
 
         $label = $field['label'] ?? Str::headline((string) ($field['id'] ?? 'value'));
@@ -131,8 +147,11 @@ class PluginSchemaMapper
             $component->password()->revealable();
         }
 
-        if (($targets = $dependencyResetTargets[$name] ?? []) !== []) {
+        if (array_key_exists($name, $dependencyResetTargets)) {
             $component->live();
+        }
+
+        if (($targets = $dependencyResetTargets[$name] ?? []) !== []) {
             $component->afterStateUpdated(function (Set $set) use ($targets): void {
                 foreach ($targets as $target) {
                     $set($target, null);
@@ -140,7 +159,7 @@ class PluginSchemaMapper
             });
         }
 
-        return $component
+        return $this->applyVisibility($component, $field, $prefix, $plugin)
             ->label($label)
             ->default($default)
             ->helperText($helperText)
@@ -184,6 +203,60 @@ class PluginSchemaMapper
         return $section;
     }
 
+    private function applyVisibility(Component $component, array $field, string $prefix, ?Plugin $plugin): Component
+    {
+        $conditions = $field['visible_when'] ?? [];
+        $provider = $field['visibility_provider'] ?? null;
+        if ($conditions === [] && $provider === null) {
+            return $component;
+        }
+
+        return $component
+            ->dehydratedWhenHidden()
+            ->visible(function (Get $get) use ($conditions, $provider, $field, $prefix, $plugin): bool {
+                foreach ($conditions as $dependency => $values) {
+                    if (! $this->visibilityValueAllowed($get($this->qualifiedDependencyName($dependency, $prefix)), Arr::wrap($values))) {
+                        return false;
+                    }
+                }
+
+                if ($provider === null) {
+                    return true;
+                }
+
+                if (! $plugin) {
+                    return false;
+                }
+
+                try {
+                    return app(PluginManager::class)->fieldVisible(
+                        $plugin,
+                        $provider,
+                        $this->optionProviderState(['depends_on' => $field['visibility_depends_on'] ?? []], $prefix, $get),
+                        $field,
+                    );
+                } catch (Throwable $e) {
+                    Log::warning('Plugin field visibility failed.', [
+                        'plugin_id' => $plugin->plugin_id,
+                        'provider' => $provider,
+                        'error' => $e->getMessage(),
+                    ]);
+
+                    return false;
+                }
+            });
+    }
+
+    /**
+     * Compare numbers by value so saved integers and submitted numeric strings match the same rule.
+     */
+    private function visibilityValueAllowed(mixed $value, array $allowed): bool
+    {
+        $normalize = fn (mixed $candidate): mixed => is_int($candidate) || is_float($candidate) ? (string) $candidate : $candidate;
+
+        return in_array($normalize($value), array_map($normalize, $allowed), true);
+    }
+
     private function selectComponent(string $name, array $field, ?Plugin $plugin, string $prefix): Select
     {
         $optionsProvider = trim((string) ($field['options_provider'] ?? ''));
@@ -225,15 +298,21 @@ class PluginSchemaMapper
             ->options(function () use ($field, $modelClass, $labelAttribute) {
                 $query = $modelClass::query();
 
-                if (($field['scope'] ?? null) === 'owned' && auth()->check() && $query->getModel()->isFillable('user_id')) {
+                if (($field['scope'] ?? null) === 'owned' && ! auth()->check()) {
+                    return [];
+                }
+
+                if (($field['scope'] ?? null) === 'owned' && $query->getModel()->isFillable('user_id')) {
                     $query->where('user_id', auth()->id());
                 }
 
-                return $query
-                    ->orderBy($labelAttribute)
-                    ->limit(200)
-                    ->pluck($labelAttribute, 'id')
-                    ->toArray();
+                $query->orderBy($labelAttribute)->limit(200)->select([$labelAttribute, 'id']);
+
+                return app(PluginUiRequestCache::class)->queryOptions(
+                    $query->toBase(),
+                    fn (): array => $query->pluck($labelAttribute, 'id')->toArray(),
+                    $modelClass,
+                );
             });
 
         if ($multiple) {
@@ -443,6 +522,10 @@ class PluginSchemaMapper
     private function collectDependencyResetTargets(array $fields, string $prefix, array &$targets): void
     {
         foreach ($fields as $field) {
+            foreach ([...array_keys($field['visible_when'] ?? []), ...($field['visibility_depends_on'] ?? [])] as $dependency) {
+                $targets[$this->qualifiedDependencyName($dependency, $prefix)] ??= [];
+            }
+
             if (($field['type'] ?? null) === 'section') {
                 $this->collectDependencyResetTargets($field['fields'] ?? [], $prefix, $targets);
 
@@ -489,7 +572,7 @@ class PluginSchemaMapper
         $model = app($modelClass);
         $rule = Rule::exists($model->getTable(), 'id');
 
-        if (($field['scope'] ?? null) === 'owned' && auth()->check() && ! auth()->user()->isAdmin() && Schema::hasColumn($model->getTable(), 'user_id')) {
+        if (($field['scope'] ?? null) === 'owned' && auth()->check() && ! auth()->user()->isAdmin() && app(PluginUiRequestCache::class)->hasColumn($model->getTable(), 'user_id')) {
             $rule->where(fn ($query) => $query->where('user_id', auth()->id()));
         }
 
@@ -508,11 +591,11 @@ class PluginSchemaMapper
         // Use a guaranteed-invalid table name when the table cannot be resolved so the rule always fails safely.
         $rule = Rule::exists($tableName ?? '_invalid_table_', $keyColumn);
 
-        if ((bool) ($field['scope_plugin'] ?? false) && $tableName && Schema::hasColumn($tableName, 'extension_plugin_id')) {
+        if ((bool) ($field['scope_plugin'] ?? false) && $tableName && app(PluginUiRequestCache::class)->hasColumn($tableName, 'extension_plugin_id')) {
             $rule->where('extension_plugin_id', $plugin->id);
         }
 
-        if ((bool) ($field['enabled_only'] ?? false) && $tableName && Schema::hasColumn($tableName, 'enabled')) {
+        if ((bool) ($field['enabled_only'] ?? false) && $tableName && app(PluginUiRequestCache::class)->hasColumn($tableName, 'enabled')) {
             $rule->where('enabled', true);
         }
 

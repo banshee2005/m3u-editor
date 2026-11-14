@@ -81,6 +81,10 @@ class SyncSeriesStrmFiles implements ShouldQueue
             if ($series) {
                 $this->fetchMetadataForSeries($series, $settings);
 
+                // A disabled series, or one without enabled episodes, writes
+                // nothing, so also clean where its existing files live.
+                $this->trackExistingSyncLocations($series);
+
                 // For single series sync, cleanup immediately
                 $this->performCleanup();
 
@@ -123,12 +127,30 @@ class SyncSeriesStrmFiles implements ShouldQueue
                 $query->where('playlist_id', $this->playlist_id);
             })
             ->when($this->series_ids !== null, function ($query) {
-                $query->whereIn('id', $this->series_ids);
+                $query->whereIntegerInRaw('id', $this->series_ids);
             })
             ->count();
 
         if ($totalCount === 0) {
             Log::info('STRM Sync: No series to process');
+
+            // Cleanup must still run with zero enabled series - e.g. disabling the
+            // last enabled series at this location leaves its tracked files/mappings
+            // behind otherwise, since there's no batch left to carry the cleanup chain
+            // forward. CheckSeriesStrmProgress treats totalSeries=0 as already complete
+            // and dispatches cleanup immediately.
+            dispatch(new CheckSeriesStrmProgress(
+                currentOffset: 0,
+                totalSeries: 0,
+                notify: $this->notify,
+                all_playlists: $this->all_playlists,
+                playlist_id: $this->playlist_id,
+                user_id: $this->user_id,
+                needsCleanup: true,
+                series_ids: $this->series_ids,
+                syncRunId: $this->syncRunId,
+                completionPhase: $this->completionPhase,
+            ));
 
             return;
         }
@@ -207,7 +229,7 @@ class SyncSeriesStrmFiles implements ShouldQueue
                 $query->where('playlist_id', $this->playlist_id);
             })
             ->when($this->series_ids !== null, function ($query) {
-                $query->whereIn('id', $this->series_ids);
+                $query->whereIntegerInRaw('id', $this->series_ids);
             })
             ->orderBy('id')
             ->skip($this->batchOffset)
@@ -263,7 +285,7 @@ class SyncSeriesStrmFiles implements ShouldQueue
                     $q->where('series_id', $this->series->id);
                 }
                 if ($this->series_ids !== null) {
-                    $q->whereIn('series_id', $this->series_ids);
+                    $q->whereIntegerInRaw('series_id', $this->series_ids);
                 }
             })
             ->distinct()
@@ -369,7 +391,7 @@ class SyncSeriesStrmFiles implements ShouldQueue
                     $query->where('playlist_id', $this->playlist_id);
                 }
                 if ($this->series_ids !== null) {
-                    $query->whereIn('id', $this->series_ids);
+                    $query->whereIntegerInRaw('id', $this->series_ids);
                 }
             })
             ->get();
@@ -395,7 +417,7 @@ class SyncSeriesStrmFiles implements ShouldQueue
                 }
                 if ($this->series_ids !== null) {
                     $query->whereHas('series', function ($q) {
-                        $q->whereIn('id', $this->series_ids);
+                        $q->whereIntegerInRaw('id', $this->series_ids);
                     });
                 }
             })
@@ -418,6 +440,25 @@ class SyncSeriesStrmFiles implements ShouldQueue
                     ->delay(now()->addSeconds($integrationData['delay']));
             }
         }
+    }
+
+    /**
+     * Add the sync locations holding this series' existing episode files, so
+     * cleanup reaches them even when this run wrote no files for the series.
+     */
+    private function trackExistingSyncLocations(Series $series): void
+    {
+        $locations = StrmFileMapping::query()
+            ->where('syncable_type', Episode::class)
+            ->whereIn('syncable_id', Episode::query()->select('id')->where('series_id', $series->id))
+            ->distinct()
+            ->pluck('sync_location')
+            ->all();
+
+        $this->processedSyncLocations = array_values(array_unique([
+            ...$this->processedSyncLocations,
+            ...$locations,
+        ]));
     }
 
     /**
@@ -477,6 +518,13 @@ class SyncSeriesStrmFiles implements ShouldQueue
 
             // Get the series episodes
             $episodes = $series->enabled_episodes;
+
+            // Prefer media-server sources: batch-eager-load the match
+            // relations when the toggle is on (one query), so the "original"
+            // url branch below never queries per episode. Toggle off = zero.
+            if ($series->playlist?->prefer_media_server_sources) {
+                $episodes->loadMissing('mediaSourceMatch.mediaEpisode');
+            }
 
             // Check if there are any episodes
             if ($episodes->isEmpty()) {
@@ -555,11 +603,15 @@ class SyncSeriesStrmFiles implements ShouldQueue
                 return trim($name);
             };
 
+            // Resolved unconditionally: the filename-metadata branch below needs it
+            // independently of whether "category" is also selected as a folder
+            // component - the form offers them as separate settings.
+            $category = $series->category;
+
             // See if the category is enabled, if not, skip, else create the folder
             if (in_array('category', $pathStructure)) {
                 // Create the category folder
                 // Remove any special characters from the category name
-                $category = $series->category;
                 $catName = $category?->name ?? $category?->name_internal ?? 'Uncategorized';
                 // Apply name filtering
                 $catName = $applyNameFilter($catName);
@@ -651,9 +703,9 @@ class SyncSeriesStrmFiles implements ShouldQueue
             $seriesReleaseDate = $series->release_date;
             $seriesMetadata = $series->metadata ?? [];
             $playlistUser = $playlist?->user;
-            $playlistUuid = $playlist?->uuid;
+            $playlistPassword = $playlist?->getInternalAuthPassword();
 
-            if (! $playlistUser || ! $playlistUuid) {
+            if (! $playlistUser || ! $playlistPassword) {
                 Log::warning('STRM Sync: Series has no associated playlist user, skipping episode URL generation', [
                     'series_id' => $series->id,
                     'playlist_id' => $series->playlist_id,
@@ -750,9 +802,21 @@ class SyncSeriesStrmFiles implements ShouldQueue
                 $useOriginalUrl = ($sync_settings['url_type'] ?? 'proxy') === 'original';
                 if ($useOriginalUrl) {
                     $url = $ep->url;
+
+                    // Prefer media-server sources: when matched, write the
+                    // media item's signed URL instead. No availability check
+                    // here: the file is static and stream-start applies its
+                    // own fallback.
+                    if ($series->playlist?->prefer_media_server_sources) {
+                        $mediaEpisode = $ep->mediaSourceMatch?->mediaEpisode;
+
+                        if ($mediaEpisode?->enabled) {
+                            $url = $mediaEpisode->url;
+                        }
+                    }
                 } else {
                     $containerExtension = $ep->container_extension ?? 'mp4';
-                    $url = rtrim("/series/{$playlistUser->name}/{$playlistUuid}/".$ep->id.'.'.$containerExtension, '.');
+                    $url = rtrim("/series/{$playlistUser->name}/{$playlistPassword}/".$ep->id.'.'.$containerExtension, '.');
                     $url = PlaylistService::getBaseUrl($url);
                 }
 

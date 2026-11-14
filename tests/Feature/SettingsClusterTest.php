@@ -4,21 +4,29 @@ use App\Filament\Clusters\Settings\Pages\ManageAlertSettings;
 use App\Filament\Clusters\Settings\Pages\ManageApiSettings;
 use App\Filament\Clusters\Settings\Pages\ManageAssetSettings;
 use App\Filament\Clusters\Settings\Pages\ManageBackupSettings;
+use App\Filament\Clusters\Settings\Pages\ManageCacheSettings;
 use App\Filament\Clusters\Settings\Pages\ManageCopilotSettings;
 use App\Filament\Clusters\Settings\Pages\ManageGeneralSettings;
 use App\Filament\Clusters\Settings\Pages\ManageIntegrationSettings;
+use App\Filament\Clusters\Settings\Pages\ManageNavigationSettings;
 use App\Filament\Clusters\Settings\Pages\ManageProxySettings;
 use App\Filament\Clusters\Settings\Pages\ManageSmtpSettings;
 use App\Filament\Clusters\Settings\Pages\ManageSyncSettings;
 use App\Filament\Clusters\Settings\Pages\ManageTvAppSettings;
+use App\Filament\Clusters\Settings\SettingsCluster;
+use App\Filament\Pages\Backups;
+use App\Filament\Resources\CachedContentFiles\CachedContentFileResource;
+use App\Jobs\RestartQueue;
 use App\Models\User;
 use App\Settings\GeneralSettings;
 use Filament\Schemas\Components\Tabs;
 use Filament\Schemas\Schema;
+use Illuminate\Support\Facades\Bus;
 use Livewire\Livewire;
 
 $allPages = [
     ManageGeneralSettings::class,
+    ManageNavigationSettings::class,
     ManageProxySettings::class,
     ManageTvAppSettings::class,
     ManageSyncSettings::class,
@@ -26,6 +34,7 @@ $allPages = [
     ManageBackupSettings::class,
     ManageSmtpSettings::class,
     ManageApiSettings::class,
+    ManageCacheSettings::class,
     ManageIntegrationSettings::class,
     ManageCopilotSettings::class,
     ManageAlertSettings::class,
@@ -36,6 +45,17 @@ beforeEach(function () {
 });
 
 it('renders every settings sub-page', function (string $page) {
+    Livewire::test($page)->assertOk();
+})->with($allPages);
+
+it('renders every settings sub-page in a non-English locale', function (string $page) {
+    // Regression: a bare, dot-less __() label (e.g. __('Navigation')) collides with a
+    // same-named lang/{locale}/{group}.php translation *group* file when no exact JSON
+    // translation exists for that locale, returning an array instead of a string and
+    // crashing the page. English is unaffected because en.json carries an identity
+    // entry for every string; other locales are not guaranteed to.
+    app()->setLocale('fr');
+
     Livewire::test($page)->assertOk();
 })->with($allPages);
 
@@ -87,11 +107,85 @@ it('resolves the custom date format from the virtual fields on the general page'
         ]);
 });
 
+it('registers the Navigation page in the Settings cluster sub-navigation', function () {
+    // SettingsCluster overrides getClusteredComponents() with an explicit list rather than
+    // relying on auto-discovery, so every new settings sub-page must be added here or it
+    // is unreachable via the Settings sidebar/sub-nav despite still being a valid route.
+    expect(SettingsCluster::getClusteredComponents())->toContain(ManageNavigationSettings::class);
+});
+
 it('hides the proxy page when the proxy integration is disabled', function () {
     config(['proxy.proxy_integration_enabled' => false]);
 
     expect(ManageProxySettings::canAccess())->toBeFalse()
         ->and(ManageProxySettings::shouldRegisterNavigation())->toBeFalse();
+});
+
+it('shows only the header actions that belong to each settings sub-page', function (string $page, array $expected) {
+    $maintenanceActions = ['test_websocket', 'clear_expired_logo_cache', 'clear_logo_cache', 'reset_queue'];
+
+    $component = Livewire::test($page);
+
+    foreach ($expected as $action) {
+        $component->assertActionExists($action);
+    }
+
+    foreach (array_diff($maintenanceActions, $expected) as $action) {
+        $component->assertActionDoesNotExist($action);
+    }
+})->with([
+    'general' => [ManageGeneralSettings::class, ['test_websocket']],
+    'navigation' => [ManageNavigationSettings::class, ['restore_default', 'restore_simplified_default']],
+    'proxy' => [ManageProxySettings::class, ['test_connection', 'm3u_proxy_info', 'github']],
+    'tv app' => [ManageTvAppSettings::class, ['send_tv_notification', 'get_tv_app']],
+    'sync' => [ManageSyncSettings::class, ['reset_queue']],
+    'assets' => [ManageAssetSettings::class, ['manage_assets', 'clear_expired_logo_cache', 'clear_logo_cache']],
+    'backups' => [ManageBackupSettings::class, ['manage_backups']],
+    'smtp' => [ManageSmtpSettings::class, ['send_test_email']],
+    'api' => [ManageApiSettings::class, ['manage_api_keys', 'view_api_docs']],
+    'cache' => [ManageCacheSettings::class, ['manage_cached_items']],
+    'integrations' => [ManageIntegrationSettings::class, []],
+    'copilot' => [ManageCopilotSettings::class, []],
+    'alerts' => [ManageAlertSettings::class, []],
+]);
+
+it('links the backups page header to the backups manager', function () {
+    Livewire::test(ManageBackupSettings::class)
+        ->assertActionVisible('manage_backups')
+        ->assertActionHasUrl('manage_backups', Backups::getUrl());
+});
+
+it('only links to cached items while caching is enabled', function () {
+    $settings = app(GeneralSettings::class);
+    $settings->enable_cache = false;
+    $settings->save();
+
+    Livewire::test(ManageCacheSettings::class)
+        ->assertActionHidden('manage_cached_items');
+
+    $settings->enable_cache = true;
+    $settings->save();
+
+    Livewire::test(ManageCacheSettings::class)
+        ->assertActionVisible('manage_cached_items')
+        ->assertActionHasUrl('manage_cached_items', CachedContentFileResource::getUrl());
+});
+
+it('sends the SMTP test email from the page header using the form state', function () {
+    Livewire::test(ManageSmtpSettings::class)
+        ->fillForm(['smtp_host' => null, 'smtp_port' => null])
+        ->callAction('send_test_email', ['to_email' => 'admin@example.com'])
+        ->assertNotified(__('Missing SMTP Fields'));
+});
+
+it('resets the queue from the sync options page header', function () {
+    Bus::fake();
+
+    Livewire::test(ManageSyncSettings::class)
+        ->callAction('reset_queue')
+        ->assertNotified(__('Queue reset'));
+
+    Bus::assertDispatched(RestartQueue::class);
 });
 
 /**
@@ -114,7 +208,8 @@ function activeSettingsTab(string $pageClass, string $tab): int
 it('opens the Integrations page on the tab named in ?tab=', function () {
     expect(activeSettingsTab(ManageIntegrationSettings::class, 'tmdb'))->toBe(1)
         ->and(activeSettingsTab(ManageIntegrationSettings::class, 'aiostreams'))->toBe(2)
-        ->and(activeSettingsTab(ManageIntegrationSettings::class, 'mediaflow'))->toBe(3);
+        ->and(activeSettingsTab(ManageIntegrationSettings::class, 'mediaflow'))->toBe(3)
+        ->and(activeSettingsTab(ManageIntegrationSettings::class, 'sports'))->toBe(4);
 });
 
 it('opens the Alerts page on the tab named in ?tab=', function () {

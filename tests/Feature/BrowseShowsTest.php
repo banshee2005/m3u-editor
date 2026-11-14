@@ -276,6 +276,104 @@ it('creates a once rule from a programme', function () {
         ->exists())->toBeTrue();
 });
 
+it('resolves the once rule channel and airing channel name from the programme\'s own EPG', function () {
+    // Another EPG (created first) reuses the same XMLTV id for an unrelated channel.
+    $otherEpg = Epg::factory()->for($this->user)->create();
+    $otherEpgChannel = EpgChannel::factory()->for($otherEpg)->create([
+        'user_id' => $this->user->id,
+        'channel_id' => '101',
+        'display_name' => 'CHAMP | Sheffield United',
+    ]);
+    Channel::factory()->for($this->setting->playlist)->create(['epg_channel_id' => $otherEpgChannel->id]);
+
+    $epgChannel = EpgChannel::factory()->for($this->epg)->create([
+        'user_id' => $this->user->id,
+        'channel_id' => '101',
+        'display_name' => 'BBC Two',
+    ]);
+    $channel = Channel::factory()->for($this->setting->playlist)->create(['epg_channel_id' => $epgChannel->id, 'enabled' => true]);
+
+    $programme = EpgProgramme::factory()->for($this->epg)->create([
+        'title' => 'Match of the Day',
+        'epg_channel_id' => '101',
+        'start_time' => now()->addHours(2),
+        'end_time' => now()->addHours(3),
+    ]);
+
+    Livewire::test(BrowseShows::class)
+        ->set('dvr_setting_id', $this->setting->id)
+        ->call('openShowDetail', 'Match of the Day')
+        ->assertSet('selectedShowDetail', fn (?array $detail) => $detail['airings'][0]['channel_name'] === 'BBC Two')
+        ->call('recordOnce', $programme->id);
+
+    expect(DvrRecordingRule::where('programme_id', $programme->id)->value('channel_id'))->toBe($channel->id);
+});
+
+it('resolves the once rule channel by tvg-id when the channel has no EPG mapping', function () {
+    $channel = Channel::factory()->for($this->setting->playlist)->create([
+        'stream_id' => 'bbctwo.uk',
+        'epg_channel_id' => null,
+    ]);
+
+    $programme = EpgProgramme::factory()->for($this->epg)->create([
+        'title' => 'Match of the Day',
+        'epg_channel_id' => 'bbctwo.uk',
+        'start_time' => now()->addHours(2),
+        'end_time' => now()->addHours(3),
+    ]);
+
+    Livewire::test(BrowseShows::class)
+        ->set('dvr_setting_id', $this->setting->id)
+        ->call('recordOnce', $programme->id);
+
+    expect(DvrRecordingRule::where('programme_id', $programme->id)->value('channel_id'))->toBe($channel->id);
+});
+
+it('restricts search to the selected channel using tvg-id when there is no explicit EPG mapping', function () {
+    $channelA = Channel::factory()->for($this->setting->playlist)->create([
+        'stream_id' => 'r07.a',
+        'epg_channel_id' => null,
+        'enabled' => true,
+    ]);
+    Channel::factory()->for($this->setting->playlist)->create([
+        'stream_id' => 'r07.b',
+        'epg_channel_id' => null,
+        'enabled' => true,
+    ]);
+
+    EpgProgramme::factory()->for($this->epg)->create([
+        'title' => 'R07 Programme A',
+        'epg_channel_id' => 'r07.a',
+        'start_time' => now()->addHours(2),
+        'end_time' => now()->addHours(3),
+    ]);
+    EpgProgramme::factory()->for($this->epg)->create([
+        'title' => 'R07 Programme B',
+        'epg_channel_id' => 'r07.b',
+        'start_time' => now()->addHours(2),
+        'end_time' => now()->addHours(3),
+    ]);
+
+    Livewire::test(BrowseShows::class)
+        ->set('dvr_setting_id', $this->setting->id)
+        ->set('channel_id', $channelA->id)
+        ->call('search')
+        ->assertSet('shows', fn (array $shows) => count($shows) === 1
+            && $shows[0]['title'] === 'R07 Programme A');
+});
+
+it('does not create a once rule for a programme from another user\'s EPG', function () {
+    $programme = EpgProgramme::factory()
+        ->for(Epg::factory()->for(User::factory()))
+        ->create(['title' => 'Foreign Show']);
+
+    Livewire::test(BrowseShows::class)
+        ->set('dvr_setting_id', $this->setting->id)
+        ->call('recordOnce', $programme->id);
+
+    expect(DvrRecordingRule::where('programme_id', $programme->id)->exists())->toBeFalse();
+});
+
 it('warns with a notification when a duplicate once rule exists', function () {
     $programme = EpgProgramme::factory()->for($this->epg)->create(['title' => 'Special Event']);
 
@@ -358,6 +456,45 @@ it('creates a series rule with custom options', function () {
         ->and($rule->priority)->toBe(75)
         ->and($rule->start_early_seconds)->toBe(120)
         ->and($rule->end_late_seconds)->toBe(300);
+});
+
+it('converts series padding unit and direction into signed seconds', function () {
+    Livewire::test(BrowseShows::class)
+        ->set('dvr_setting_id', $this->setting->id)
+        ->set('seriesStartEarly', 5)
+        ->set('seriesStartUnit', 'min')
+        ->set('seriesStartDirection', 'trim')
+        ->set('seriesEndLate', 90)
+        ->set('seriesEndUnit', 'sec')
+        ->set('seriesEndDirection', 'trim')
+        ->call('recordSeriesWithOptions', 'Breaking Bad');
+
+    $rule = DvrRecordingRule::where('user_id', $this->user->id)
+        ->where('series_title', 'Breaking Bad')
+        ->first();
+
+    expect($rule)->not->toBeNull()
+        ->and($rule->start_early_seconds)->toBe(-300)
+        ->and($rule->end_late_seconds)->toBe(-90);
+});
+
+it('clamps series padding to 24 hours when the form is not validated', function () {
+    Livewire::test(BrowseShows::class)
+        ->set('dvr_setting_id', $this->setting->id)
+        ->set('seriesStartEarly', 99999)
+        ->set('seriesStartUnit', 'min')
+        ->set('seriesStartDirection', 'trim')
+        ->set('seriesEndLate', 99999)
+        ->set('seriesEndUnit', 'min')
+        ->call('recordSeriesWithOptions', 'Breaking Bad');
+
+    $rule = DvrRecordingRule::where('user_id', $this->user->id)
+        ->where('series_title', 'Breaking Bad')
+        ->first();
+
+    expect($rule)->not->toBeNull()
+        ->and($rule->start_early_seconds)->toBe(-86400)
+        ->and($rule->end_late_seconds)->toBe(86400);
 });
 
 it('warns when recordSeriesWithOptions is called without a dvr setting selected', function () {

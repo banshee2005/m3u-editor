@@ -14,6 +14,8 @@ Works with m3u, m3u8, m3u+ and Xtream codes api!
 
 EPG support for XMLTV files (local or remote), XMLTV URLs, and full **Schedules Direct** integration.
 
+![feature-card](https://m3ue.sparkison.dev/img/social-card.jpg)
+
 ### Questions/issues/suggestions
 
 Feel free to [open an issue](https://github.com/sparkison/m3u-editor/issues/new?template=bug_report.md) on this repo, or hit us up on [Discord](https://discord.gg/rS3abJ5dz7)
@@ -61,17 +63,19 @@ View more in our [getting started](https://sparkison.github.io/m3u-editor-docs/d
 
 ## 📸 Screenshots
 
-![Channel editor](./screenshots/channel-editing.png)
+![Dashboard](./screenshots/v0.13.4/m3ue-home.png)
 
-![Series management](./screenshots/series-mgmt.png)
+![Series detail](./screenshots/v0.13.4/m3ue-series-detail.png)
 
-![Playlist EPG preview](./screenshots/in-app-playlist-epg-preview.png)
+![Series editor](./screenshots/v0.13.4/m3ue-series-editor.png)
 
-![EPG preview with playpack](./screenshots/in-app-playlist-epg-playback.png)
+![Playlist output options](./screenshots/v0.13.4/m3ue-output-options.png)
 
-![Proxy stats](./screenshots/proxy-monitor.png)
+![Media servers](./screenshots/v0.13.4/m3ue-servers.png)
 
-![API](./screenshots/api.png)
+![Proxy stream monitor](./screenshots/v0.13.4/m3ue-proxy-monitor.png)
+
+![API](./screenshots/v0.13.4/m3ue-api.png)
 
 ---
 

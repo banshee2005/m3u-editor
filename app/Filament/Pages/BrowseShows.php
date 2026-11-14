@@ -5,14 +5,15 @@ namespace App\Filament\Pages;
 use App\Enums\DvrRuleType;
 use App\Enums\DvrSeriesMode;
 use App\Filament\Concerns\HasBrowseShowsFiltersForm;
+use App\Filament\Support\DvrPaddingFields;
 use App\Jobs\DvrSchedulerTick;
 use App\Models\Channel;
 use App\Models\DvrRecordingRule;
 use App\Models\DvrSetting;
 use App\Models\Epg;
-use App\Models\EpgChannel;
 use App\Models\EpgProgramme;
 use App\Models\Group;
+use App\Services\EpgProgrammeChannelResolver;
 use App\Services\ShowMetadataService;
 use App\Settings\GeneralSettings;
 use App\Support\EpgProgrammeNormalizer;
@@ -266,7 +267,11 @@ class BrowseShows extends Page
             'seriesChannelId' => $this->seriesChannelId,
             'seriesPriority' => $this->seriesPriority,
             'seriesStartEarly' => $this->seriesStartEarly,
+            'seriesStartUnit' => $this->seriesStartUnit,
+            'seriesStartDirection' => $this->seriesStartDirection,
             'seriesEndLate' => $this->seriesEndLate,
+            'seriesEndUnit' => $this->seriesEndUnit,
+            'seriesEndDirection' => $this->seriesEndDirection,
             'seriesKeepLast' => $this->seriesKeepLast,
         ]);
     }
@@ -287,8 +292,8 @@ class BrowseShows extends Page
             $channelName,
             $this->seriesNewOnly ? __('new only') : null,
             $this->seriesPriority !== 50 ? 'P:'.$this->seriesPriority : null,
-            ($this->seriesStartEarly || $this->seriesEndLate)
-                ? '+'.$this->seriesStartEarly.'s/+'.$this->seriesEndLate.'s'
+            ($this->seriesStartEarlySeconds() || $this->seriesEndLateSeconds())
+                ? DvrPaddingFields::formatSeconds($this->seriesStartEarlySeconds()).'/'.DvrPaddingFields::formatSeconds($this->seriesEndLateSeconds())
                 : null,
             $this->seriesKeepLast ? __('keep').' '.$this->seriesKeepLast : null,
         ]);
@@ -343,8 +348,7 @@ class BrowseShows extends Page
         $this->selectedShowTitle = $title;
         $this->seriesNewOnly = 0;
         $this->seriesPriority = 50;
-        $this->seriesStartEarly = 0;
-        $this->seriesEndLate = 0;
+        $this->resetSeriesPadding();
         $this->seriesKeepLast = null;
         [$this->sourceChannelId, $this->sourceChannelName] = $this->resolveSourceChannel($title);
         $this->seriesChannelId = 0;
@@ -371,7 +375,7 @@ class BrowseShows extends Page
             return;
         }
 
-        $programme = EpgProgramme::find($programmeId);
+        $programme = app(EpgProgrammeChannelResolver::class)->findOwnedProgramme($programmeId, $dvrSetting->user_id);
 
         if (! $programme) {
             Notification::make()->title(__('Programme not found.'))->danger()->send();
@@ -391,17 +395,10 @@ class BrowseShows extends Page
             return;
         }
 
-        // epg_programmes.epg_channel_id is the string channel ID from the EPG XML;
-        // channels.epg_channel_id is an integer FK to epg_channels.id — resolve via EpgChannel first.
-        $channel = null;
-        if ($programme->epg_channel_id) {
-            $epgChannelId = EpgChannel::where('channel_id', $programme->epg_channel_id)->value('id');
-            if ($epgChannelId) {
-                $channel = Channel::where('user_id', Auth::id())
-                    ->where('epg_channel_id', $epgChannelId)
-                    ->first();
-            }
-        }
+        $ownerChannels = $dvrSetting->ownerChannelsSubquery();
+        $channel = $ownerChannels
+            ? app(EpgProgrammeChannelResolver::class)->channelForProgramme($programme, $ownerChannels, ['id'])
+            : null;
 
         DvrRecordingRule::create([
             'user_id' => Auth::id(),
@@ -488,8 +485,8 @@ class BrowseShows extends Page
             'channel_id' => $channelId,
             'source_channel_id' => $sourceChannelId,
             'priority' => $this->seriesPriority,
-            'start_early_seconds' => $this->seriesStartEarly,
-            'end_late_seconds' => $this->seriesEndLate,
+            'start_early_seconds' => $this->seriesStartEarlySeconds(),
+            'end_late_seconds' => $this->seriesEndLateSeconds(),
             'keep_last' => $this->seriesKeepLast ?: null,
         ]);
     }
@@ -514,20 +511,14 @@ class BrowseShows extends Page
         $programme = $this->buildBaseQuery()
             ->where('title', $title)
             ->orderBy('start_time')
-            ->first(['epg_channel_id']);
+            ->first(['epg_id', 'epg_channel_id']);
 
-        if (! $programme?->epg_channel_id) {
+        if (! $programme) {
             return [null, null];
         }
 
-        $epgChannelPk = EpgChannel::where('channel_id', $programme->epg_channel_id)->value('id');
-        if (! $epgChannelPk) {
-            return [null, null];
-        }
-
-        $channel = Channel::whereIn('id', $subquery)
-            ->where('epg_channel_id', $epgChannelPk)
-            ->first(['id', 'title', 'title_custom', 'name', 'name_custom']);
+        $channel = app(EpgProgrammeChannelResolver::class)
+            ->channelForProgramme($programme, $subquery, ['id', 'title', 'title_custom', 'name', 'name_custom']);
 
         if (! $channel) {
             return [null, null];
@@ -678,12 +669,8 @@ class BrowseShows extends Page
      */
     private function buildBaseQuery(): Builder
     {
-        $userId = Auth::id();
-
-        $epgIds = Epg::where('user_id', $userId)->pluck('id');
-
         $query = EpgProgramme::query()
-            ->whereIn('epg_id', $epgIds)
+            ->whereIn('epg_id', Epg::where('user_id', Auth::id())->select('id'))
             ->where('start_time', '>=', now())
             ->where('start_time', '<=', now()->addDays($this->days));
 
@@ -710,11 +697,7 @@ class BrowseShows extends Page
             : null;
 
         if ($subquery) {
-            $epgChannelIds = $this->resolveEpgChannelScope($subquery);
-
-            if ($epgChannelIds !== null) {
-                $query->whereIn('epg_channel_id', $epgChannelIds);
-            }
+            $this->scopeToFilteredChannels($query, $subquery);
         }
 
         return $query;
@@ -818,8 +801,7 @@ class BrowseShows extends Page
             return null;
         }
 
-        $channelIds = $programmes->pluck('epg_channel_id')->unique()->filter()->values()->all();
-        $channelNames = $this->resolveChannelNames($channelIds);
+        $channelNames = app(EpgProgrammeChannelResolver::class)->channelNames($programmes);
         $timezone = config('dev.timezone') ?? app(GeneralSettings::class)->app_timezone ?? 'UTC';
 
         $episodeLookups = [];
@@ -847,7 +829,7 @@ class BrowseShows extends Page
 
             return [
                 'id' => $p->id,
-                'channel_name' => $channelNames[$p->epg_channel_id] ?? $p->epg_channel_id,
+                'channel_name' => EpgProgrammeChannelResolver::nameFor($channelNames, $p),
                 'start_time_human' => $startTime?->format('D M j, g:ia'),
                 'end_time_human' => $endTime?->format('g:ia'),
                 'duration_human' => $this->formatDuration($startTime, $endTime),
@@ -939,111 +921,37 @@ class BrowseShows extends Page
     }
 
     /**
-     * @param  list<string>  $channelIds
-     * @return array<string, string>
-     */
-    private function resolveChannelNames(array $channelIds): array
-    {
-        if (empty($channelIds)) {
-            return [];
-        }
-
-        return EpgChannel::without('epg')
-            ->whereIn('channel_id', $channelIds)
-            ->get(['channel_id', 'name', 'display_name', 'name_custom', 'display_name_custom'])
-            ->mapWithKeys(fn (EpgChannel $c) => [
-                $c->channel_id => $c->name_custom
-                    ?: $c->display_name_custom
-                    ?: $c->display_name
-                    ?: $c->name,
-            ])
-            ->all();
-    }
-
-    /**
-     * Resolve the set of XMLTV channel IDs that are in scope for the given channels.
+     * Limit the programme query to the guide data behind the DVR setting's channels,
+     * narrowed by the active channel filter. Programmes are matched on each mapped
+     * channel's own EPG (epg_id + XMLTV id), with a tvg-id (stream_id) fallback for
+     * unmapped channels - see EpgProgrammeChannelResolver::scopeToChannels().
      *
-     * Matches via two paths so that both EPG-channel-mapped channels and tvg-id
-     * (stream_id) channels return results:
-     *   1. channels.epg_channel_id → epg_channels.channel_id  (SchedulesDirect-style numeric IDs)
-     *   2. channels.stream_id                                  (XMLTV tvg-id that matches directly)
-     *
-     * Returns null when the playlist has no EPG-linked channels at all (i.e. no
-     * filtering should be applied — all programmes are fair game). Returns an empty
-     * array when a channel/group filter is active but nothing matched (0 results).
+     * With no filter active and no guide-linked channels at all, the query is left
+     * unscoped (all programmes are fair game). An active filter that matches nothing
+     * yields 0 results.
      *
      * @param  Builder  $channelsSubquery  Subquery selecting channels.id, scoped to the owner
-     * @return list<string>|null
      */
-    private function resolveEpgChannelScope(Builder $channelsSubquery): ?array
+    private function scopeToFilteredChannels(Builder $query, Builder $channelsSubquery): void
     {
-        $includeDisabled = $this->shouldIncludeDisabledChannels();
+        $resolver = app(EpgProgrammeChannelResolver::class);
+
+        $channels = DB::table('channels')->whereIn('channels.id', clone $channelsSubquery);
+
+        if (! $this->shouldIncludeDisabledChannels()) {
+            $channels->where('channels.enabled', true);
+        }
 
         if ($this->channel_id) {
-            $channelQuery = DB::table('channels')
-                ->join('epg_channels', 'epg_channels.id', '=', 'channels.epg_channel_id')
-                ->where('channels.id', $this->channel_id)
-                ->whereNotNull('channels.epg_channel_id');
-            if (! $includeDisabled) {
-                $channelQuery->where('channels.enabled', true);
-            }
-            $epgId = $channelQuery->value('epg_channels.channel_id');
-
-            return $epgId ? [$epgId] : null;
+            $channels->where('channels.id', $this->channel_id);
+        } elseif ($this->channel_name) {
+            $channels->whereRaw('LOWER(channels.title) LIKE ?', ['%'.mb_strtolower($this->channel_name).'%']);
+        } elseif ($this->group_id) {
+            $channels->where('channels.group_id', $this->group_id);
+        } elseif (! $resolver->hasGuideChannels($channels)) {
+            return;
         }
 
-        $epgMapBase = DB::table('channels')
-            ->join('epg_channels', 'epg_channels.id', '=', 'channels.epg_channel_id')
-            ->whereIn('channels.id', clone $channelsSubquery)
-            ->whereNotNull('channels.epg_channel_id');
-
-        if (! $includeDisabled) {
-            $epgMapBase->where('channels.enabled', true);
-        }
-
-        $streamIdBase = DB::table('channels')
-            ->whereIn('channels.id', clone $channelsSubquery)
-            ->whereNotNull('channels.stream_id')
-            ->where('channels.stream_id', '!=', '');
-
-        if (! $includeDisabled) {
-            $streamIdBase->where('channels.enabled', true);
-        }
-
-        if ($this->channel_name) {
-            $channelKw = mb_strtolower($this->channel_name);
-            $ids = (clone $epgMapBase)
-                ->whereRaw('LOWER(channels.title) LIKE ?', ["%{$channelKw}%"])
-                ->pluck('epg_channels.channel_id')
-                ->merge(
-                    (clone $streamIdBase)
-                        ->whereRaw('LOWER(channels.title) LIKE ?', ["%{$channelKw}%"])
-                        ->pluck('channels.stream_id')
-                )
-                ->unique()->values()->all();
-
-            return $ids;
-        }
-
-        if ($this->group_id) {
-            $ids = (clone $epgMapBase)
-                ->where('channels.group_id', $this->group_id)
-                ->pluck('epg_channels.channel_id')
-                ->merge(
-                    (clone $streamIdBase)
-                        ->where('channels.group_id', $this->group_id)
-                        ->pluck('channels.stream_id')
-                )
-                ->unique()->values()->all();
-
-            return $ids;
-        }
-
-        $ids = (clone $epgMapBase)
-            ->pluck('epg_channels.channel_id')
-            ->merge($streamIdBase->pluck('channels.stream_id'))
-            ->unique()->values()->all();
-
-        return ! empty($ids) ? $ids : null;
+        $resolver->scopeToChannels($query, $channels);
     }
 }

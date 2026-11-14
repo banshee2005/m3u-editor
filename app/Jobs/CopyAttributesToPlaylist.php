@@ -3,9 +3,11 @@
 namespace App\Jobs;
 
 use App\Models\Channel;
+use App\Models\CustomPlaylist;
 use App\Models\EpgChannel;
 use App\Models\Group;
 use App\Models\Playlist;
+use App\Services\EpgCacheService;
 use App\Services\ProviderMigrationPlanner;
 use Filament\Notifications\Notification;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -51,6 +53,7 @@ class CopyAttributesToPlaylist implements ShouldQueue
         public bool $migrationMode = false,
         public bool $preserveEpg = false,
         public bool $disableTargetOnly = false,
+        public bool $migrateCustomPlaylists = true,
         public ?array $resolvedMap = null,
         public ?string $planFingerprint = null,
         public bool $dryRun = false,
@@ -110,6 +113,12 @@ class CopyAttributesToPlaylist implements ShouldQueue
             return $results;
         }
 
+        // Bulk channel writes skip model events, so drop the target's generated
+        // XMLTV/gzip guide; otherwise copied EPG mappings stay invisible until it expires.
+        if ($results > 0) {
+            EpgCacheService::clearPlaylistEpgCacheFile($playlist);
+        }
+
         // If here, success! Notify the user
         $body = $this->migrationMode
             ? "\"{$sourcePlaylist->name}\" configuration migrated onto \"{$playlist->name}\". ".$this->summarizeReport()
@@ -151,6 +160,7 @@ class CopyAttributesToPlaylist implements ShouldQueue
             'enabled',
             'group',
             'channel',
+            'channel_minor',
             'shift',
             'station_id',
             'url',
@@ -187,8 +197,25 @@ class CopyAttributesToPlaylist implements ShouldQueue
             $sourceGroupSortOrders[strtolower($g->name ?? '')] = $g->sort_order ?? 0;
         }
 
-        // Build the target fields to select for matching
-        $targetFieldsToSelect = array_unique(array_merge(['id'], $this->channelMatchAttributes));
+        // Build the target fields to select for matching. These also need every
+        // custom/attribute field that buildUpdateData()'s overwrite guard reads -
+        // otherwise an unselected field looks empty on the target and the guard
+        // wrongly allows an overwrite even when "Overwrite Existing Attributes"
+        // is off.
+        $targetFieldsToSelect = array_unique(array_merge(['id'], $this->channelMatchAttributes, [
+            'name_custom',
+            'title_custom',
+            'stream_id_custom',
+            'logo',
+            'enabled',
+            'group',
+            'group_id',
+            'shift',
+            'channel',
+            'channel_minor',
+            'station_id',
+            'sort',
+        ]));
 
         // If we're creating missing channels, we process from source → target
         // Otherwise, we process from target → source (for updates only)
@@ -277,6 +304,7 @@ class CopyAttributesToPlaylist implements ShouldQueue
                     'group_id',
                     'shift',
                     'channel',
+                    'channel_minor',
                     'station_id',
                     'sort',
                 ])))
@@ -408,6 +436,8 @@ class CopyAttributesToPlaylist implements ShouldQueue
             'disabled' => 0,
             'unmatched_source' => 0,
             'matched' => count($pairs),
+            'custom_playlist_rows_repointed' => 0,
+            'custom_playlist_rows_dropped' => 0,
         ];
 
         if (empty($pairs)) {
@@ -439,7 +469,7 @@ class CopyAttributesToPlaylist implements ShouldQueue
                     ->get([
                         'id', 'name', 'name_custom', 'title', 'title_custom', 'stream_id',
                         'stream_id_custom', 'logo_internal', 'enabled', 'group', 'channel',
-                        'shift', 'sort', 'station_id', 'epg_channel_id',
+                        'channel_minor', 'shift', 'sort', 'station_id', 'epg_channel_id',
                     ])
                     ->keyBy('id');
 
@@ -447,7 +477,7 @@ class CopyAttributesToPlaylist implements ShouldQueue
                     ->whereIn('id', $targetIds)
                     ->get([
                         'id', 'name_custom', 'title_custom', 'stream_id_custom', 'logo', 'enabled',
-                        'group', 'group_id', 'shift', 'channel', 'station_id', 'sort', 'epg_channel_id',
+                        'group', 'group_id', 'shift', 'channel', 'channel_minor', 'station_id', 'sort', 'epg_channel_id',
                     ])
                     ->keyBy('id');
 
@@ -503,6 +533,13 @@ class CopyAttributesToPlaylist implements ShouldQueue
                     $report['disabled'] = count($toDisable);
                 }
 
+                // Repoint Custom Playlist membership: any custom playlist that already curated
+                // channels from the (expired) source playlist should keep pointing at the same
+                // logical channel, now living on the replacement provider.
+                if ($this->migrateCustomPlaylists) {
+                    $this->repointCustomPlaylistMemberships($pairs, $report);
+                }
+
                 if ($this->dryRun) {
                     throw $rollbackForDryRun;
                 }
@@ -516,7 +553,7 @@ class CopyAttributesToPlaylist implements ShouldQueue
         $this->report = $report;
 
         if (! $this->dryRun) {
-            Log::info("CopyAttributesToPlaylist[migration]: {$report['updated']} channels migrated from playlist {$sourcePlaylist->id} onto playlist {$targetPlaylist->id} (epg copied {$report['epg_copied']}, disabled {$report['disabled']}).");
+            Log::info("CopyAttributesToPlaylist[migration]: {$report['updated']} channels migrated from playlist {$sourcePlaylist->id} onto playlist {$targetPlaylist->id} (epg copied {$report['epg_copied']}, disabled {$report['disabled']}, custom playlist rows repointed {$report['custom_playlist_rows_repointed']}).");
         }
 
         return $report['updated'];
@@ -622,13 +659,136 @@ class CopyAttributesToPlaylist implements ShouldQueue
         $r = $this->report;
 
         return trim(sprintf(
-            '%d channels updated, %d skipped, %d EPG mappings copied%s%s.',
+            '%d channels updated, %d skipped, %d EPG mappings copied%s%s%s.',
             $r['updated'] ?? 0,
             $r['skipped'] ?? 0,
             $r['epg_copied'] ?? 0,
             ($r['epg_conflicts'] ?? 0) > 0 ? sprintf(', %d EPG conflicts left unchanged', $r['epg_conflicts']) : '',
             ($r['disabled'] ?? 0) > 0 ? sprintf(', %d target-only channels disabled', $r['disabled']) : '',
+            ($r['custom_playlist_rows_repointed'] ?? 0) > 0 ? sprintf(', %d Custom Playlist entries repointed', $r['custom_playlist_rows_repointed']) : '',
         ));
+    }
+
+    /**
+     * Repoint Custom Playlist channel membership from the (expired) source channel onto its
+     * matched replacement channel, so a Custom Playlist that curated channels from this
+     * playlist keeps serving them, now via the replacement provider. Per-custom-playlist
+     * channel number/sort order and the custom group tag travel with the repointed row.
+     *
+     * If the replacement channel is already independently a member of the same Custom Playlist
+     * (a collision on the pivot's unique (channel_id, custom_playlist_id) pair), that existing
+     * membership is left untouched and the now-redundant source row is simply dropped.
+     *
+     * @param  array<int, array{source_id: int, target_id: int}>  $pairs
+     * @param  array<string, int>  $report
+     */
+    private function repointCustomPlaylistMemberships(array $pairs, array &$report): void
+    {
+        $sourceToTarget = [];
+        foreach ($pairs as $pair) {
+            $sourceToTarget[$pair['source_id']] = $pair['target_id'];
+        }
+
+        if (empty($sourceToTarget)) {
+            return;
+        }
+
+        $rows = DB::table('channel_custom_playlist')
+            ->whereIn('channel_id', array_keys($sourceToTarget))
+            ->get(['channel_id', 'custom_playlist_id']);
+
+        if ($rows->isEmpty()) {
+            return;
+        }
+
+        $existingTargetMemberships = DB::table('channel_custom_playlist')
+            ->whereIn('channel_id', array_values($sourceToTarget))
+            ->get(['channel_id', 'custom_playlist_id'])
+            ->map(fn ($row): string => $row->channel_id.':'.$row->custom_playlist_id)
+            ->flip();
+
+        $repointed = 0;
+        $dropped = 0;
+        $tagCandidates = [];
+
+        foreach ($rows as $row) {
+            $targetChannelId = $sourceToTarget[$row->channel_id];
+            $collisionKey = $targetChannelId.':'.$row->custom_playlist_id;
+
+            if (isset($existingTargetMemberships[$collisionKey])) {
+                // The replacement channel is already independently in this Custom Playlist;
+                // keep that membership and discard the now-dead source-side row.
+                DB::table('channel_custom_playlist')
+                    ->where('channel_id', $row->channel_id)
+                    ->where('custom_playlist_id', $row->custom_playlist_id)
+                    ->delete();
+                $dropped++;
+
+                continue;
+            }
+
+            DB::table('channel_custom_playlist')
+                ->where('channel_id', $row->channel_id)
+                ->where('custom_playlist_id', $row->custom_playlist_id)
+                ->update(['channel_id' => $targetChannelId]);
+            $repointed++;
+
+            $tagCandidates[] = [
+                'source_channel_id' => $row->channel_id,
+                'target_channel_id' => $targetChannelId,
+                'custom_playlist_id' => $row->custom_playlist_id,
+            ];
+        }
+
+        $this->moveCustomPlaylistGroupTags($tagCandidates);
+
+        $report['custom_playlist_rows_repointed'] = $repointed;
+        $report['custom_playlist_rows_dropped'] = $dropped;
+    }
+
+    /**
+     * Re-apply each moved channel's per-custom-playlist "custom group" tag (a Spatie tag scoped
+     * to the Custom Playlist's uuid) onto its replacement channel, so the group label survives
+     * the repoint.
+     *
+     * @param  array<int, array{source_channel_id: int, target_channel_id: int, custom_playlist_id: int}>  $candidates
+     */
+    private function moveCustomPlaylistGroupTags(array $candidates): void
+    {
+        if (empty($candidates)) {
+            return;
+        }
+
+        $customPlaylistUuids = CustomPlaylist::query()
+            ->whereIn('id', array_unique(array_column($candidates, 'custom_playlist_id')))
+            ->pluck('uuid', 'id');
+
+        $sourceChannels = Channel::query()
+            ->whereIn('id', array_unique(array_column($candidates, 'source_channel_id')))
+            ->with('tags')
+            ->get()
+            ->keyBy('id');
+
+        $targetChannels = Channel::query()
+            ->whereIn('id', array_unique(array_column($candidates, 'target_channel_id')))
+            ->get()
+            ->keyBy('id');
+
+        foreach ($candidates as $candidate) {
+            $uuid = $customPlaylistUuids->get($candidate['custom_playlist_id']);
+            $sourceChannel = $sourceChannels->get($candidate['source_channel_id']);
+            $targetChannel = $targetChannels->get($candidate['target_channel_id']);
+            if (! $uuid || ! $sourceChannel || ! $targetChannel) {
+                continue;
+            }
+
+            $tag = $sourceChannel->tags->firstWhere('type', $uuid);
+            if (! $tag) {
+                continue;
+            }
+
+            $targetChannel->attachTag($tag->getAttributeValue('name'), $uuid);
+        }
     }
 
     /**
@@ -707,6 +867,12 @@ class CopyAttributesToPlaylist implements ShouldQueue
 
             // Default copy behavior
             $updateData[$targetField] = $sourceValue;
+
+            // A sub-channel part ("5.1") is copied as a pair with its number, so a
+            // target "2.1" overwritten by a source "7" becomes 7, not 7.1.
+            if ($targetField === 'channel') {
+                $updateData['channel_minor'] = $sourceChannel->channel_minor;
+            }
         }
 
         return $updateData;
@@ -735,6 +901,7 @@ class CopyAttributesToPlaylist implements ShouldQueue
             'stream_id' => $sourceChannel->stream_id ?? null,
             'station_id' => $sourceChannel->station_id ?? null,
             'channel' => $sourceChannel->channel ?? null,
+            'channel_minor' => $sourceChannel->channel_minor ?? null,
             'shift' => $sourceChannel->shift ?? 0,
             'enabled' => $sourceChannel->enabled ?? true,
             'group' => $sourceChannel->group ?? null,
@@ -833,7 +1000,16 @@ class CopyAttributesToPlaylist implements ShouldQueue
             }
 
             // Normalize the value for consistent matching
-            $keyParts[] = strtolower(trim((string) $value));
+            $keyPart = strtolower(trim((string) $value));
+
+            // The "Channel Number" match attribute must compare the full sub-channel
+            // number (major.minor, e.g. 5.1), not just the major number - otherwise
+            // 5.1 and 5.2 are treated as the same channel.
+            if ($attribute === 'channel') {
+                $keyPart .= '.'.strtolower(trim((string) ($channel->channel_minor ?? '')));
+            }
+
+            $keyParts[] = $keyPart;
         }
 
         // Create a composite key by joining all parts with a delimiter

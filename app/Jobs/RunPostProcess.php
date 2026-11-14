@@ -19,6 +19,7 @@ use Illuminate\Support\Facades\Config;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Mail;
+use InvalidArgumentException;
 use Symfony\Component\Process\Process as SymfonyProcess;
 
 class RunPostProcess implements ShouldQueue
@@ -78,12 +79,16 @@ class RunPostProcess implements ShouldQueue
             // Add the counts of added/removed groups/channels to the model
             $this->model->added_groups = $this->lastSync->addedGroups()->count();
             $this->model->removed_groups = $this->lastSync->removedGroups()->count();
+            $this->model->added_categories = $this->lastSync->addedCategories()->count();
+            $this->model->removed_categories = $this->lastSync->removedCategories()->count();
             $this->model->added_channels = $this->lastSync->addedChannels()->count();
             $this->model->removed_channels = $this->lastSync->removedChannels()->count();
 
             // Also add the names of the groups/channels added/removed
             $this->model->added_group_names = implode(' • ', $this->lastSync->addedGroups()->pluck('name')->toArray());
             $this->model->removed_group_names = implode(' • ', $this->lastSync->removedGroups()->pluck('name')->toArray());
+            $this->model->added_category_names = implode(' • ', $this->lastSync->addedCategories()->pluck('name')->toArray());
+            $this->model->removed_category_names = implode(' • ', $this->lastSync->removedCategories()->pluck('name')->toArray());
             $this->model->added_channel_names = implode(' • ', $this->lastSync->addedChannels()->pluck('name')->toArray());
             $this->model->removed_channel_names = implode(' • ', $this->lastSync->removedChannels()->pluck('name')->toArray());
         }
@@ -109,20 +114,7 @@ class RunPostProcess implements ShouldQueue
                 $emailVars = [];
                 $vars = $metadata['email_vars'] ?? [];
                 foreach ($vars as $var) {
-                    if ($var['value'] === 'url') {
-                        if ($modelType === Epg::class) {
-                            $value = route('epg.file', ['uuid' => $this->model->uuid]);
-                        } else {
-                            $value = PlaylistFacade::getUrls($this->model)['m3u'];
-                        }
-                    } else {
-                        if ($var['value'] === 'status') {
-                            $value = $this->model->status->value ?? '';
-                        } else {
-                            $value = $this->model->{$var['value']} ?? '';
-                        }
-                    }
-                    $emailVars[$var['value']] = $value;
+                    $emailVars[$var['value']] = $this->outputVariableValue($var['value']);
                 }
 
                 // Send email using the configured email service
@@ -169,21 +161,20 @@ class RunPostProcess implements ShouldQueue
                     Log::warning('RunPostProcess blocked SSRF attempt to private/reserved URL', ['url' => $url]);
                     throw new Exception("Webhook URL '{$url}' resolves to a private or reserved address and cannot be used.");
                 }
+
+                // The check above fails fast with a readable error, but it
+                // resolves the host separately from the connect. These
+                // options also check the IP each hop actually connects to,
+                // so DNS rebinding or a 302 can't reach a private address.
+                $redirectOptions = config('proxy.allow_private_webhook_urls', false)
+                    ? []
+                    : PrivateNetworkGuard::connectGuardOptions();
                 $jsonBody = (bool) ($metadata['json_body'] ?? false);
                 $noBody = (bool) ($metadata['no_body'] ?? false);
                 $queryVars = [];
                 $vars = $metadata['post_vars'] ?? [];
                 foreach ($vars as $var) {
-                    if ($var['value'] === 'url') {
-                        if ($modelType === Epg::class) {
-                            $value = route('epg.file', ['uuid' => $this->model->uuid]);
-                        } else {
-                            $value = PlaylistFacade::getUrls($this->model)['m3u'];
-                        }
-                    } else {
-                        $value = $this->model->{$var['value']} ?? '';
-                    }
-                    $queryVars[$var['variable_name']] = $value;
+                    $queryVars[$var['variable_name']] = $this->outputVariableValue($var['value']);
                 }
 
                 // Build custom headers
@@ -199,7 +190,7 @@ class RunPostProcess implements ShouldQueue
                 if ($post && $noBody) {
                     // POST request without body (e.g., for triggering Emby/Jellyfin tasks)
                     // Use withBody with empty string to avoid Laravel sending []
-                    $response = Http::withHeaders($headers)
+                    $response = Http::withOptions($redirectOptions)->withHeaders($headers)
                         ->withBody('', 'text/plain')
                         ->post($url);
                 } elseif ($post && $jsonBody) {
@@ -208,23 +199,25 @@ class RunPostProcess implements ShouldQueue
                     $jsonContent = json_encode($queryVars);
 
                     // Make the request with raw JSON body
-                    $response = Http::withHeaders($headers)
+                    $response = Http::withOptions($redirectOptions)->withHeaders($headers)
                         ->withBody($jsonContent, 'application/json')
                         ->post($url);
                 } elseif ($post && ! empty($queryVars)) {
-                    // Send variables as form data or JSON based on jsonBody setting
-                    if ($jsonBody) {
-                        $headers['Content-Type'] = 'application/json';
-                    }
-                    $response = Http::withHeaders($headers)
+                    // $jsonBody is always false here (the $jsonBody branch above
+                    // already handles that case), so this always sends form data.
+                    // Laravel's HTTP client sends ->post() bodies as JSON by
+                    // default; asForm() is required to get form-data encoding.
+                    $response = Http::withOptions($redirectOptions)->withHeaders($headers)
+                        ->asForm()
                         ->post($url, $queryVars);
                 } elseif ($post) {
                     // POST request with empty variables (sends as form data)
-                    $response = Http::withHeaders($headers)
+                    $response = Http::withOptions($redirectOptions)->withHeaders($headers)
+                        ->asForm()
                         ->post($url, $queryVars);
                 } else {
                     // GET request with query parameters
-                    $response = Http::withHeaders($headers)->get($url, $queryVars);
+                    $response = Http::withOptions($redirectOptions)->withHeaders($headers)->get($url, $queryVars);
                 }
 
                 // If results ok, log the results
@@ -264,51 +257,52 @@ class RunPostProcess implements ShouldQueue
                         ->sendToDatabase($user);
                 }
             } else {
-                // If the metadata is not a URL, then we're running a script
-                $cmd = $metadata['path'];
-                $process = SymfonyProcess::fromShellCommandline($cmd);
+                // If the metadata is not a URL, then we're running a script.
+                // Scripts run as the worker's OS user, so only an admin may
+                // own one. Checked here, not just in the form, because records
+                // can be written without form validation (e.g. Copilot tools).
+                if (! $postProcess->user?->isAdmin()) {
+                    throw new Exception('Local scripts can only be run by post processes owned by an admin.');
+                }
+
+                $scriptPath = $metadata['path'];
+                if (! is_file($scriptPath)) {
+                    throw new Exception("Local script '{$scriptPath}' was not found.");
+                }
+
+                // Argument array, not a shell command line, so the path can
+                // never be interpreted as extra shell commands.
+                $process = new SymfonyProcess([$scriptPath]);
                 $process->setTimeout(60);
                 $exportVars = [];
                 $vars = $metadata['script_vars'] ?? [];
                 foreach ($vars as $var) {
-                    if ($var['value'] === 'url') {
-                        if ($modelType === Epg::class) {
-                            $value = route('epg.file', ['uuid' => $this->model->uuid]);
-                        } else {
-                            $value = PlaylistFacade::getUrls($this->model)['m3u'];
-                        }
-                    } else {
-                        if ($var['value'] === 'status') {
-                            $value = $this->model->status->value ?? '';
-                        } else {
-                            $value = $this->model->{$var['value']} ?? '';
-                        }
-                    }
-                    $exportVars[$var['export_name']] = $value;
+                    $exportVars[$var['export_name']] = $this->outputVariableValue($var['value']);
                 }
                 $output = '';
                 $errors = '';
                 if (count($exportVars) > 0) {
                     $process->setEnv($exportVars);
                 }
-                $hasErrors = false;
                 $process->run(
-                    function ($type, $buffer) use (&$output, &$hasErrors, &$errors) {
+                    function ($type, $buffer) use (&$output, &$errors) {
                         if ($type === SymfonyProcess::OUT) {
                             $output .= $buffer;
                         }
                         if ($type === SymfonyProcess::ERR) {
-                            $hasErrors = true;
                             $errors .= $buffer;
                         }
                     }
                 );
 
-                // Check if the process was successful
-                if (! $hasErrors) {
+                // The exit status decides the outcome; scripts may write
+                // diagnostics to stderr and still succeed.
+                if ($process->isSuccessful()) {
                     // Success!
                     $title = "Post processing for \"$name\" completed successfully";
-                    $body = $output;
+                    $body = trim($errors) !== ''
+                        ? rtrim($output)."\n\n[stderr]\n".$errors
+                        : $output;
                     PostProcessLog::create([
                         'name' => $name,
                         'type' => $postProcess->event,
@@ -325,7 +319,9 @@ class RunPostProcess implements ShouldQueue
                 } else {
                     // Error running the script
                     $title = "Error running post processing for \"$name\"";
-                    $body = $errors;
+                    $body = trim($errors) !== ''
+                        ? $errors
+                        : "Script exited with status {$process->getExitCode()}.";
                     PostProcessLog::create([
                         'name' => $name,
                         'type' => $postProcess->event,
@@ -383,14 +379,13 @@ class RunPostProcess implements ShouldQueue
             return false;
         }
 
-        $host = parse_url($url, PHP_URL_HOST);
-        if (! $host) {
+        try {
+            PrivateNetworkGuard::assertUrlSafe($url);
+        } catch (InvalidArgumentException) {
             return true;
         }
 
-        $ip = gethostbyname($host);
-
-        return PrivateNetworkGuard::ipIsPrivate($ip);
+        return false;
     }
 
     /**
@@ -451,6 +446,23 @@ class RunPostProcess implements ShouldQueue
     }
 
     /**
+     * Resolve an output variable (email, webhook or script) from the model.
+     * "time" falls back to the persisted sync duration when no sync log was
+     * passed to the job.
+     */
+    protected function outputVariableValue(string $key): mixed
+    {
+        return match ($key) {
+            'url' => $this->model instanceof Epg
+                ? route('epg.file', ['uuid' => $this->model->uuid])
+                : PlaylistFacade::getUrls($this->model)['m3u'],
+            'status' => $this->model->status->value ?? '',
+            'time' => $this->model->time ?? $this->model->sync_time ?? '',
+            default => $this->model->{$key} ?? '',
+        };
+    }
+
+    /**
      * Get the value of a field from the model or related data
      */
     protected function getFieldValue(string $field): mixed
@@ -461,50 +473,20 @@ class RunPostProcess implements ShouldQueue
             'name' => $this->model->name,
             'url' => $this->model->url ?? null,
             'status' => $this->model->status?->value ?? $this->model->status,
-            'synctime' => $this->model->sync_time,
+            'time' => $this->model->time ?? $this->model->sync_time,
             'added_groups' => $this->model->added_groups ?? null,
             'removed_groups' => $this->model->removed_groups ?? null,
+            'added_categories' => $this->model->added_categories ?? null,
+            'removed_categories' => $this->model->removed_categories ?? null,
             'added_channels' => $this->model->added_channels ?? null,
             'removed_channels' => $this->model->removed_channels ?? null,
             'added_group_names' => $this->model->added_group_names ?? null,
             'removed_group_names' => $this->model->removed_group_names ?? null,
+            'added_category_names' => $this->model->added_category_names ?? null,
+            'removed_category_names' => $this->model->removed_category_names ?? null,
             'added_channel_names' => $this->model->added_channel_names ?? null,
             'removed_channel_names' => $this->model->removed_channel_names ?? null,
             default => null,
         };
-    }
-
-    /**
-     * Replace placeholders in a string with actual model values
-     * Placeholders are in the format {{field_name}}
-     */
-    protected function replacePlaceholders(string $content, string $modelType): string
-    {
-        // Define available placeholders and their values
-        $placeholders = [
-            'id' => $this->model->id,
-            'uuid' => $this->model->uuid,
-            'name' => $this->model->name,
-            'url' => $modelType === Epg::class
-                ? route('epg.file', ['uuid' => $this->model->uuid])
-                : PlaylistFacade::getUrls($this->model)['m3u'],
-            'status' => $this->model->status?->value ?? $this->model->status ?? '',
-            'time' => $this->model->sync_time ?? '',
-            'added_groups' => $this->model->added_groups ?? 0,
-            'removed_groups' => $this->model->removed_groups ?? 0,
-            'added_channels' => $this->model->added_channels ?? 0,
-            'removed_channels' => $this->model->removed_channels ?? 0,
-            'added_group_names' => $this->model->added_group_names ?? '',
-            'removed_group_names' => $this->model->removed_group_names ?? '',
-            'added_channel_names' => $this->model->added_channel_names ?? '',
-            'removed_channel_names' => $this->model->removed_channel_names ?? '',
-        ];
-
-        // Replace all placeholders
-        foreach ($placeholders as $key => $value) {
-            $content = str_replace('{{'.$key.'}}', $value, $content);
-        }
-
-        return $content;
     }
 }
