@@ -73,12 +73,15 @@ class PairDevice extends Page
 
     /**
      * One empty row, keyed the way Filament keys repeater items.
+     * The simple repeater's Select binds to {uuid}.playlist_auth_id, so the
+     * row must be seeded in that nested shape — a flat null never receives
+     * the selection and validation fails with "credential field is required".
      *
-     * @return array<string, null>
+     * @return array<string, array{playlist_auth_id: null}>
      */
     private static function emptyCredentialRows(): array
     {
-        return [(string) Str::uuid() => null];
+        return [(string) Str::uuid() => ['playlist_auth_id' => null]];
     }
 
     public function content(Schema $schema): Schema
