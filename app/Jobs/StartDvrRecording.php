@@ -43,8 +43,11 @@ class StartDvrRecording implements ShouldBeUnique, ShouldQueue
 
     public int $timeout = 30;
 
-    public function __construct(public readonly int $recordingId, public readonly bool $resume = false)
-    {
+    public function __construct(
+        public readonly int $recordingId,
+        public readonly bool $resume = false,
+        public readonly bool $forceFresh = false,
+    ) {
         $this->onQueue('dvr');
     }
 
@@ -81,7 +84,7 @@ class StartDvrRecording implements ShouldBeUnique, ShouldQueue
         }
 
         try {
-            $recorder->start($recording);
+            $recorder->start($recording, $this->forceFresh);
         } catch (Throwable $e) {
             // Transient provider failures (e.g. an HDHomeRun tuner momentarily
             // busy with a lingering session or another client) can clear
@@ -101,7 +104,9 @@ class StartDvrRecording implements ShouldBeUnique, ShouldQueue
                     'error' => $e->getMessage(),
                 ]);
 
-                self::dispatch($recording->id)
+                // forceFresh=true on retry: the failed attempt may have
+                // piggybacked onto a pooled stream whose upstream went stale.
+                self::dispatch($recording->id, forceFresh: true)
                     ->onQueue('dvr')
                     ->delay(now()->addSeconds(self::RETRY_DELAY_SECONDS));
 

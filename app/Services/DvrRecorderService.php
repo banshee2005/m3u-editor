@@ -111,7 +111,7 @@ class DvrRecorderService
             throw new Exception("DvrSetting not found for recording {$recording->id}");
         }
 
-        $streamUrl = $this->resolveCaptureUrl($recording);
+        $streamUrl = $this->resolveCaptureUrl($recording, $forceFresh);
 
         Log::info('DVR: Starting proxy broadcast', [
             'recording_id' => $recording->id,
@@ -185,7 +185,7 @@ class DvrRecorderService
      * Resolve the URL the proxy should capture a recording from, persisting it to
      * stream_url when it changed.
      */
-    private function resolveCaptureUrl(DvrRecording $recording): string
+    private function resolveCaptureUrl(DvrRecording $recording, bool $forceFresh = false): string
     {
         // Resolve the raw source URL for the recording.
         // If there's already an active stream on the proxy for this channel, piggyback
