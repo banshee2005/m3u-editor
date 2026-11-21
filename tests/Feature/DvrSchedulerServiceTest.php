@@ -34,6 +34,7 @@ use App\Models\EpgProgramme;
 use App\Models\PlaylistAuth;
 use App\Models\User;
 use App\Services\DvrSchedulerService;
+use App\Services\DvrRecorderService;
 use App\Services\M3uProxyService;
 use App\Support\SeriesKey;
 use Illuminate\Foundation\Testing\RefreshDatabase;
@@ -1548,6 +1549,66 @@ it('attempt_count starts at 1 for newly created recordings', function () {
     expect($recording->attempt_count)->toBe(1);
 });
 
+it('start job retry dispatches the next attempt with a distinct uniqueId', function () {
+    // Regression: ShouldBeUnique used to key on the bare recordingId, so the
+    // in-handle retry was rejected by the lock the running job still held
+    // (Shaun's "the retry job doesn't fire").
+    $recording = DvrRecording::factory()
+        ->for($this->setting, 'dvrSetting')
+        ->for($this->user)
+        ->create([
+            'title' => 'In-Job Retry Show',
+            'scheduled_start' => now()->subMinutes(5),
+            'scheduled_end' => now()->addHour(),
+        ]);
+
+    Queue::fake();
+
+    $recorder = Mockery::mock(DvrRecorderService::class);
+    $recorder->shouldReceive('start')->once()->andThrow(new RuntimeException('proxy unavailable'));
+
+    $job = new StartDvrRecording($recording->id);
+    $job->handle($recorder);
+
+    Queue::assertPushed(StartDvrRecording::class, function (StartDvrRecording $pushed) use ($recording) {
+        return $pushed->recordingId === $recording->id
+            && $pushed->attempt === 2
+            && $pushed->forceFresh === true
+            && $pushed->uniqueId() === "{$recording->id}:2";
+    });
+
+    $recording->refresh();
+    expect($recording->attempt_count)->toBe(2)
+        ->and($recording->status)->toBe(DvrRecordingStatus::Scheduled);
+});
+
+it('start job fails permanently at MAX_START_ATTEMPTS total attempts', function () {
+    $recording = DvrRecording::factory()
+        ->for($this->setting, 'dvrSetting')
+        ->for($this->user)
+        ->create([
+            'title' => 'Exhausted Job Show',
+            'scheduled_start' => now()->subMinutes(5),
+            'scheduled_end' => now()->addHour(),
+        ]);
+
+    Queue::fake();
+
+    $recorder = Mockery::mock(DvrRecorderService::class);
+    $recorder->shouldReceive('start')->once()->andThrow(new RuntimeException('still down'));
+
+    // Attempt 3 of 3: nextAttempt=4 > MAX -> permanent failure, no dispatch.
+    $job = new StartDvrRecording($recording->id, attempt: 3);
+    $job->handle($recorder);
+
+    Queue::assertNotPushed(StartDvrRecording::class);
+
+    $recording->refresh();
+    expect($recording->status)->toBe(DvrRecordingStatus::Failed)
+        ->and($recording->attempt_count)->toBe(3)
+        ->and($recording->error_message)->toBe('still down');
+});
+
 // --- Match modes ---
 
 it('match_mode exact only records exact title match', function () {
@@ -2135,6 +2196,13 @@ function fakeActiveBroadcastIds(?array $activeIds): void
 {
     $proxy = Mockery::mock(M3uProxyService::class);
     $proxy->shouldReceive('activeBroadcastIds')->once()->andReturn($activeIds);
+    // tick() runs reconcileStaleRecordings() first, which calls this to
+    // decide whether a recording's broadcast is still alive. Without the
+    // stub Mockery throws, tick aborts, and resumeLostRecordings() never
+    // runs (activeBroadcastIds: 0 calls / no job pushed). Return every
+    // recording id so reconcile leaves the fixture alone.
+    $proxy->shouldReceive('getRunningDvrRecordingIds')
+        ->andReturnUsing(fn (): array => DvrRecording::pluck('id')->all());
     app()->instance(M3uProxyService::class, $proxy);
 }
 
@@ -2174,4 +2242,157 @@ it('does not resume a recording that only just started', function () {
     $this->service->tick();
 
     Queue::assertNotPushed(StartDvrRecording::class);
+});
+
+// --- days_of_week filter ---
+
+it('series rule with days_of_week only schedules airings on allowed weekdays', function () {
+    $rule = DvrRecordingRule::factory()
+        ->series()
+        ->for($this->setting, 'dvrSetting')
+        ->for($this->user)
+        ->create([
+            'series_title' => 'Weekday Show',
+            'series_mode' => DvrSeriesMode::All,
+            'days_of_week' => [4], // Thursday only (PHP date w)
+        ]);
+
+    // Next Thursday, 10:00 UTC
+    $thursday = now()->next(4)->setTime(10, 0);
+    // Next Wednesday (day before), 10:00 UTC - must NOT record
+    $wednesday = $thursday->copy()->subDay();
+
+    EpgProgramme::factory()->for($this->epg)->create([
+        'title' => 'Weekday Show',
+        'epg_channel_id' => 'test.channel',
+        'season' => null,
+        'episode' => null,
+        'start_time' => $thursday,
+        'end_time' => $thursday->copy()->addHour(),
+    ]);
+    EpgProgramme::factory()->for($this->epg)->create([
+        'title' => 'Weekday Show',
+        'epg_channel_id' => 'test.channel',
+        'season' => null,
+        'episode' => null,
+        'start_time' => $wednesday,
+        'end_time' => $wednesday->copy()->addHour(),
+    ]);
+
+    $this->service->matchAndSchedule(14 * 24 * 60);
+
+    $recordings = DvrRecording::where('dvr_recording_rule_id', $rule->id)->get();
+    expect($recordings->count())->toBe(1);
+    expect($recordings->first()->programme_start->format('w'))->toBe('4');
+});
+
+it('series rule without days_of_week schedules every day', function () {
+    $rule = DvrRecordingRule::factory()
+        ->series()
+        ->for($this->setting, 'dvrSetting')
+        ->for($this->user)
+        ->create([
+            'series_title' => 'Any Day Show',
+            'series_mode' => DvrSeriesMode::All,
+            'days_of_week' => null,
+        ]);
+
+    $wednesday = now()->next(3)->setTime(10, 0);
+    $thursday = now()->next(4)->setTime(10, 0);
+
+    foreach ([$wednesday, $thursday] as $start) {
+        EpgProgramme::factory()->for($this->epg)->create([
+            'title' => 'Any Day Show',
+            'epg_channel_id' => 'test.channel',
+            'season' => null,
+            'episode' => null,
+            'start_time' => $start,
+            'end_time' => $start->copy()->addHour(),
+        ]);
+    }
+
+    $this->service->matchAndSchedule(14 * 24 * 60);
+
+    expect(DvrRecording::where('dvr_recording_rule_id', $rule->id)->count())->toBe(2);
+});
+
+// --- programme_uid for no season/episode (multi-draw) ---
+
+it('all mode schedules multiple same-title airings without season/episode on one day', function () {
+    $rule = DvrRecordingRule::factory()
+        ->series()
+        ->for($this->setting, 'dvrSetting')
+        ->for($this->user)
+        ->create([
+            'series_title' => 'Grand Slam of Curling - National',
+            'series_mode' => DvrSeriesMode::All,
+        ]);
+
+    $day = now()->next(2)->setTime(16, 0);
+    $draw1 = $day;
+    $draw2 = $day->copy()->addHours(4);
+
+    foreach ([$draw1, $draw2] as $start) {
+        EpgProgramme::factory()->for($this->epg)->create([
+            'title' => 'Grand Slam of Curling - National',
+            'epg_channel_id' => 'test.channel',
+            'season' => null,
+            'episode' => null,
+            'start_time' => $start,
+            'end_time' => $start->copy()->addHours(2),
+        ]);
+    }
+
+    $this->service->matchAndSchedule(14 * 24 * 60);
+
+    expect(DvrRecording::where('dvr_recording_rule_id', $rule->id)->count())->toBe(2);
+});
+
+it('builds distinct programme uids for same title different start times without S/E', function () {
+    $service = app(DvrSchedulerService::class);
+    $ref = new ReflectionMethod($service, 'buildProgrammeUid');
+    $ref->setAccessible(true);
+
+    $base = EpgProgramme::factory()->for($this->epg)->make([
+        'title' => 'Grand Slam of Curling - National',
+        'epg_channel_id' => 'test.channel',
+        'season' => null,
+        'episode' => null,
+        'start_time' => now()->addDay()->setTime(16, 0),
+    ]);
+    $later = EpgProgramme::factory()->for($this->epg)->make([
+        'title' => 'Grand Slam of Curling - National',
+        'epg_channel_id' => 'test.channel',
+        'season' => null,
+        'episode' => null,
+        'start_time' => now()->addDay()->setTime(20, 0),
+    ]);
+
+    $uid1 = $ref->invoke($service, $base);
+    $uid2 = $ref->invoke($service, $later);
+
+    expect($uid1)->not->toBe($uid2);
+});
+
+it('keeps stable programme uid for scripted episodes across airtime drift', function () {
+    $service = app(DvrSchedulerService::class);
+    $ref = new ReflectionMethod($service, 'buildProgrammeUid');
+    $ref->setAccessible(true);
+
+    $a = EpgProgramme::factory()->for($this->epg)->make([
+        'title' => 'Breaking Bad',
+        'epg_channel_id' => 'test.channel',
+        'season' => 1,
+        'episode' => 5,
+        'start_time' => now()->addDay()->setTime(21, 0),
+    ]);
+    $b = EpgProgramme::factory()->for($this->epg)->make([
+        'title' => 'Breaking Bad',
+        'epg_channel_id' => 'test.channel',
+        'season' => 1,
+        'episode' => 5,
+        'start_time' => now()->addDay()->setTime(21, 15), // drifted
+    ]);
+
+    expect($ref->invoke($service, $a))->toBe($ref->invoke($service, $b));
 });

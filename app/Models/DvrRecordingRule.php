@@ -8,6 +8,7 @@ use App\Enums\DvrRecordingStatus;
 use App\Enums\DvrRuleType;
 use App\Enums\DvrSeriesMode;
 use App\Services\DvrSchedulerService;
+use App\Support\EpgProgrammeNormalizer;
 use App\Support\SeriesKey;
 use Carbon\CarbonImmutable;
 use Illuminate\Database\Eloquent\Builder;
@@ -37,9 +38,52 @@ class DvrRecordingRule extends Model
             'enabled' => 'boolean',
             'enable_comskip' => 'boolean',
             'sports_dedup_days' => 'integer',
+            'days_of_week' => 'array',
             'manual_start' => UtcDateTime::class,
             'manual_end' => UtcDateTime::class,
         ];
+    }
+
+    /**
+     * Whether this rule restricts airings to specific weekdays.
+     * null/empty days_of_week = every day (default).
+     *
+     * @return list<int>|null
+     */
+    public function allowedDaysOfWeek(): ?array
+    {
+        $days = $this->days_of_week;
+
+        if (! is_array($days) || $days === []) {
+            return null;
+        }
+
+        return array_values(array_map('intval', $days));
+    }
+
+    /**
+     * True when [start] falls on an allowed weekday for this rule.
+     * Day-of-week uses PHP date('w') (0=Sunday .. 6=Saturday) in the app
+     * timezone so "Thursday" matches what the user sees in the guide.
+     */
+    public function allowsDayOfWeek(\DateTimeInterface $start): bool
+    {
+        $allowed = $this->allowedDaysOfWeek();
+
+        if ($allowed === null) {
+            return true;
+        }
+
+        $timezone = app(\App\Settings\GeneralSettings::class)->app_timezone
+            ?: config('app.timezone', 'UTC');
+        $day = (int) $start->format('w');
+        // format('w') on a Carbon in UTC needs the app timezone applied first
+        // when start_time was loaded as UTC - convert before reading 'w'.
+        if ($start instanceof \Carbon\CarbonInterface) {
+            $day = (int) $start->timezone($timezone)->format('w');
+        }
+
+        return in_array($day, $allowed, true);
     }
 
     /**
@@ -82,6 +126,19 @@ class DvrRecordingRule extends Model
         });
 
         static::saving(function (self $rule): void {
+            if (
+                $rule->type === DvrRuleType::Series
+                && ! empty($rule->series_title)
+            ) {
+                // Guide titles carry superscript markers (ᴴᴰ, ᴺᵉʷ, ᴸⁱᵛᵉ...)
+                // that never appear in the cleaned EPG programme titles the
+                // matcher queries against - strip them so a rule created from
+                // the raw guide text still matches (see EpgProgrammeNormalizer).
+                $rule->series_title = EpgProgrammeNormalizer::cleanForSearch(
+                    $rule->series_title,
+                );
+            }
+
             if (
                 $rule->type === DvrRuleType::Series
                 && ! empty($rule->series_title)

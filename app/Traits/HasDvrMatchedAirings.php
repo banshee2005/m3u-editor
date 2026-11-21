@@ -82,6 +82,15 @@ trait HasDvrMatchedAirings
             return [];
         }
 
+        // Same weekday filter as DvrSchedulerService::matchSeriesRule().
+        $programmes = $programmes
+            ->filter(fn (EpgProgramme $p): bool => $rule->allowsDayOfWeek($p->start_time))
+            ->values();
+
+        if ($programmes->isEmpty()) {
+            return [];
+        }
+
         // Run the actual scheduler logic in dry-run mode to determine
         // which airings will be recorded vs skipped. This ensures
         // consistency between the preview and actual scheduling.

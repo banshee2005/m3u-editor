@@ -407,7 +407,8 @@ class DispatcharrDvrController extends Controller
             return $this->notFound();
         }
 
-        if ($recording->status === DvrRecordingStatus::Recording && $recording->proxy_network_id) {
+        if (in_array($recording->status, [DvrRecordingStatus::Recording, DvrRecordingStatus::PostProcessing], true)
+            && $recording->proxy_network_id) {
             return app(DvrStreamController::class)->serveLivePlaylist($request, $recording);
         }
 

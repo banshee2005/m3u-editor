@@ -66,6 +66,7 @@ use App\Settings\GeneralSettings;
 use App\Support\ChannelNumber;
 use App\Support\DvrLibraryFallback;
 use App\Support\EpgProgrammeArtwork;
+use App\Support\EpgProgrammeNormalizer;
 use App\Support\EpisodeNumberParser;
 use App\Support\SeriesKey;
 use App\Support\TmdbRating;
@@ -2370,6 +2371,18 @@ class XtreamApiController extends Controller
                 'delete_dvr_series_rule' => $this->deleteDvrSeriesRule($request, $dvrPlaylist, $playlistAuth),
                 'search_epg_shows' => $this->searchEpgShows($request, $dvrPlaylist, $playlistAuth),
             };
+        } elseif ($action === 'get_timeshift_config') {
+            if (! config('timeshift.enabled', true)) {
+                return response()->json(['error' => 'Timeshift is not enabled'], 403);
+            }
+
+            return response()->json([
+                'enabled' => true,
+                'window_seconds' => (int) config('timeshift.window_seconds', 10800),
+                'max_window_seconds' => (int) config('timeshift.max_window_seconds', 10800),
+                'segment_seconds' => (int) config('timeshift.segment_seconds', 2),
+                'max_concurrent' => (int) config('timeshift.max_concurrent', 20),
+            ]);
         } else {
             return response()->json(['error' => 'Invalid action parameter'], 400);
         }
@@ -3483,6 +3496,20 @@ class XtreamApiController extends Controller
                 ]);
             }
         } else {
+            // DVR playback resumes against the recording's own id; make sure it
+            // belongs to a DVR setting this credential may use.
+            if ($contentType === 'dvr_recording') {
+                $dvrSettingIds = $this->resolveDvrSettingIds($playlist);
+                $owned = $dvrSettingIds !== []
+                    && DvrRecording::query()
+                        ->whereIn('dvr_setting_id', $dvrSettingIds)
+                        ->whereKey($streamId)
+                        ->exists();
+                if (! $owned) {
+                    return response()->json(['error' => 'Recording not found'], 404);
+                }
+            }
+
             $progress = ViewerWatchProgress::updateOrCreate(
                 [
                     'playlist_viewer_id' => $viewer->id,
@@ -3499,17 +3526,21 @@ class XtreamApiController extends Controller
                 ])
             );
 
-            // Capture the stable catalog identity (same as the /api/watch-progress
-            // write path) so WatchProgressLinker can relink this row if stream_id
-            // later goes stale (e.g. a media-server library flush), instead of
-            // leaving a fresh row permanently unrecoverable.
-            app(WatchProgressLinker::class)->backfillTmdbId($progress);
+            // These two resolve the row against Channel/Episode/VOD metadata;
+            // a DVR recording has none of those, so don't run them for it.
+            if ($contentType !== 'dvr_recording') {
+                // Capture the stable catalog identity (same as the /api/watch-progress
+                // write path) so WatchProgressLinker can relink this row if stream_id
+                // later goes stale (e.g. a media-server library flush), instead of
+                // leaving a fresh row permanently unrecoverable.
+                app(WatchProgressLinker::class)->backfillTmdbId($progress);
 
-            app(WatchHistoryScrobbler::class)->queue(
-                $progress,
-                $viewer->playlist_auth_id,
-                WatchHistoryScrobbler::parseClientProviders($request->input('client_scrobblers')),
-            );
+                app(WatchHistoryScrobbler::class)->queue(
+                    $progress,
+                    $viewer->playlist_auth_id,
+                    WatchHistoryScrobbler::parseClientProviders($request->input('client_scrobblers')),
+                );
+            }
         }
 
         return response()->json($progress);
@@ -4106,6 +4137,10 @@ class XtreamApiController extends Controller
 
         if (app(SportsService::class)->isEnabled()) {
             $features[] = 'sports';
+        }
+
+        if (config('timeshift.enabled', true)) {
+            $features[] = 'timeshift';
         }
 
         return $features;
@@ -5475,7 +5510,14 @@ class XtreamApiController extends Controller
         $channelId = ($rawChannelId === null || $rawChannelId === '')
             ? null
             : (int) $rawChannelId;
-        $title = trim((string) $request->input('title', ''));
+        // Strip guide superscript markers (ᴴᴰ/ᴺᵉʷ/...) before any keying or
+        // storage: the cleaned form is what the EPG matcher queries against
+        // (EpgProgrammeNormalizer is applied when the guide is indexed), and
+        // the duplicate guard below must key on it too or "The National" vs
+        // "The National ᴺᵉʷ" would register as two different shows.
+        $title = EpgProgrammeNormalizer::cleanForSearch(
+            trim((string) $request->input('title', '')),
+        );
 
         if (! $title) {
             return response()->json(['error' => 'title is required'], 400);
@@ -5541,6 +5583,8 @@ class XtreamApiController extends Controller
             // hook's first branch and clobber unique_se → new_flag.
             'new_only' => ($seriesMode === DvrSeriesMode::NewFlag),
             'keep_last' => $keepLast,
+            // days_of_week: JSON array string ("[4]") or ""/absent = every day.
+            'days_of_week' => self::parseDaysOfWeek($request->input('days_of_week')),
             'enabled' => true,
         ];
 
@@ -5645,6 +5689,12 @@ class XtreamApiController extends Controller
         $rawKeepLast = $request->input('keep_last');
         if (is_numeric($rawKeepLast)) {
             $rule->keep_last = (int) $rawKeepLast;
+        }
+
+        // days_of_week: present = overwrite ("" or [] clears to every day);
+        // absent = leave unchanged (omit-to-inherit, like the other options).
+        if ($request->has('days_of_week')) {
+            $rule->days_of_week = self::parseDaysOfWeek($request->input('days_of_week'));
         }
 
         $rawPriority = $request->input('priority');
@@ -5812,7 +5862,15 @@ class XtreamApiController extends Controller
     private function formatDvrRecording(DvrRecording $recording, string $username, string $password, bool $full = false): array
     {
         $isRecording = $recording->status === DvrRecordingStatus::Recording;
+        $isPostProcessing = $recording->status === DvrRecordingStatus::PostProcessing;
         $isCompleted = $recording->status === DvrRecordingStatus::Completed;
+        // Proxy segments survive until post-processing step 4 cleanup, so the
+        // growing HLS window stays playable through post_processing (otherwise
+        // clients hit a dead zone between stop and completed). Recording keeps
+        // the historical always-emit live_url behaviour; post_processing only
+        // emits it while a broadcast id is still present.
+        $hasLivePlaylist = $isRecording
+            || ($isPostProcessing && $recording->proxy_network_id !== null);
 
         $format = $isCompleted
             ? ($recording->dvrSetting?->dvr_output_format ?? 'mp4')
@@ -5826,14 +5884,24 @@ class XtreamApiController extends Controller
             ? "{$baseUrl}/dvr/{$username}/{$password}/{$recording->uuid}.{$format}"
             : null;
 
-        $liveUrl = $isRecording
+        $liveUrl = $hasLivePlaylist
             ? "{$baseUrl}/dvr/{$username}/{$password}/{$recording->uuid}/live.m3u8"
             : null;
 
         $edlUrl = $this->dvrEdlUrl($recording, $username, $password);
         $hasEdl = $edlUrl !== null;
 
+        // Seconds recorded so far while the window is still growing, so the
+        // client can show a duration even when the player reports none for a
+        // dynamic HLS timeline.
+        $elapsedSeconds = null;
+        if ($hasLivePlaylist && $recording->actual_start !== null) {
+            $end = $recording->actual_end ?? now();
+            $elapsedSeconds = max(0, $end->getTimestamp() - $recording->actual_start->getTimestamp());
+        }
+
         $data = [
+            'id' => $recording->id,
             'uuid' => $recording->uuid,
             'title' => $recording->title,
             'subtitle' => $recording->subtitle,
@@ -5847,6 +5915,7 @@ class XtreamApiController extends Controller
             'actual_start' => $recording->actual_start?->toIso8601String(),
             'actual_end' => $recording->actual_end?->toIso8601String(),
             'duration_seconds' => $recording->duration_seconds,
+            'elapsed_seconds' => $elapsedSeconds,
             'file_size_bytes' => $recording->file_size_bytes,
             'season' => $recording->season,
             'episode' => $recording->episode,
@@ -5866,6 +5935,42 @@ class XtreamApiController extends Controller
     }
 
     /**
+     * Parse the wire form of days_of_week (JSON array string like "[4]",
+     * ""/[] for every day, null = every day) into a sorted list of 0-6
+     * weekday ints (PHP date('w'), 0=Sunday). Invalid input → null
+     * (every day) rather than throwing.
+     */
+    private function parseDaysOfWeek(mixed $raw): ?array
+    {
+        if ($raw === null || $raw === '' || $raw === '[]') {
+            return null;
+        }
+
+        $decoded = is_array($raw) ? $raw : json_decode($raw, true);
+        if (! is_array($decoded)) {
+            return null;
+        }
+
+        $days = [];
+        foreach ($decoded as $day) {
+            if (is_numeric($day)) {
+                $d = (int) $day;
+                if ($d >= 0 && $d <= 6) {
+                    $days[$d] = $d;
+                }
+            }
+        }
+
+        if ($days === []) {
+            return null;
+        }
+
+        ksort($days);
+
+        return array_values($days);
+    }
+
+    /**
      * Format a DvrRecordingRule (series rule) into the API response shape.
      */
     private function formatDvrSeriesRule(DvrRecordingRule $rule): array
@@ -5878,6 +5983,7 @@ class XtreamApiController extends Controller
             'match_mode' => $rule->match_mode->value,
             'series_mode' => $rule->series_mode->value,
             'keep_last' => $rule->keep_last,
+            'days_of_week' => $rule->days_of_week,
             'priority' => $rule->priority,
             'enabled' => (bool) $rule->enabled,
             'enable_comskip' => (bool) $rule->enable_comskip,

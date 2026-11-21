@@ -47,13 +47,20 @@ class StartDvrRecording implements ShouldBeUnique, ShouldQueue
         public readonly int $recordingId,
         public readonly bool $resume = false,
         public readonly bool $forceFresh = false,
+        public readonly int $attempt = 1,
     ) {
         $this->onQueue('dvr');
     }
 
+    /**
+     * Attempt-scoped key: the in-handle retry dispatches the NEXT attempt
+     * number, so it gets a different key and is not rejected by the
+     * ShouldBeUnique lock this job still holds until handle() returns.
+     * (A bare recordingId made every retry silently undispatchable.)
+     */
     public function uniqueId(): string
     {
-        return (string) $this->recordingId;
+        return "{$this->recordingId}:{$this->attempt}";
     }
 
     public function handle(DvrRecorderService $recorder): void
@@ -84,53 +91,62 @@ class StartDvrRecording implements ShouldBeUnique, ShouldQueue
         }
 
         try {
-            $recorder->start($recording, $this->forceFresh);
+            // forceFresh on retries (attempt > 1): a failed attempt may have
+            // piggybacked onto a pooled stream whose upstream went stale.
+            $recorder->start($recording, forceFresh: $this->forceFresh || $this->attempt > 1);
         } catch (Throwable $e) {
             // Transient provider failures (e.g. an HDHomeRun tuner momentarily
             // busy with a lingering session or another client) can clear
             // within seconds. Retry a bounded number of times while the
             // programme is still on air instead of failing the recording
             // outright.
-            $attempt = ($recording->attempt_count ?? 0) + 1;
+            //
+            // $this->attempt is this job's own attempt number (1-based), so
+            // MAX_START_ATTEMPTS is a true total: attempts 1..3, then fail.
+            // (Reading attempt_count off the row and adding 1 double-counted
+            // against a column that defaults to 1 -- only two runs happened.)
+            $nextAttempt = $this->attempt + 1;
             $stillOnAir = $recording->scheduled_end && $recording->scheduled_end->isAfter(now());
 
-            if ($attempt < self::MAX_START_ATTEMPTS && $stillOnAir) {
+            if ($nextAttempt > self::MAX_START_ATTEMPTS || ! $stillOnAir) {
+                Log::error("StartDvrRecording: recording {$this->recordingId} failed to start — {$e->getMessage()}");
+
                 $recording->update([
-                    'attempt_count' => $attempt,
+                    'status' => DvrRecordingStatus::Failed->value,
+                    'error_message' => $e->getMessage(),
+                    'attempt_count' => $this->attempt,
                 ]);
 
-                Log::warning('StartDvrRecording: attempt '.$attempt.' failed — retrying in '.self::RETRY_DELAY_SECONDS.'s', [
-                    'recording_id' => $this->recordingId,
-                    'error' => $e->getMessage(),
-                ]);
+                $recording->notifyTv(__('Recording Failed'), 'danger');
 
-                // forceFresh=true on retry: the failed attempt may have
-                // piggybacked onto a pooled stream whose upstream went stale.
-                self::dispatch($recording->id, forceFresh: true)
-                    ->onQueue('dvr')
-                    ->delay(now()->addSeconds(self::RETRY_DELAY_SECONDS));
+                if ($user = $recording->user) {
+                    Notification::make()
+                        ->danger()
+                        ->title('Recording Failed to Start')
+                        ->body($recording->title)
+                        ->broadcast($user)
+                        ->sendToDatabase($user);
+                }
+
+                $this->fail($e);
 
                 return;
             }
 
-            Log::error("StartDvrRecording: recording {$this->recordingId} failed to start — {$e->getMessage()}");
-
             $recording->update([
-                'status' => DvrRecordingStatus::Failed->value,
-                'error_message' => $e->getMessage(),
-                'attempt_count' => $attempt,
+                'attempt_count' => $nextAttempt,
             ]);
 
-            $recording->notifyTv(__('Recording Failed'), 'danger');
+            Log::warning('StartDvrRecording: attempt '.$this->attempt.' failed — retrying as attempt '.$nextAttempt.' in '.self::RETRY_DELAY_SECONDS.'s', [
+                'recording_id' => $this->recordingId,
+                'error' => $e->getMessage(),
+            ]);
 
-            if ($user = $recording->user) {
-                Notification::make()
-                    ->danger()
-                    ->title('Recording Failed to Start')
-                    ->body($recording->title)
-                    ->broadcast($user)
-                    ->sendToDatabase($user);
-            }
+            self::dispatch($this->recordingId, forceFresh: true, attempt: $nextAttempt)
+                ->onQueue('dvr')
+                ->delay(now()->addSeconds(self::RETRY_DELAY_SECONDS));
+
+            return;
         }
     }
 

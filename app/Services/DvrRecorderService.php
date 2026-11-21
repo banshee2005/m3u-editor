@@ -125,7 +125,8 @@ class DvrRecorderService
             'status' => DvrRecordingStatus::Recording->value,
             'actual_start' => now(),
             'proxy_network_id' => $networkId,
-            'attempt_count' => ($recording->attempt_count ?? 0) + 1,
+            // attempt_count is owned by StartDvrRecording (next/failed attempt
+            // number); do not bump it here or a first-try success reads as 2.
         ]);
 
         Log::info('DVR: Proxy broadcast started', [

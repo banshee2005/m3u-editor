@@ -38,6 +38,7 @@ use App\Http\Controllers\WatchProgressController;
 use App\Http\Controllers\WebhookTestController;
 use App\Http\Controllers\XtreamApiController;
 use App\Http\Controllers\XtreamStreamController;
+use App\Http\Controllers\TimeshiftStreamController;
 use App\Services\DvrArtworkService;
 use App\Services\ExternalIpService;
 use Illuminate\Routing\Middleware\ValidateSignature;
@@ -165,6 +166,17 @@ Route::get('/series/{username}/{password}/{streamId}.{format?}', [XtreamStreamCo
     ->name('xtream.stream.series.root');
 Route::get('/timeshift/{username}/{password}/{duration}/{date}/{streamId}.{format?}', [XtreamStreamController::class, 'handleTimeshift'])
     ->name('xtream.stream.timeshift.root');
+
+// Shared per-channel rolling timeshift window (client ?timeshift=1 on /live/...).
+// Signed so guest viewers never see owner credentials. Must stay before the
+// generic /{username}/{password}/{streamId}.{format?} fallback.
+Route::get('/timeshift-live/signed/{uuid}/live.m3u8', [TimeshiftStreamController::class, 'signedPlaylist'])
+    ->middleware(ValidateSignature::relative(['client_id']))
+    ->name('timeshift.live.playlist.signed');
+Route::get('/timeshift-live/signed/{uuid}/{segment}.ts', [TimeshiftStreamController::class, 'signedSegment'])
+    ->middleware(ValidateSignature::relative(['client_id']))
+    ->where('segment', 'live[0-9]+')
+    ->name('timeshift.live.segment.signed');
 
 // DVR file streaming routes - also declared before the HDHR /{uuid}/... catch-all.
 // Stream auth mirrors the Xtream stream pattern: the owner's default login (username +

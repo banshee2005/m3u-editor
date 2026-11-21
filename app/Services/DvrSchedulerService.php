@@ -305,6 +305,15 @@ class DvrSchedulerService
             return [];
         }
 
+        // Optional weekday filter (null/empty days_of_week = every day).
+        $programmes = $programmes
+            ->filter(fn (EpgProgramme $p): bool => $rule->allowsDayOfWeek($p->start_time))
+            ->values();
+
+        if ($programmes->isEmpty()) {
+            return [];
+        }
+
         foreach ($programmes as $programme) {
             // Dedup strategy depends on series_mode:
             // - All: record every matching airing (no dedup)
@@ -768,7 +777,13 @@ class DvrSchedulerService
                 ]);
 
                 if ($programme->start_time->lte(now())) {
-                    StartDvrRecording::dispatch($existingFailed->id)->onQueue('dvr');
+                    // Resurrect = retry of a failed start: forceFresh skips
+                    // piggybacking; attempt continues the recording's chain.
+                    StartDvrRecording::dispatch(
+                        $existingFailed->id,
+                        forceFresh: true,
+                        attempt: max(1, (int) ($existingFailed->attempt_count ?? 1)),
+                    )->onQueue('dvr');
                 }
 
                 return;
@@ -958,7 +973,17 @@ class DvrSchedulerService
             }
 
             Log::info("DVR: Triggering recording {$recording->id} ({$recording->title})");
-            StartDvrRecording::dispatch($recording->id)->onQueue('dvr');
+            // Attempt-scoped dispatch: after a retryable failure attempt_count
+            // holds the next attempt number, so this re-trigger shares the
+            // in-handle retry's uniqueId (no parallel start) and, when the
+            // retry job was lost, resumes the chain with forceFresh instead
+            // of re-piggybacking the stale stream that failed.
+            $attempt = max(1, (int) ($recording->attempt_count ?? 1));
+            StartDvrRecording::dispatch(
+                $recording->id,
+                forceFresh: $attempt > 1,
+                attempt: $attempt,
+            )->onQueue('dvr');
         }
     }
 
@@ -1129,6 +1154,26 @@ class DvrSchedulerService
      */
     private function buildProgrammeUid(EpgProgramme $programme): string
     {
+        // Programmes with season/episode: stable across EPG time drift
+        // (channel + title + S/E only) - a shifted airtime is still the
+        // same episode.
+        //
+        // Without season/episode (sports/news/curling draws): the airtime
+        // IS the identity. Including start_time lets mode=all schedule
+        // multiple same-title draws/sessions on one day that share a
+        // title but not a clock time. Same event re-listed with a drifted
+        // time may schedule twice - acceptable for mode=all (record every
+        // airing); unique_se/new_flag still dedup via the sports date
+        // window before create.
+        if ($programme->season === null && $programme->episode === null) {
+            return md5(sprintf(
+                '%s|%s|%s',
+                $programme->epg_channel_id,
+                $programme->title,
+                $programme->start_time?->format('Y-m-d H:i:s') ?? '',
+            ));
+        }
+
         return md5(sprintf(
             '%s|%s|%s|%s',
             $programme->epg_channel_id,

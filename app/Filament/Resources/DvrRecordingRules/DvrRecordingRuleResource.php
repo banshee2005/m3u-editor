@@ -13,6 +13,7 @@ use App\Traits\HasDvrMatchedAirings;
 use App\Traits\HasUserFiltering;
 use BackedEnum;
 use Filament\Actions;
+use Filament\Forms\Components\CheckboxList;
 use Filament\Forms\Components\DateTimePicker;
 use Filament\Forms\Components\Select;
 use Filament\Forms\Components\TextInput;
@@ -189,6 +190,28 @@ class DvrRecordingRuleResource extends Resource
                     ->visible(fn (Get $get): bool => self::isRuleType($get('type'), DvrRuleType::Series))
                     ->live(onBlur: true),
 
+                CheckboxList::make('days_of_week')
+                    ->label(__('Days of Week'))
+                    ->options([
+                        0 => __('Sunday'),
+                        1 => __('Monday'),
+                        2 => __('Tuesday'),
+                        3 => __('Wednesday'),
+                        4 => __('Thursday'),
+                        5 => __('Friday'),
+                        6 => __('Saturday'),
+                    ])
+                    ->helperText(__('Only record airings on these days. Leave all unchecked to record every day.'))
+                    ->visible(fn (Get $get): bool => self::isRuleType($get('type'), DvrRuleType::Series))
+                    ->live(onBlur: true)
+                    // No formatStateUsing/afterStateHydrated here: CheckboxList's
+                    // OptionsArrayStateCast already normalizes hydrate/dehydrate
+                    // ([4] <-> ['4']); extra hooks conflicted and an explicit
+                    // dehydrated(Get) closure could evaluate false at save time,
+                    // silently dropping the field (days never persisted). Visible
+                    // gating above still keeps it off non-series rules.
+                    ->dehydrated(),
+
                 Select::make('enable_comskip')
                     ->label(__('Commercial Detection (Comskip)'))
                     ->options([
@@ -267,6 +290,7 @@ class DvrRecordingRuleResource extends Resource
             'channel_id' => $get('channel_id') ?? $record?->channel_id,
             'source_channel_id' => $get('source_channel_id') ?? $record?->source_channel_id,
             'sports_dedup_days' => $get('sports_dedup_days') ?? $record?->sports_dedup_days,
+            'days_of_week' => $get('days_of_week') ?? $record?->days_of_week,
         ];
 
         if ($type !== DvrRuleType::Series || $seriesTitle === '' || ! $dvrSettingId) {
