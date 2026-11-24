@@ -16,12 +16,15 @@ use App\Models\DvrRecordingRule;
 use App\Models\DvrSetting;
 use App\Models\Epg;
 use App\Models\EpgProgramme;
+use App\Services\M3uProxyService;
 use App\Support\SeriesKey;
 use Carbon\CarbonInterface;
 use Closure;
 use Exception;
 use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 
 /**
@@ -72,6 +75,10 @@ class DvrSchedulerService
 
             if (config('dvr.salvage_interrupted', false)) {
                 $this->salvageInterruptedRecordings();
+            }
+
+            if (config('dvr.stall_diag', true)) {
+                $this->watchRecordingStalls();
             }
         } catch (Exception $e) {
             Log::error('DVR scheduler tick failed: '.$e->getMessage(), [
@@ -1024,6 +1031,177 @@ class DvrSchedulerService
             ]);
 
             PostProcessDvrRecording::dispatch($recording->id);
+        }
+    }
+
+    /**
+     * Diagnostic watchdog: when an ACTIVE broadcast's playlist stops advancing
+     * (socket open, no data - e.g. a silent tuner stall), capture a forensic
+     * snapshot (HDHR tuner status, proxy broadcast status, playlist stats) at
+     * most once every 5 minutes. Observation only - no automatic restart yet;
+     * the data tells us why the source went silent before we decide the fix.
+     */
+    private function watchRecordingStalls(): void
+    {
+        $stallSeconds = max(60, (int) config('dvr.stall_seconds', 120));
+
+        $recordings = DvrRecording::recording()
+            ->whereNotNull('proxy_network_id')
+            ->where('actual_start', '<=', UtcDateTime::forQuery(now()->subMinutes(2)))
+            ->where('scheduled_end', '>', UtcDateTime::forQuery(now()))
+            ->get(['id', 'proxy_network_id', 'title', 'stream_url', 'channel_id', 'actual_start', 'scheduled_end', 'attempt_count', 'dvr_setting_id']);
+
+        if ($recordings->isEmpty()) {
+            return;
+        }
+
+        $proxy = app(M3uProxyService::class);
+        $activeIds = $proxy->activeBroadcastIds();
+        if ($activeIds === null) {
+            return;
+        }
+
+        foreach ($recordings as $recording) {
+            if (! in_array($recording->proxy_network_id, $activeIds, true)) {
+                continue; // not registered - resumeLostRecordings handles it
+            }
+
+            $stats = $proxy->broadcastPlaylistStats((string) $recording->proxy_network_id);
+            if ($stats === null) {
+                continue;
+            }
+
+            $key = 'dvr.stalldiag:'.$recording->id;
+            $state = Cache::get($key);
+            $pdt = $stats['last_pdt'];
+
+            if (! is_array($state) || $pdt === null || ($state['pdt'] ?? null) !== $pdt) {
+                Cache::put($key, ['pdt' => $pdt, 'since' => now()->timestamp, 'logged_at' => 0], 7200);
+
+                continue;
+            }
+
+            $stalled = now()->timestamp - (int) $state['since'];
+            if ($stalled < $stallSeconds) {
+                continue;
+            }
+            if (now()->timestamp - (int) ($state['logged_at'] ?? 0) < 300) {
+                continue; // at most one diagnostic snapshot per 5 minutes
+            }
+
+            $this->captureStallDiagnostics($recording, $stats, [
+                'stalled_seconds' => $stalled,
+                'detected_by' => 'dvr-scheduler-stall-watchdog',
+            ]);
+
+            $state['logged_at'] = now()->timestamp;
+            Cache::put($key, $state, 7200);
+        }
+    }
+
+    /**
+     * Write a forensic snapshot for a stalled recording: HDHR device + per-tuner
+     * status, proxy broadcast status, playlist stagnation. JSON under
+     * storage/app/private/dvr-stall-diag/ plus a compact log warning.
+     */
+    private function captureStallDiagnostics(DvrRecording $recording, array $stats, array $context): void
+    {
+        $proxy = app(M3uProxyService::class);
+        $hdhrBase = $this->hdhrBaseUrl($recording->stream_url);
+
+        $tuners = [];
+        if ($hdhrBase !== null) {
+            foreach (range(0, 3) as $n) {
+                $tuners['tuner'.$n] = $this->fetchStatusJson($hdhrBase.'/tuner'.$n.'/status.json');
+            }
+        }
+
+        $diag = [
+            'captured_at' => now()->toIso8601String(),
+            'context' => $context,
+            'recording' => [
+                'id' => $recording->id,
+                'title' => $recording->title,
+                'channel_id' => $recording->channel_id,
+                'status' => $recording->status?->value,
+                'stream_url' => $recording->stream_url,
+                'proxy_network_id' => $recording->proxy_network_id,
+                'actual_start' => optional($recording->actual_start)->toIso8601String(),
+                'scheduled_end' => optional($recording->scheduled_end)->toIso8601String(),
+                'attempt_count' => $recording->attempt_count,
+                'dvr_setting_id' => $recording->dvr_setting_id,
+            ],
+            'playlist' => $stats,
+            'proxy_broadcast_status' => $proxy->broadcastStatus((string) $recording->proxy_network_id),
+            'hdhr' => [
+                'base' => $hdhrBase,
+                'discover' => $hdhrBase !== null ? $this->fetchStatusJson($hdhrBase.'/discover.json') : null,
+                'lineup_status' => $hdhrBase !== null ? $this->fetchStatusJson($hdhrBase.'/lineup_status.json') : null,
+                'device_status' => $hdhrBase !== null ? $this->fetchStatusJson($hdhrBase.'/status.json') : null,
+                'tuners' => $tuners,
+            ],
+        ];
+
+        $dir = storage_path('app/private/dvr-stall-diag');
+        if (! is_dir($dir)) {
+            @mkdir($dir, 0775, true);
+        }
+        $path = $dir.'/rec-'.$recording->id.'-'.now()->format('Ymd-His').'.json';
+        @file_put_contents($path, json_encode($diag, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+
+        Log::warning('DVR stall diagnostics captured', [
+            'recording_id' => $recording->id,
+            'title' => $recording->title,
+            'path' => $path,
+            'playlist_last_pdt' => $stats['last_pdt_iso'] ?? null,
+            'playlist_pdt_age_seconds' => $stats['pdt_age_seconds'] ?? null,
+            'playlist_segments' => $stats['segments'] ?? null,
+            'stalled_seconds' => $context['stalled_seconds'] ?? null,
+            'hdhr_model' => $diag['hdhr']['discover']['body']['ModelNumber'] ?? null,
+            'hdhr_tuner_count' => $diag['hdhr']['discover']['body']['TunerCount'] ?? null,
+            'proxy_status' => is_array($diag['proxy_broadcast_status'])
+                ? ($diag['proxy_broadcast_status']['status'] ?? json_encode($diag['proxy_broadcast_status']))
+                : null,
+        ]);
+    }
+
+    /**
+     * Derive the HDHomeRun base URL (status pages live on port 80, not :5004)
+     * from a recording's capture URL.
+     */
+    private function hdhrBaseUrl(?string $streamUrl): ?string
+    {
+        if (! $streamUrl) {
+            return null;
+        }
+        $parts = parse_url($streamUrl);
+        if (! $parts || ! isset($parts['host'])) {
+            return null;
+        }
+        $base = ($parts['scheme'] ?? 'http').'://'.$parts['host'];
+        $port = $parts['port'] ?? null;
+        if ($port !== null && ! in_array($port, [80, 5004], true)) {
+            $base .= ':'.$port;
+        }
+
+        return $base;
+    }
+
+    /**
+     * @return array{http_status:int,body:mixed}|null
+     */
+    private function fetchStatusJson(string $url): ?array
+    {
+        try {
+            $response = Http::timeout(4)->get($url);
+            $body = $response->json();
+            if (! is_array($body)) {
+                $body = ['raw' => mb_substr((string) $response->body(), 0, 300)];
+            }
+
+            return ['http_status' => $response->status(), 'body' => $body];
+        } catch (\Throwable) {
+            return null;
         }
     }
 

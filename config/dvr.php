@@ -53,6 +53,23 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | DVR — Stall diagnostics
+    |--------------------------------------------------------------------------
+    |
+    | When an ACTIVE recording's HLS playlist stops advancing (silent tuner /
+    | provider stall with the socket still open), capture a forensic snapshot:
+    | HDHomeRun device + per-tuner status, proxy broadcast status, playlist
+    | stagnation. Logged at most once per five minutes. Observation only.
+    |
+    */
+
+    'stall_diag' => filter_var(env('DVR_STALL_DIAG', true), FILTER_VALIDATE_BOOLEAN),
+
+    // Seconds without playlist progress before a capture is considered stalled.
+    'stall_seconds' => (int) env('DVR_STALL_SECONDS', 120),
+
+    /*
+    |--------------------------------------------------------------------------
     | DVR — Default storage settings
     |--------------------------------------------------------------------------
     |

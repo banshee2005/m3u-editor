@@ -4223,6 +4223,71 @@ class M3uProxyService
     }
 
     /**
+     * Playlist growth stats for a broadcast — used by the DVR stall watchdog to
+     * tell "still capturing" from "socket open but silent".
+     *
+     * @return array{segments:int,last_pdt:?int,last_pdt_iso:?string,pdt_age_seconds:?int}|null
+     */
+    public function broadcastPlaylistStats(string $networkId): ?array
+    {
+        if (empty($this->apiBaseUrl)) {
+            return null;
+        }
+
+        try {
+            $response = Http::timeout(4)
+                ->withHeaders($this->apiToken ? ['X-API-Token' => $this->apiToken] : [])
+                ->get($this->apiBaseUrl.'/broadcast/'.rawurlencode($networkId).'/live.m3u8');
+
+            if (! $response->successful()) {
+                return null;
+            }
+
+            $body = $response->body();
+            $segments = preg_match_all('/^#EXTINF/m', $body);
+            $lastPdt = null;
+            $lastPdtIso = null;
+            if (preg_match_all('/^#EXT-X-PROGRAM-DATE-TIME:(\S+)/m', $body, $matches)) {
+                $lastPdtIso = end($matches[1]) ?: null;
+                $ts = $lastPdtIso !== null ? strtotime($lastPdtIso) : false;
+                $lastPdt = $ts !== false ? $ts : null;
+            }
+
+            return [
+                'segments' => (int) $segments,
+                'last_pdt' => $lastPdt,
+                'last_pdt_iso' => $lastPdtIso,
+                'pdt_age_seconds' => $lastPdt !== null ? max(0, now()->timestamp - $lastPdt) : null,
+            ];
+        } catch (Exception) {
+            return null;
+        }
+    }
+
+    /**
+     * Raw status payload for a broadcast (proxy /broadcast/{id}/status).
+     */
+    public function broadcastStatus(string $networkId): ?array
+    {
+        if (empty($this->apiBaseUrl)) {
+            return null;
+        }
+
+        try {
+            $response = Http::timeout(4)
+                ->acceptJson()
+                ->withHeaders($this->apiToken ? ['X-API-Token' => $this->apiToken] : [])
+                ->get($this->apiBaseUrl.'/broadcast/'.rawurlencode($networkId).'/status');
+
+            return $response->successful()
+                ? ($response->json() ?? [])
+                : ['http_status' => $response->status()];
+        } catch (Exception) {
+            return null;
+        }
+    }
+
+    /**
      * Get the public live HLS URL for an in-progress DVR recording.
      * Clients can connect to this URL to watch the recording in real time.
      */
