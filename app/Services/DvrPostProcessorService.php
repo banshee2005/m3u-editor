@@ -146,9 +146,11 @@ class DvrPostProcessorService
         }
 
         $fileSize = file_exists($outputFullPath) ? filesize($outputFullPath) : null;
-        // Prefer the actual segment-derived duration so cancelled recordings reflect
-        // what was really captured, not the originally scheduled programme length.
-        $duration = $this->durationFromManifest($m3u8FullPath) ?? $this->estimateDuration($recording);
+        // The muxed file is the truth: a corrupt EXTINF or a skipped segment
+        // makes the manifest sum wrong (seen: 60518 s saved for a 1h53m file).
+        $duration = $this->ffprobeDuration($outputFullPath)
+            ?? $this->durationFromManifest($m3u8FullPath)
+            ?? $this->estimateDuration($recording);
 
         Log::info('DVR post-processing step 1 complete: '.strtoupper($outputFormat).' concatenated', [
             'recording_id' => $recording->id,
@@ -530,6 +532,8 @@ class DvrPostProcessorService
         $concatListPath = $segmentDir.'/concat-list.txt';
         $expected = array_sum($durations);
         $maxSkips = 4;
+        $useFaststart = true;
+        $previousFailureAt = null;
 
         for ($attempt = 0; ; $attempt++) {
             $listContent = implode("\n", array_map(
@@ -555,7 +559,9 @@ class DvrPostProcessorService
 
             match ($format) {
                 'mkv' => array_push($args, '-f', 'matroska'),
-                default => array_push($args, '-movflags', '+faststart'), // mp4
+                default => $useFaststart
+                    ? array_push($args, '-movflags', '+faststart') // mp4
+                    : null,
             };
 
             $args[] = $outputPath;
@@ -577,9 +583,23 @@ class DvrPostProcessorService
             $exitCode = proc_close($process);
 
             if ($exitCode === 0) {
-                @unlink($concatListPath);
+                // exit 0 is not proof of a complete mux: a source timeline
+                // jump can make ffmpeg end "successfully" after a fraction of
+                // the segments (seen: 264 s saved of a 2 h recording). Verify
+                // the output against the manifest before accepting it.
+                $produced = $this->ffprobeDuration($outputPath);
+                if ($produced !== null && $expected > 0 && $produced >= $expected * 0.6) {
+                    @unlink($concatListPath);
 
-                return;
+                    return;
+                }
+
+                Log::warning('DVR concat: output shorter than expected despite clean exit - retrying', [
+                    'output_seconds' => $produced === null ? null : round($produced, 1),
+                    'expected_seconds' => round($expected, 1),
+                    'attempt' => $attempt,
+                ]);
+                $exitCode = $exitCode === 0 ? -1 : $exitCode;
             }
 
             // Map the muxer's death point (output duration) back to a manifest
@@ -596,6 +616,41 @@ class DvrPostProcessorService
                     }
                     $cum += $dur;
                 }
+            }
+
+            // Manifest EXTINF durations drift from real media, so the walk above
+            // can land on a segment that does not actually contain the corrupt
+            // packet (seen: repeated failure at the same second while skipping
+            // the "wrong" neighbours). When a retry fails at the same point,
+            // re-locate using the segments' real ffprobe start times.
+            if ($actual !== null && $previousFailureAt !== null && abs($actual - $previousFailureAt) < 1.0) {
+                $starts = $this->segmentStarts($segmentDir, $segments);
+                $reLocated = null;
+                for ($i = 0, $n = count($starts) - 1; $i < $n; $i++) {
+                    if ($starts[$i] !== null && $starts[$i + 1] !== null
+                        && $actual >= $starts[$i] && $actual < $starts[$i + 1]) {
+                        $reLocated = $i;
+
+                        break;
+                    }
+                }
+                if ($reLocated !== null) {
+                    $badIndex = $reLocated;
+                    Log::warning('DVR concat: re-located failure point via ffprobe start times', [
+                        'segment' => $segments[$badIndex],
+                    ]);
+                }
+            }
+            $previousFailureAt = $actual;
+
+            // ffmpeg can exhaust memory on its +faststart trailer pass for very
+            // large outputs; that pass is cosmetic - retry without it.
+            if ($exitCode !== 0 && $useFaststart && file_exists($logFile)
+                && str_contains((string) file_get_contents($logFile), 'Out of memory')) {
+                $useFaststart = false;
+                Log::warning('DVR concat: memory error during faststart pass - retrying without +faststart', [
+                    'attempt' => $attempt,
+                ]);
             }
 
             if ($badIndex === null || $attempt >= $maxSkips) {
@@ -626,6 +681,30 @@ class DvrPostProcessorService
             array_splice($durations, $badIndex, 1);
             $expected = array_sum($durations);
         }
+    }
+
+    /**
+     * Real start timestamps of the given segments via ffprobe. Used only on a
+     * retry failure to re-locate the corrupt segment accurately.
+     *
+     * @param  array<int, string>  $segments
+     * @return array<int, float|null>
+     */
+    private function segmentStarts(string $segmentDir, array $segments): array
+    {
+        $ffprobe = (string) config('dvr.ffprobe_path', '/usr/bin/ffprobe');
+        $starts = [];
+        foreach ($segments as $seg) {
+            $out = [];
+            $code = 0;
+            exec(escapeshellarg($ffprobe)
+                .' -v error -show_entries format=start_time -of csv=p=0 '
+                .escapeshellarg($segmentDir.'/'.$seg).' 2>/dev/null', $out, $code);
+            $val = trim($out[0] ?? '');
+            $starts[] = ($code === 0 && is_numeric($val)) ? (float) $val : null;
+        }
+
+        return $starts;
     }
 
     /**
