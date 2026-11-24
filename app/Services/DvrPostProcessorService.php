@@ -460,16 +460,35 @@ class DvrPostProcessorService
     {
         $segmentDir = dirname($m3u8Path);
 
-        // Parse segment filenames from the .m3u8 manifest (lines not starting with #)
+        // Parse segment filenames (and their EXTINF durations, used to locate
+        // the failure point when a corrupt packet aborts the muxer).
         $rawLines = file($m3u8Path);
         if ($rawLines === false) {
             throw new Exception("Could not read HLS manifest: {$m3u8Path}");
         }
 
-        $segments = array_values(array_filter(
-            array_map('trim', $rawLines),
-            fn (string $line) => $line !== '' && ! str_starts_with($line, '#')
-        ));
+        $segments = [];
+        $durations = [];
+        $pending = null;
+        foreach (array_map('trim', $rawLines) as $line) {
+            if ($line === '') {
+                continue;
+            }
+            if (str_starts_with($line, '#EXTINF:')) {
+                // Clamp absurd durations: a source timeline jump can write a
+                // bogus EXTINF (seen: 53512s "segment") which would poison the
+                // cumulative failure-point walk and the reported duration.
+                $pending = min((float) substr($line, strlen('#EXTINF:')), 120.0);
+
+                continue;
+            }
+            if (str_starts_with($line, '#')) {
+                continue;
+            }
+            $segments[] = $line;
+            $durations[] = $pending ?? 0.0;
+            $pending = null;
+        }
 
         if (empty($segments)) {
             throw new Exception('No segments found in HLS manifest');
@@ -500,55 +519,136 @@ class DvrPostProcessorService
             return;
         }
 
-        // MP4 / MKV: use FFmpeg concat demuxer with stream copy
+        // MP4 / MKV: FFmpeg concat demuxer with stream copy. A single corrupt
+        // packet (OTA glitch, provider hiccup) aborts the muxer and previously
+        // failed the ENTIRE recording, discarding hours of good footage. On
+        // failure we locate the segment covering the failure point (from the
+        // output's probed duration vs the manifest's EXTINF walk), drop that
+        // one segment, and retry — proven to turn a dead 17-min partial into
+        // a 99.9%-complete file. As a last resort a mostly-complete output
+        // is accepted instead of being thrown away.
         $concatListPath = $segmentDir.'/concat-list.txt';
-        $logFile = $segmentDir.'/ffmpeg-concat.log';
+        $expected = array_sum($durations);
+        $maxSkips = 4;
 
-        $listContent = implode("\n", array_map(
-            fn (string $seg) => "file '".str_replace("'", "'\\''", "{$segmentDir}/{$seg}")."'",
-            $segments
-        ));
-        file_put_contents($concatListPath, $listContent);
+        for ($attempt = 0; ; $attempt++) {
+            $listContent = implode("\n", array_map(
+                fn (string $seg) => "file '".str_replace("'", "'\\''", "{$segmentDir}/{$seg}")."'",
+                $segments
+            ));
+            file_put_contents($concatListPath, $listContent);
 
-        $args = [
-            $ffmpegPath,
-            '-y',
-            '-f', 'concat',
-            '-safe', '0',
-            '-i', $concatListPath,
-            '-c', 'copy',
-        ];
+            $logFile = $attempt === 0
+                ? $segmentDir.'/ffmpeg-concat.log'
+                : $segmentDir."/ffmpeg-concat-attempt{$attempt}.log";
 
-        match ($format) {
-            'mkv' => array_push($args, '-f', 'matroska'),
-            default => array_push($args, '-movflags', '+faststart'), // mp4
-        };
+            $args = [
+                $ffmpegPath,
+                '-y',
+                '-fflags', '+genpts+discardcorrupt+igndts',
+                '-f', 'concat',
+                '-safe', '0',
+                '-i', $concatListPath,
+                '-c', 'copy',
+                '-avoid_negative_ts', 'make_zero',
+            ];
 
-        $args[] = $outputPath;
+            match ($format) {
+                'mkv' => array_push($args, '-f', 'matroska'),
+                default => array_push($args, '-movflags', '+faststart'), // mp4
+            };
 
-        $cmd = implode(' ', array_map('escapeshellarg', $args)).' 2>&1';
+            $args[] = $outputPath;
 
-        $descriptor = [
-            0 => ['file', '/dev/null', 'r'],
-            1 => ['file', $logFile, 'w'],
-            2 => ['file', $logFile, 'a'],
-        ];
+            $cmd = implode(' ', array_map('escapeshellarg', $args)).' 2>&1';
 
-        $process = proc_open($cmd, $descriptor, $pipes);
+            $descriptor = [
+                0 => ['file', '/dev/null', 'r'],
+                1 => ['file', $logFile, 'w'],
+                2 => ['file', $logFile, 'a'],
+            ];
 
-        if (! is_resource($process)) {
-            throw new Exception('proc_open failed for HLS concat');
+            $process = proc_open($cmd, $descriptor, $pipes);
+
+            if (! is_resource($process)) {
+                throw new Exception('proc_open failed for HLS concat');
+            }
+
+            $exitCode = proc_close($process);
+
+            if ($exitCode === 0) {
+                @unlink($concatListPath);
+
+                return;
+            }
+
+            // Map the muxer's death point (output duration) back to a manifest
+            // segment so the retry can skip exactly the corrupt one.
+            $actual = $this->ffprobeDuration($outputPath);
+            $badIndex = null;
+            if ($actual !== null) {
+                $cum = 0.0;
+                foreach ($durations as $i => $dur) {
+                    if ($actual >= $cum - 1.0 && $actual < $cum + $dur + 1.0) {
+                        $badIndex = $i;
+
+                        break;
+                    }
+                    $cum += $dur;
+                }
+            }
+
+            if ($badIndex === null || $attempt >= $maxSkips) {
+                @unlink($concatListPath);
+
+                if ($actual !== null && $expected > 0 && $actual >= $expected * 0.6) {
+                    Log::warning('DVR concat: ffmpeg failed but output covers most of the recording - accepting it', [
+                        'output_seconds' => round($actual, 1),
+                        'expected_seconds' => round($expected, 1),
+                        'exit_code' => $exitCode,
+                        'segments_skipped' => $attempt,
+                    ]);
+
+                    return;
+                }
+
+                $log = file_exists($logFile) ? file_get_contents($logFile) : 'no log';
+                throw new Exception("ffmpeg concat exited with code {$exitCode}: ".substr($log, -500));
+            }
+
+            Log::warning('DVR concat: skipping corrupt segment and retrying', [
+                'segment' => $segments[$badIndex],
+                'segment_seconds' => round($durations[$badIndex], 1),
+                'output_seconds' => round($actual, 1),
+                'attempt' => $attempt + 1,
+            ]);
+            array_splice($segments, $badIndex, 1);
+            array_splice($durations, $badIndex, 1);
+            $expected = array_sum($durations);
+        }
+    }
+
+    /**
+     * Duration of a media file in seconds via ffprobe, or null when unreadable.
+     */
+    private function ffprobeDuration(string $path): ?float
+    {
+        if (! is_file($path)) {
+            return null;
         }
 
-        $exitCode = proc_close($process);
+        $ffprobe = (string) config('dvr.ffprobe_path', '/usr/bin/ffprobe');
+        $cmd = escapeshellarg($ffprobe)
+            .' -v error -show_entries format=duration -of csv=p=0 '
+            .escapeshellarg($path).' 2>/dev/null';
+        $out = [];
+        $code = 0;
+        exec($cmd, $out, $code);
+        $val = trim($out[0] ?? '');
 
-        // Clean up concat list file
-        @unlink($concatListPath);
-
-        if ($exitCode !== 0) {
-            $log = file_exists($logFile) ? file_get_contents($logFile) : 'no log';
-            throw new Exception("ffmpeg concat exited with code {$exitCode}: ".substr($log, -500));
-        }
+        // csv=p=0 yields a bare number; guard anyway so a "duration=…" style
+        // line can never cast to 0.0 and poison the failure-point lookup.
+        return ($code === 0 && is_numeric($val)) ? (float) $val : null;
     }
 
     /**
