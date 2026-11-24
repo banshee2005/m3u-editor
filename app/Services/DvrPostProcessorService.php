@@ -148,9 +148,11 @@ class DvrPostProcessorService
         $fileSize = file_exists($outputFullPath) ? filesize($outputFullPath) : null;
         // The muxed file is the truth: a corrupt EXTINF or a skipped segment
         // makes the manifest sum wrong (seen: 60518 s saved for a 1h53m file).
-        $duration = $this->ffprobeDuration($outputFullPath)
-            ?? $this->durationFromManifest($m3u8FullPath)
-            ?? $this->estimateDuration($recording);
+        // duration_seconds is an integer column, so round before storing.
+        $probed = $this->ffprobeDuration($outputFullPath);
+        $duration = $probed !== null
+            ? (int) round($probed)
+            : ($this->durationFromManifest($m3u8FullPath) ?? $this->estimateDuration($recording));
 
         Log::info('DVR post-processing step 1 complete: '.strtoupper($outputFormat).' concatenated', [
             'recording_id' => $recording->id,

@@ -117,7 +117,32 @@ class DvrRecorderService
             'stream_url' => $streamUrl,
         ]);
 
-        $networkId = $this->proxy->startDvrBroadcast($recording, $setting, $streamUrl);
+        $networkId = null;
+        $maxAttempts = max(1, (int) config('dvr.start_attempts', 1));
+
+        for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
+            $networkId = $this->proxy->startDvrBroadcast($recording, $setting, $streamUrl);
+
+            // A provider blip right at capture start kills the broadcast within
+            // seconds (seen: "ran 1s" failures). Verify it survived, and retry
+            // the start while attempts remain. "Unknown" (proxy unreachable)
+            // is treated as started so we never double-start blindly.
+            $ready = $this->proxy->broadcastPlaylistReady($networkId);
+            if ($ready !== false) {
+                break;
+            }
+
+            Log::warning('DVR: broadcast died immediately after start', [
+                'recording_id' => $recording->id,
+                'attempt' => $attempt,
+                'max_attempts' => $maxAttempts,
+            ]);
+
+            if ($attempt < $maxAttempts) {
+                sleep(4);
+                $streamUrl = $this->resolveCaptureUrl($recording);
+            }
+        }
 
         $recording->update([
             'status' => DvrRecordingStatus::Recording->value,

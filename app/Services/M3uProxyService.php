@@ -4232,6 +4232,34 @@ class M3uProxyService
     }
 
     /**
+     * Whether a broadcast's playlist is readable right now.
+     *
+     * Used to verify a just-started DVR broadcast actually survived its first
+     * seconds (provider blip at capture start). Returns null when the answer
+     * cannot be determined, so callers never act on "not ready" blindly.
+     */
+    public function broadcastPlaylistReady(string $networkId): ?bool
+    {
+        if (empty($this->apiBaseUrl)) {
+            return null;
+        }
+
+        try {
+            $response = Http::timeout(3)
+                ->withHeaders($this->apiToken ? ['X-API-Token' => $this->apiToken] : [])
+                ->get($this->apiBaseUrl.'/broadcast/'.rawurlencode($networkId).'/live.m3u8');
+
+            if ($response->successful()) {
+                return str_contains($response->body(), '#EXTM3U');
+            }
+
+            return $response->status() === 404 ? false : null;
+        } catch (Exception) {
+            return null;
+        }
+    }
+
+    /**
      * Get the API-based live HLS URL for an in-progress DVR recording.
      * Uses the internal API base URL so the editor can reach the proxy from within Docker.
      */

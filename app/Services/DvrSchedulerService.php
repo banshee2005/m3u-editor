@@ -7,6 +7,7 @@ use App\Enums\DvrMatchMode;
 use App\Enums\DvrRecordingStatus;
 use App\Enums\DvrRuleType;
 use App\Enums\DvrSeriesMode;
+use App\Jobs\PostProcessDvrRecording;
 use App\Jobs\StartDvrRecording;
 use App\Jobs\StopDvrRecording;
 use App\Models\Channel;
@@ -68,6 +69,10 @@ class DvrSchedulerService
             $this->triggerPendingRecordings();
             $this->stopExpiredRecordings();
             $this->resumeLostRecordings();
+
+            if (config('dvr.salvage_interrupted', false)) {
+                $this->salvageInterruptedRecordings();
+            }
         } catch (Exception $e) {
             Log::error('DVR scheduler tick failed: '.$e->getMessage(), [
                 'exception' => $e,
@@ -973,6 +978,52 @@ class DvrSchedulerService
 
             Log::warning("DvrSchedulerService: Recording {$recording->id} ({$recording->title}) is missing from the proxy, resuming");
             StartDvrRecording::dispatch($recording->id, resume: true)->onQueue('dvr');
+        }
+    }
+
+    /**
+     * Recordings whose airing window is over but whose capture stopped early
+     * (lost broadcast, server restart) still have their segments on the proxy.
+     * Finalize those instead of failing the recording outright — the viewer
+     * gets a partial file rather than nothing. Opt-in via dvr.salvage_interrupted.
+     */
+    private function salvageInterruptedRecordings(): void
+    {
+        $candidates = DvrRecording::query()
+            ->whereNotNull('proxy_network_id')
+            ->where(function ($q) {
+                $q->where('status', DvrRecordingStatus::Recording->value)
+                    ->orWhere(function ($q2) {
+                        $q2->where('status', DvrRecordingStatus::Failed->value)
+                            ->where('error_message', 'Server restarted during recording');
+                    });
+            })
+            ->where('scheduled_end', '<=', UtcDateTime::forQuery(now()))
+            ->get();
+
+        if ($candidates->isEmpty()) {
+            return;
+        }
+
+        $activeIds = app(M3uProxyService::class)->activeBroadcastIds();
+        if ($activeIds === null) {
+            return;
+        }
+
+        foreach ($candidates as $recording) {
+            if (in_array($recording->proxy_network_id, $activeIds, true)) {
+                continue; // still capturing; the normal stop path will finalize it
+            }
+
+            Log::warning("DvrSchedulerService: salvaging interrupted recording {$recording->id} ({$recording->title})");
+
+            $recording->update([
+                'status' => DvrRecordingStatus::PostProcessing->value,
+                'error_message' => null,
+                'actual_end' => $recording->actual_end ?? now(),
+            ]);
+
+            PostProcessDvrRecording::dispatch($recording->id);
         }
     }
 

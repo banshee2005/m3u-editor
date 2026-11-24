@@ -28,6 +28,31 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | DVR — Start attempts
+    |--------------------------------------------------------------------------
+    |
+    | How many times to (re)start a proxy broadcast when it dies immediately
+    | after starting (provider blip at capture start). 1 disables retries.
+    |
+    */
+
+    'start_attempts' => (int) env('DVR_START_ATTEMPTS', 1),
+
+    /*
+    |--------------------------------------------------------------------------
+    | DVR — Salvage interrupted recordings
+    |--------------------------------------------------------------------------
+    |
+    | When enabled, a recording whose capture ended before the airing window
+    | (lost broadcast, restart) is finalized from the segments the proxy still
+    | holds instead of being failed outright — you get a partial file.
+    |
+    */
+
+    'salvage_interrupted' => filter_var(env('DVR_SALVAGE_INTERRUPTED', false), FILTER_VALIDATE_BOOLEAN),
+
+    /*
+    |--------------------------------------------------------------------------
     | DVR — Default storage settings
     |--------------------------------------------------------------------------
     |
