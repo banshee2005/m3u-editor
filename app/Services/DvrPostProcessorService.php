@@ -592,6 +592,7 @@ class DvrPostProcessorService
                 $produced = $this->ffprobeDuration($outputPath);
                 if ($produced !== null && $expected > 0 && $produced >= $expected * 0.6) {
                     @unlink($concatListPath);
+                    $this->repairAudioGapsIfNeeded($ffmpegPath, $outputPath, $format);
 
                     return;
                 }
@@ -665,6 +666,7 @@ class DvrPostProcessorService
                         'exit_code' => $exitCode,
                         'segments_skipped' => $attempt,
                     ]);
+                    $this->repairAudioGapsIfNeeded($ffmpegPath, $outputPath, $format);
 
                     return;
                 }
@@ -707,6 +709,102 @@ class DvrPostProcessorService
         }
 
         return $starts;
+    }
+
+    /**
+     * Copy-remuxing ADTS-in-TS HLS segments into MP4 can drop short audio bursts
+     * (measured: 520 holes of 0.5-1.5 s on a 34-min OTA recording, even though
+     * the source segments are clean) - players respond with stutter/A-V desync.
+     * Detect that and repair by re-encoding ONLY the audio with gap filling;
+     * video stays untouched and duration is preserved.
+     */
+    private function repairAudioGapsIfNeeded(string $ffmpegPath, string $outputPath, string $format): void
+    {
+        if ($format === 'ts') {
+            return; // binary concat keeps the original stream as-is
+        }
+
+        $gaps = $this->audioGapCount($outputPath);
+        if ($gaps === null || $gaps < 6) {
+            return;
+        }
+
+        $tmp = $outputPath.'.audiofix.'.($format === 'mkv' ? 'mkv' : 'mp4');
+        $logFile = $tmp.'.log';
+
+        $args = [
+            $ffmpegPath,
+            '-y',
+            '-i', $outputPath,
+            '-map', '0:v:0?',
+            '-map', '0:a:0?',
+            '-c:v', 'copy',
+            '-c:a', 'aac',
+            '-b:a', '192k',
+            '-af', 'aresample=async=1:first_pts=0',
+        ];
+        if ($format === 'mkv') {
+            array_push($args, '-f', 'matroska');
+        } else {
+            array_push($args, '-movflags', '+faststart');
+        }
+        $args[] = $tmp;
+
+        $cmd = implode(' ', array_map('escapeshellarg', $args)).' 2>&1';
+        $descriptor = [
+            0 => ['file', '/dev/null', 'r'],
+            1 => ['file', $logFile, 'w'],
+            2 => ['file', $logFile, 'a'],
+        ];
+        $process = proc_open($cmd, $descriptor, $pipes);
+        if (! is_resource($process)) {
+            Log::warning('DVR audio gap repair: proc_open failed', ['recording_output' => $outputPath]);
+
+            return;
+        }
+        $exit = proc_close($process);
+
+        if ($exit === 0 && is_file($tmp) && filesize($tmp) > 0) {
+            @unlink($outputPath);
+            @rename($tmp, $outputPath);
+            Log::warning('DVR audio gaps repaired', [
+                'output' => $outputPath,
+                'gaps_found' => $gaps,
+                'size_bytes' => filesize($outputPath),
+            ]);
+        } else {
+            @unlink($tmp);
+            Log::warning('DVR audio gap repair failed - keeping original output', [
+                'output' => $outputPath,
+                'gaps_found' => $gaps,
+                'exit_code' => $exit,
+                'log_tail' => is_file($logFile) ? substr((string) file_get_contents($logFile), -300) : null,
+            ]);
+        }
+
+        @unlink($logFile);
+    }
+
+    /**
+     * Count audio packet gaps > 0.3 s (AAC frame is ~21 ms). Null when unknown.
+     */
+    private function audioGapCount(string $path): ?int
+    {
+        if (! is_file($path)) {
+            return null;
+        }
+
+        $ffprobe = (string) config('dvr.ffprobe_path', '/usr/bin/ffprobe');
+        $cmd = escapeshellarg($ffprobe)
+            .' -v error -select_streams a:0 -show_entries packet=pts_time -of csv=p=0 '
+            .escapeshellarg($path)
+            ." | awk '\$1-p>0.3{c++} {p=\$1} END{print c+0}' 2>/dev/null";
+        $out = [];
+        $code = 0;
+        exec($cmd, $out, $code);
+        $val = trim($out[0] ?? '');
+
+        return ($code === 0 && is_numeric($val)) ? (int) $val : null;
     }
 
     /**
